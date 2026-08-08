@@ -20,12 +20,13 @@ setup() {
 
 # --- csp_choose_backend (how sessions are run) -------------------------------
 
-@test "backend: auto picks tmux when tmux is available" {
+@test "backend: auto defaults to hub even when tmux is available" {
+  # tmux is opt-in; merely having it installed must NOT change the default.
   run csp_choose_backend 1 0 ""
-  [ "$output" = "tmux" ]
+  [ "$output" = "hub" ]
 }
 
-@test "backend: auto picks hub when tmux is absent" {
+@test "backend: auto defaults to hub when tmux is absent" {
   run csp_choose_backend 0 0 ""
   [ "$output" = "hub" ]
 }
@@ -46,10 +47,11 @@ setup() {
   [ "$output" = "hub" ]
 }
 
-@test "backend: an unrecognised forced value falls through to auto" {
-  # e.g. a typo like "Hub" is not honoured as an override.
+@test "backend: an unrecognised forced value falls through to auto (hub)" {
+  # e.g. a typo like "Hub" is not honoured as an override, so we get the
+  # default auto choice, which is now hub even with tmux available.
   run csp_choose_backend 1 0 "Hub"
-  [ "$output" = "tmux" ]   # auto, because tmux is available here
+  [ "$output" = "hub" ]
 }
 
 # --- csp_backend_is_valid ----------------------------------------------------

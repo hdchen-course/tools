@@ -179,8 +179,9 @@ are all you really need.
 
 ## Switching modes
 
-The picker chooses for you: **tmux if the `tmux` command exists, otherwise hub.**
-Override it for a single run with the `CSP_BACKEND` variable:
+The picker defaults to **hub mode everywhere** — even if you have `tmux`
+installed. tmux mode is an opt-in for when you specifically want several sessions
+running at once. Choose it for a single run with the `CSP_BACKEND` variable:
 
 ```sh
 CSP_BACKEND=hub  claude-session-picker    # force one-at-a-time
@@ -214,8 +215,9 @@ you *don't* get is a task continuing to run while you're away — for that you n
 tmux.
 
 **How do I get real concurrency?**
-Install `tmux` (one command, see above) and restart the picker. Each session then
-gets its own tmux window and they all keep running at once.
+Install `tmux`, then start the picker with `CSP_BACKEND=tmux claude-session-picker`
+(installing tmux alone doesn't change the default — you opt in with that variable).
+Each session then gets its own tmux window and they all keep running at once.
 
 **Is any of my data sent anywhere?**
 No. The tool makes no network calls whatsoever. It reads files that already exist
@@ -289,10 +291,12 @@ older install of this same tool. Re-run `./install.sh --force` to replace it, or
 `./install.sh --prefix ~/some/other/bin` to put it somewhere else.
 
 **I installed tmux but the header still says `mode: hub`**
-The mode is decided when the picker starts. Quit it (`q`) and run it again. If it
-still says hub, check that tmux is really on your `PATH` with
-`command -v tmux`, and that you don't have `CSP_BACKEND=hub` set (`echo
-$CSP_BACKEND`).
+That's expected — hub is the default even with tmux installed. Installing tmux
+doesn't switch modes on its own; you opt in per run with
+`CSP_BACKEND=tmux claude-session-picker` (or `export CSP_BACKEND=tmux` in your
+shell rc). If you set that and it *still* says hub, check tmux is really on your
+`PATH` with `command -v tmux` (forcing tmux without the command falls back to
+hub).
 
 **tmux mode opened a window but Claude isn't there**
 The window runs `claude --resume <id>` in the session's project folder. If that

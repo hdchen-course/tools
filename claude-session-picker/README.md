@@ -24,32 +24,41 @@ New here? The step-by-step user manual is at **[docs/MANUAL.md](docs/MANUAL.md)*
 
 ## Two modes: hub and tmux
 
-The picker can *run* a session in one of two ways. It picks one for you at
-startup and prints which one on the header line, so you always know what
-pressing `Enter` is about to do.
+The picker can *run* a session in one of two ways. **hub is the default
+everywhere**; tmux is an opt-in for people who want several sessions running at
+once. The header line always tells you which mode you're in.
 
-| | **hub** | **tmux** |
+| | **hub** (default) | **tmux** (opt-in) |
 |---|---|---|
 | Needs installed | nothing | the `tmux` command |
-| When it is used | whenever `tmux` is not installed | automatically, whenever `tmux` **is** installed |
+| When it is used | **always, unless you ask for tmux** | only when you set `CSP_BACKEND=tmux` |
 | Where a session opens | in your current terminal | in its own tmux *window* |
 | While you use session A | B, C… are **stopped** (saved on disk) | B, C… keep **running** in the background |
-| Quitting the session | returns you to the picker menu | leaves you in tmux; other windows still live |
-| Good for | a bare remote Linux host, minimal setups | several agents working at once |
+| Quitting the session | **returns you to the picker menu** | leaves you in tmux; other windows still live |
+| Switching | quit the session → pick the next from the menu | tmux keys: `Ctrl-b n` / `Ctrl-b p` / `Ctrl-b <number>` |
+| Good for | the common case: browse and resume, one at a time | several agents making progress in parallel |
 
-**Honest note on concurrency.** Only tmux mode gives you *truly simultaneous*
-sessions. Hub mode is one-at-a-time **by design**: it hands the whole terminal to
-one Claude and takes it back when that Claude exits, which is why it needs no
-extra software and cannot leave your terminal in a strange state. Nothing is lost
-when you switch — Claude persists every session to disk as you go, so reopening
-picks up exactly where you left off. If you want several agents making progress
-in parallel, install `tmux` (see [Optional: tmux](#optional-tmux)).
+**Why hub is the default even if you have tmux.** Auto-picking tmux just because
+it happens to be installed is surprising: pressing `Enter` drops you into a
+full-screen tmux client, and if that's the only window, quitting it drops you
+back to the shell — not the menu — and the picker can't bring you back. Hub
+gives the same predictable "quit a session → back to the menu → pick the next"
+flow on every machine, needs nothing installed, and can't leave your terminal in
+a strange state. Nothing is lost when you switch: Claude saves every session to
+disk as you go, so reopening picks up exactly where you left off.
+
+**Want true concurrency?** Install `tmux` and opt in with `CSP_BACKEND=tmux`.
+Then each session opens in its own tmux window and the others keep running in
+the background; you switch between them with tmux's own keys (`Ctrl-b n` for the
+next window, `Ctrl-b p` for the previous, `Ctrl-b` then a number to jump, and
+`Ctrl-b d` to detach). See [Optional: tmux](#optional-tmux).
 
 Force a mode with the `CSP_BACKEND` environment variable:
 
 ```sh
-CSP_BACKEND=hub  claude-session-picker    # one at a time, even if tmux exists
-CSP_BACKEND=tmux claude-session-picker    # windows that keep running
+claude-session-picker                     # default: hub (returns to the menu)
+CSP_BACKEND=tmux claude-session-picker    # opt in to concurrent tmux windows
+CSP_BACKEND=hub  claude-session-picker    # explicit hub (same as default)
 ```
 
 Forcing `tmux` on a machine without the `tmux` command falls back to `hub`
@@ -105,9 +114,10 @@ sudo apt install tmux        # Debian/Ubuntu
 sudo yum install tmux        # RHEL / CentOS / Fedora
 ```
 
-The next time you start the picker it will notice `tmux` and switch to tmux mode
-by itself. Nothing else changes; use `CSP_BACKEND=hub` any time you want the
-simple one-at-a-time behaviour back.
+Installing tmux does **not** change the picker's default — it stays in hub mode
+so nothing about your normal flow changes. To actually use concurrent windows,
+opt in per run with `CSP_BACKEND=tmux claude-session-picker` (or export
+`CSP_BACKEND=tmux` in your shell rc to make it your personal default).
 
 ## Usage
 
@@ -140,7 +150,7 @@ terminal are drawn, the highlighted row is always kept in view, and a
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CSP_BACKEND` | *(auto)* | force `hub` or `tmux` |
+| `CSP_BACKEND` | `hub` | set to `tmux` to opt in to concurrent windows; `hub` (or unset) is the default |
 | `CSP_TMUX_SESSION` | `claude-sessions` | name of the tmux session that holds the windows |
 | `CSP_CLAUDE_DIR` | `~/.claude` | where to look for Claude's data (used by the tests) |
 

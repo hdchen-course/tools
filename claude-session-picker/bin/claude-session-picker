@@ -262,7 +262,12 @@ csp_draw() {
   if [ "$CSP_ACTIVE_BACKEND" = "tmux" ]; then
     mode_hint="mode: tmux (others keep running)"
   else
-    mode_hint="mode: hub (one at a time)"
+    mode_hint="mode: hub (quit a session to return here)"
+    # If tmux is installed but the user is in hub, tell them how to unlock
+    # true concurrency — otherwise it's an invisible feature.
+    if csp_tmux_available; then
+      mode_hint="$mode_hint  ·  CSP_BACKEND=tmux for concurrent windows"
+    fi
   fi
   printf 'Claude Session Picker   ● = running    %s\n' "$mode_hint"
   printf '%s\n' '(j/k move   Enter open   n new session   R reload   q quit)'

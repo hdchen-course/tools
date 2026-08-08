@@ -48,17 +48,26 @@ CSP_MAX_LINE_LEN=200   # Longest rendered line; anything longer is truncated.
 #   FORCED          user override: "tmux", "hub", or "" for auto
 #
 # Prints one of:
-#   "tmux"  → run each session in its own tmux window; non-active sessions keep
-#             running live in the background. Chosen when tmux is usable.
 #   "hub"   → run one session at a time in this terminal, returning to the menu
-#             when it exits (state is saved to disk by Claude). The zero-
-#             dependency default that works on a bare Linux host.
+#             when it exits (state is saved to disk by Claude). This is the
+#             DEFAULT: it needs nothing installed and gives the simple
+#             "quit a session → back to the menu → pick the next one" flow that
+#             most people want.
+#   "tmux"  → run each session in its own tmux window; non-active sessions keep
+#             running live in the background. This is a power-user OPT-IN for
+#             true concurrency, chosen only when the user explicitly asks for it
+#             with CSP_BACKEND=tmux (and tmux is installed).
 #
-# The override always wins, EXCEPT we never promise "tmux" when tmux is absent,
-# because that backend simply cannot work without the tmux command. FORCED is
-# matched case-sensitively; an unrecognised value (e.g. "Hub", "screen") is
-# treated as auto — callers should first validate with csp_backend_is_valid so
-# they can warn the user rather than silently ignoring a typo.
+# Why hub is the default even when tmux exists: auto-selecting tmux just because
+# the binary happens to be installed surprises people — pressing Enter drops
+# them into a full-screen tmux client, and quitting the single window drops them
+# back to the shell instead of the menu. Defaulting to hub makes the experience
+# the same everywhere; concurrency is one env var away for those who want it.
+#
+# The override is matched case-sensitively; an unrecognised value (e.g. "Hub",
+# "screen") is treated as auto (→ hub) — callers should first validate with
+# csp_backend_is_valid so they can warn the user rather than silently ignoring
+# a typo. We never promise "tmux" when tmux is absent.
 # -----------------------------------------------------------------------------
 csp_choose_backend() {
   local tmux_available="$1" inside_tmux="$2" forced="$3"
@@ -70,12 +79,9 @@ csp_choose_backend() {
       return 0 ;;
   esac
 
-  # Auto: prefer tmux only when it is actually available.
-  if [ "$tmux_available" = "1" ]; then
-    printf 'tmux'
-  else
-    printf 'hub'
-  fi
+  # Auto (no explicit choice): always hub. tmux is opt-in only, so having tmux
+  # installed for other reasons never changes the picker's default behaviour.
+  printf 'hub'
 }
 
 # -----------------------------------------------------------------------------
