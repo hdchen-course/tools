@@ -149,7 +149,10 @@ fi
 csp_enter_raw_mode() {
   csp_capture_pristine_stty           # captures once; safe to call repeatedly
   stty -echo -icanon min 1 time 0 2>/dev/null
-  printf '\033[?25l'                 # hide the cursor while the menu is drawn
+  # Hide the cursor and clear the screen ONCE. From here on csp_draw repaints by
+  # homing the cursor (not clearing), so there's no flicker; this initial clear
+  # just gives it a clean canvas to home onto.
+  printf '\033[?25l\033[2J\033[H'
 }
 
 # csp_read_key — read one keypress and return a single normalised token:
@@ -295,107 +298,105 @@ csp_repeat() {
   printf '%s' "$out"
 }
 
-# The inner content width of the framed panel (columns between the │ borders,
-# excluding the one space of padding on each side). Set once per draw.
+# The content width used for the horizontal rules and column layout, set once
+# per draw to fit the terminal.
 CSP_INNER=82
 
-# csp_frame_top / _mid / _bot [TITLE]
-# Print a horizontal frame rule. The top rule embeds the app title.
-csp_frame_top() {
-  local title="$1" tw fill
-  tw=$(csp_display_width "$title")
-  # Layout: ┌─ <title> <fill dashes>┐   with the +2 accounting for the two
-  # spaces around the title, matching the " content " padding of the rows.
-  fill=$(( CSP_INNER + 2 - tw - 3 ))
-  [ "$fill" -lt 0 ] && fill=0
-  printf '%s%s%s %s %s%s%s\n' \
-    "$CSP_C_FRAME" "$CSP_BX_TL" "$CSP_BX_H" \
-    "${CSP_C_TITLE}${title}${CSP_C_RESET}${CSP_C_FRAME}" \
-    "$(csp_repeat "$CSP_BX_H" "$fill")" "$CSP_BX_TR" "$CSP_C_RESET"
-}
-csp_frame_mid() {
-  printf '%s%s%s%s%s%s\n' "$CSP_C_FRAME" "$CSP_BX_ML" \
-    "$(csp_repeat "$CSP_BX_H" "$(( CSP_INNER + 2 ))")" "$CSP_BX_MR" "" "$CSP_C_RESET"
-}
-csp_frame_bot() {
-  printf '%s%s%s%s%s\n' "$CSP_C_FRAME" "$CSP_BX_BL" \
-    "$(csp_repeat "$CSP_BX_H" "$(( CSP_INNER + 2 ))")" "$CSP_BX_BR" "$CSP_C_RESET"
-}
-
-# csp_frame_row CONTENT [SELECTED]
-# Print one content line inside the frame: "│ <content padded to CSP_INNER> │".
+# --- Frame style: horizontal rules only, NO vertical side borders ------------
+# We deliberately dropped the left/right "│" borders. Two reasons: (1) a right
+# border can only line up if every row's total display width is identical, and
+# CJK glyphs render at widths some fonts/terminals disagree with, so the right
+# edge drifted; (2) the left columns already align perfectly on their own. So we
+# keep only the top/middle/bottom horizontal rules — clean, modern, and immune
+# to that width ambiguity.
 #
-# IMPORTANT: CONTENT must be PLAIN text (no colour escapes), because we measure
-# its display width to pad the row to the exact inner width. We only add colour
-# AFTER padding — otherwise the invisible escape bytes would be counted as width
-# and the row would be truncated too early / the right border would misalign.
-#   • selected row → reverse video across the whole width (a solid highlight)
-#   • otherwise    → tint any green-able ● marker after padding (width is fixed
-#     by then, so recolouring a single glyph can't shift the layout)
-# Optional 3rd arg STYLE: a colour escape applied to the whole (plain) content
-# after padding — used for the dimmed mode line and column header. Passing plain
-# text + a style keeps width measurement correct (see the note above).
-csp_frame_row() {
-  local content="$1" selected="${2:-0}" style="${3:-}" fitted padded
-  fitted=$(csp_truncate_display "$content" "$CSP_INNER")
-  padded=$(csp_pad_display "$fitted" "$CSP_INNER")
-  # One format string used by every branch: left border, a space, the (already
-  # coloured) body, a space, right border, reset. Exactly 6 %s for 6 arguments —
-  # keeping these in lock-step matters: a spare argument makes printf reuse the
-  # format and emit a stray blank line after each row.
-  local body
-  if [ "$selected" = "1" ]; then
-    body="${CSP_C_SEL}${padded}${CSP_C_RESET}"
-  elif [ -n "$style" ]; then
-    body="${style}${padded}${CSP_C_RESET}"
-  else
-    # Recolour the live marker green (safe: width already fixed by padding).
-    [ -n "$CSP_C_LIVE" ] && padded="${padded/$CSP_MARKER_LIVE/${CSP_C_LIVE}${CSP_MARKER_LIVE}${CSP_C_RESET}}"
-    body="$padded"
-  fi
-  printf '%s%s %s %s%s%s\n' \
-    "$CSP_C_FRAME" "$CSP_BX_V" "$body" "$CSP_C_FRAME" "$CSP_BX_V" "$CSP_C_RESET"
+# Every draw helper APPENDS to the global CSP_BUF instead of printing, so the
+# whole screen is emitted in a single write (double buffering) — that is what
+# removes the flicker you'd get from clearing and redrawing line by line.
+CSP_BUF=""
+
+# csp_buf_line TEXT — add one line to the frame buffer, clearing to end-of-line
+# (\033[K) so leftover characters from a previous, longer frame are erased
+# without needing a full-screen clear (which is what caused flicker).
+csp_buf_line() {
+  CSP_BUF="${CSP_BUF}$1"$'\033[K\n'
 }
 
-# csp_draw SELECTED — render the framed menu for the given cursor position,
-# showing only the rows that fit and keeping the selection in view (see
-# csp_window_start). Draws a GUI-style panel: title bar, mode line, column
-# headings, the session rows (selected one highlighted), and a status bar.
+# csp_rule POSITION [TITLE] — append a horizontal rule. POSITION is top/mid/bot,
+# choosing the corner/junction glyphs; the top rule embeds the app title.
+csp_rule() {
+  local pos="$1" title="${2:-}" left right tw fill
+  case "$pos" in
+    top) left="$CSP_BX_TL"; right="$CSP_BX_TR" ;;
+    mid) left="$CSP_BX_ML"; right="$CSP_BX_MR" ;;
+    *)   left="$CSP_BX_BL"; right="$CSP_BX_BR" ;;
+  esac
+  if [ -n "$title" ]; then
+    tw=$(csp_display_width "$title")
+    fill=$(( CSP_INNER - tw - 3 ))       # "─ " + title + " " then dashes
+    [ "$fill" -lt 0 ] && fill=0
+    csp_buf_line "${CSP_C_FRAME}${left}${CSP_BX_H} ${CSP_C_TITLE}${title}${CSP_C_RESET}${CSP_C_FRAME} $(csp_repeat "$CSP_BX_H" "$fill")${right}${CSP_C_RESET}"
+  else
+    csp_buf_line "${CSP_C_FRAME}${left}$(csp_repeat "$CSP_BX_H" "$(( CSP_INNER ))")${right}${CSP_C_RESET}"
+  fi
+}
+
+# csp_buf_row CONTENT [SELECTED] [STYLE] — append one content row (no side
+# borders). A selected row is padded to the full width and shown in reverse
+# video so the highlight bar spans the whole line; other rows are printed as-is
+# (their left columns already align) with the live ● tinted green.
+csp_buf_row() {
+  local content="$1" selected="${2:-0}" style="${3:-}" padded
+  if [ "$selected" = "1" ]; then
+    padded=$(csp_pad_display "$(csp_truncate_display "$content" "$CSP_INNER")" "$CSP_INNER")
+    csp_buf_line "${CSP_C_SEL} ${padded}${CSP_C_RESET}"
+  elif [ -n "$style" ]; then
+    csp_buf_line "${style} $(csp_truncate_display "$content" "$CSP_INNER")${CSP_C_RESET}"
+  else
+    content=$(csp_truncate_display "$content" "$CSP_INNER")
+    [ -n "$CSP_C_LIVE" ] && content="${content/$CSP_MARKER_LIVE/${CSP_C_LIVE}${CSP_MARKER_LIVE}${CSP_C_RESET}}"
+    csp_buf_line " ${content}"
+  fi
+}
+
+# csp_draw SELECTED — build the whole menu into CSP_BUF and paint it in ONE
+# write, so moving the cursor never flickers. Layout: title rule, mode line,
+# rule, column headings, session rows (selected one highlighted), rule, and a
+# status bar. Only the rows that fit are drawn; the selection is kept in view.
 csp_draw() {
-  local selected="$1" i marker live_row row is_sel visible start last
+  local selected="$1" i marker row is_sel visible start last
   local mode_line header cols
 
-  # Fit the panel to the terminal (with sane min/max), once per frame.
+  # Fit the layout to the terminal (with sane min/max), once per frame.
   cols=$(csp_term_cols)
-  CSP_INNER=$(( cols - 4 ))
-  [ "$CSP_INNER" -gt 92 ] && CSP_INNER=92
+  CSP_INNER=$(( cols - 2 ))
+  [ "$CSP_INNER" -gt 96 ] && CSP_INNER=96
   [ "$CSP_INNER" -lt 40 ] && CSP_INNER=40
 
-  printf '\033[2J\033[H'   # clear screen, move cursor home
+  CSP_BUF=""   # start a fresh frame in the buffer
 
-  csp_frame_top "Claude Session Picker"
+  csp_rule top "Claude Session Picker"
 
-  # Mode line: says whether quitting a session returns you here (hub) or leaves
-  # others running (tmux), and — in hub with tmux present — how to get concurrency.
   if [ "$CSP_ACTIVE_BACKEND" = "tmux" ]; then
     mode_line="mode: tmux · each session in its own window, others keep running"
   else
     mode_line="mode: hub · quit a session to come back to this menu"
     csp_tmux_available && mode_line="$mode_line  (CSP_BACKEND=tmux for concurrency)"
   fi
-  csp_frame_row "$mode_line" 0 "$CSP_C_DIM"
-  csp_frame_mid
+  csp_buf_row "$mode_line" 0 "$CSP_C_DIM"
+  csp_rule mid
 
   if [ "$csp_count" -eq 0 ]; then
-    csp_frame_row "No Claude sessions found under $CSP_CLAUDE_DIR/projects"
-    csp_frame_row "Start one with:  claude    then reopen this picker."
-    csp_frame_bot
+    csp_buf_row "No Claude sessions found under $CSP_CLAUDE_DIR/projects"
+    csp_buf_row "Start one with:  claude    then reopen this picker."
+    csp_rule bot
+    # Paint: home the cursor, write the buffer, clear anything below.
+    printf '\033[H%s\033[J' "$CSP_BUF"
     return
   fi
 
-  # Column headings (● legend + Title / Project / Last active), dimmed.
   header=$(csp_format_line "●" "Title" "Project" "Last active" 0)
-  csp_frame_row "$header" 0 "$CSP_C_HEADER"
+  csp_buf_row "$header" 0 "$CSP_C_HEADER"
 
   visible=$(csp_visible_rows)
   start=$(csp_window_start "$selected" "$csp_count" "$visible")
@@ -408,17 +409,14 @@ csp_draw() {
     row=$(csp_format_line "$marker" "${csp_titles[$i]}" "${csp_projects[$i]}" \
       "${csp_ages[$i]}" "$([ "$i" -eq "$selected" ] && echo 1 || echo 0)")
     is_sel=0; [ "$i" -eq "$selected" ] && is_sel=1
-    # csp_frame_row tints the live ● green itself (after padding), so we pass the
-    # plain row and let it handle colour without disturbing the width.
-    csp_frame_row "$row" "$is_sel"
+    csp_buf_row "$row" "$is_sel"
     i=$((i + 1))
   done
 
-  csp_frame_mid
-  # Status bar: key hints on the left, position (n/total) on the right. We use
-  # plain ASCII key names (j/k, Enter) so their width is unambiguous across
-  # terminals, and colour just the key letters. Spacing is computed from the
-  # PLAIN text widths so the colour escapes never skew the alignment.
+  csp_rule mid
+  # Status bar: key hints on the left, position (n/total) on the right. Plain
+  # ASCII key names keep their width unambiguous; spacing uses plain-text widths
+  # so the colour escapes don't skew alignment.
   local keys_plain pos_plain keys pos gap
   keys_plain="j/k move   Enter open   n new   d del   R reload   q quit"
   pos_plain="$((selected + 1))/${csp_count}"
@@ -426,11 +424,13 @@ csp_draw() {
   pos="${CSP_C_DIM}${pos_plain}${CSP_C_RESET}"
   gap=$(( CSP_INNER - $(csp_display_width "$keys_plain") - $(csp_display_width "$pos_plain") ))
   [ "$gap" -lt 1 ] && gap=1
-  printf '%s%s %s %s%s\n' \
-    "$CSP_C_FRAME" "$CSP_BX_V" \
-    "${keys}$(csp_repeat ' ' "$gap")${pos}" \
-    "$CSP_C_FRAME" "$CSP_BX_V" "$CSP_C_RESET"
-  csp_frame_bot
+  csp_buf_line " ${keys}$(csp_repeat ' ' "$gap")${pos}"
+  csp_rule bot
+
+  # Paint the whole frame in one write: home the cursor (no full clear → no
+  # flicker), write the buffer (each line self-clears to EOL), then clear any
+  # leftover lines below the frame.
+  printf '\033[H%s\033[J' "$CSP_BUF"
 }
 
 # csp_open ID PROJECT LABEL — open a session through the active backend.
