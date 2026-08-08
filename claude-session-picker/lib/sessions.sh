@@ -290,6 +290,35 @@ csp_session_id_from_path() {
   printf '%s' "${base%.jsonl}"   # strip extension
 }
 
+# -----------------------------------------------------------------------------
+# csp_delete_session_file FILE
+#
+# Permanently delete one session file (its .jsonl transcript). This throws away
+# that conversation's history, so the interactive caller must confirm with the
+# user FIRST — this function just does the deletion.
+#
+# SAFETY: we refuse to delete anything that isn't a regular .jsonl file living
+# directly under the Claude projects directory. That guard means a corrupted or
+# unexpected path can never make us remove something outside the session store
+# (no directories, no files elsewhere, no symlink targets). Returns 0 on a
+# successful delete, 1 if the path failed the safety check or the delete failed.
+# -----------------------------------------------------------------------------
+csp_delete_session_file() {
+  local file="$1" projects="$CSP_CLAUDE_DIR/projects"
+
+  # Must be a regular file (not a directory or symlink) ...
+  [ -f "$file" ] || return 1
+  # ... whose name ends in .jsonl ...
+  case "$file" in *.jsonl) ;; *) return 1 ;; esac
+  # ... and which actually lives under the projects directory.
+  case "$file" in "$projects"/*) ;; *) return 1 ;; esac
+  # Reject any path trickery with ".." segments, belt-and-suspenders.
+  case "$file" in *..*) return 1 ;; esac
+
+  rm -f -- "$file" 2>/dev/null || return 1
+  return 0
+}
+
 # NOTE: launching a session now lives entirely in lib/backend.sh (hub and tmux
 # backends). There is intentionally no single "resume and exec" helper here —
 # whether we hand off with exec or return to the menu is a per-backend decision.

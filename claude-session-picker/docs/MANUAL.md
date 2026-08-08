@@ -98,6 +98,7 @@ itself and always keeps the cursor visible.
 | `G` | jump to the last (oldest) session |
 | `Enter` | open the selected session |
 | `n` | start a brand-new session, in the folder you ran the picker from |
+| `d` or `x` | delete the selected session's transcript — asks you to confirm, and won't delete a session that's currently running |
 | `R` or `l` | reload the list (picks up new sessions and refreshes the `●` markers) |
 | `q` or `Esc` | quit back to your shell |
 

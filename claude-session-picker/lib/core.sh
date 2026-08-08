@@ -200,27 +200,105 @@ csp_truncate() {
 }
 
 # -----------------------------------------------------------------------------
+# csp_display_width TEXT
+#
+# Print the number of TERMINAL COLUMNS that TEXT occupies. This is NOT the same
+# as the character count: a CJK character (Chinese/Japanese/Korean) and most
+# emoji take TWO columns, while ASCII takes one. Getting this right is what lets
+# us line the menu up into neat columns even when titles mix English and 中文.
+#
+# How it works without any external tool: in a UTF-8 locale ${#TEXT} counts
+# CHARACTERS, and the same measurement in the C locale counts BYTES. A wide
+# (CJK/emoji) glyph is a multi-byte character, so (chars + bytes) / 2 yields the
+# column width: an ASCII char is 1 char + 1 byte -> 1; a 3-byte CJK char is
+# 1 char + 3 bytes -> 2. This holds for the scripts we display and needs no fork.
+# -----------------------------------------------------------------------------
+csp_display_width() {
+  local text="$1" chars bytes
+  chars=${#text}
+  # Re-measure the SAME string as bytes by switching to the C locale locally.
+  local LC_ALL=C
+  bytes=${#text}
+  printf '%d' "$(( (chars + bytes) / 2 ))"
+}
+
+# -----------------------------------------------------------------------------
+# csp_pad_display TEXT WIDTH
+#
+# Print TEXT padded with trailing spaces so it occupies exactly WIDTH terminal
+# columns (using csp_display_width, so CJK is measured correctly). If TEXT is
+# already wider than WIDTH it is returned unchanged — truncation is the caller's
+# job (csp_truncate_display). This is the column-alignment primitive that fixes
+# the "中文 rows don't line up" problem printf '%-40s' can't solve.
+# -----------------------------------------------------------------------------
+csp_pad_display() {
+  local text="$1" width="$2" w pad=""
+  w=$(csp_display_width "$text")
+  if [ "$w" -lt "$width" ]; then
+    # Build the padding. A simple loop is fine for the small widths we use.
+    local n=$(( width - w ))
+    while [ "$n" -gt 0 ]; do pad="$pad "; n=$(( n - 1 )); done
+  fi
+  printf '%s%s' "$text" "$pad"
+}
+
+# -----------------------------------------------------------------------------
+# csp_truncate_display TEXT MAX
+#
+# Like csp_truncate, but measured in terminal COLUMNS, not characters, so a
+# title of Chinese text is cut to fit its column width and never overflows into
+# the next one. Adds a trailing '…' when it had to cut.
+# -----------------------------------------------------------------------------
+csp_truncate_display() {
+  local text="$1" max="$2"
+  if [ "$(csp_display_width "$text")" -le "$max" ]; then
+    printf '%s' "$text"
+    return 0
+  fi
+  # Grow a prefix one character at a time until adding the next char would
+  # exceed max-1 (leaving one column for the ellipsis). Character-by-character
+  # keeps us from ever splitting a multi-byte glyph.
+  local out="" i=0 ch w
+  while [ "$i" -lt "${#text}" ]; do
+    ch="${text:$i:1}"
+    w=$(csp_display_width "$out$ch")
+    [ "$w" -gt "$(( max - 1 ))" ] && break
+    out="$out$ch"
+    i=$(( i + 1 ))
+  done
+  printf '%s…' "$out"
+}
+
+# -----------------------------------------------------------------------------
 # csp_format_line MARKER TITLE PROJECT AGE SELECTED
 #
-# Build one printable row of the picker. Kept pure so tests can assert exactly
-# what a row looks like without a terminal.
+# Build one printable row of the picker as neatly aligned columns. Kept pure so
+# tests can assert exactly what a row looks like without a terminal. Colour and
+# selection highlighting are added by the drawing layer, not here — this returns
+# plain text so the tests stay simple and the widths are predictable.
 #
 #   MARKER    one of the CSP_MARKER_* characters
 #   TITLE     the session's title (already truncated upstream)
 #   PROJECT   short project path (from csp_short_path)
 #   AGE       human-friendly "last active" hint (e.g. "2h ago")
-#   SELECTED  "1" if the cursor is on this row
+#   SELECTED  "1" if the cursor is on this row (adds the "›" pointer)
 #
-# The row is truncated to CSP_MAX_LINE_LEN so a pathological value can never
-# produce an oversized line.
+# Columns are padded by DISPLAY WIDTH so mixed English/中文 rows line up.
 # -----------------------------------------------------------------------------
+CSP_COL_TITLE=40    # columns reserved for the title
+CSP_COL_PROJECT=26  # columns reserved for the project path
+
 csp_format_line() {
   local marker="$1" title="$2" project="$3" age="$4" selected="$5"
-  local cursor="  " line
+  local pointer="  " line title_col project_col
 
-  [ "$selected" = "1" ] && cursor="> "
+  [ "$selected" = "1" ] && pointer="› "
 
-  line=$(printf '%s%s %-40s  %-22s %s' "$cursor" "$marker" "$title" "$project" "$age")
+  # Fit each variable-width field to its column, then pad to align the next one.
+  title_col=$(csp_pad_display "$(csp_truncate_display "$title" "$CSP_COL_TITLE")" "$CSP_COL_TITLE")
+  project_col=$(csp_pad_display "$(csp_truncate_display "$project" "$CSP_COL_PROJECT")" "$CSP_COL_PROJECT")
+
+  line="${pointer}${marker} ${title_col}  ${project_col}  ${age}"
 
   if [ "${#line}" -gt "$CSP_MAX_LINE_LEN" ]; then
     line="${line:0:$CSP_MAX_LINE_LEN}"

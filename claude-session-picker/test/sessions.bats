@@ -216,6 +216,45 @@ EOF
   [ "$output" = "100" ]
 }
 
+@test "delete: removes a real session file under the projects dir" {
+  f="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-del.jsonl"
+  printf '{"type":"mode"}\n' > "$f"
+  [ -f "$f" ]
+  run csp_delete_session_file "$f"
+  [ "$status" -eq 0 ]
+  [ ! -e "$f" ]
+}
+
+@test "delete: refuses a path outside the projects dir" {
+  outside="$BATS_TEST_TMPDIR/precious.jsonl"
+  printf 'keep me\n' > "$outside"
+  run csp_delete_session_file "$outside"
+  [ "$status" -ne 0 ]
+  [ -f "$outside" ]        # untouched
+}
+
+@test "delete: refuses a non-.jsonl file even inside projects" {
+  other="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/notes.txt"
+  printf 'keep\n' > "$other"
+  run csp_delete_session_file "$other"
+  [ "$status" -ne 0 ]
+  [ -f "$other" ]
+}
+
+@test "delete: refuses a path containing .. segments" {
+  f="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-alpha.jsonl"
+  run csp_delete_session_file "$CSP_CLAUDE_DIR/projects/../projects/-Volumes-demo-alpha/id-alpha.jsonl"
+  [ "$status" -ne 0 ]
+  [ -f "$f" ]              # the real file survives
+}
+
+@test "delete: refuses a directory" {
+  d="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha"
+  run csp_delete_session_file "$d"
+  [ "$status" -ne 0 ]
+  [ -d "$d" ]
+}
+
 @test "missing projects dir is handled without error" {
   export CSP_CLAUDE_DIR="$BATS_TEST_TMPDIR/does-not-exist"
   run csp_list_session_files

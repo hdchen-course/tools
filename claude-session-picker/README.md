@@ -131,6 +131,7 @@ claude-session-picker
 | `g` / `G` | jump to the first / last session |
 | `Enter` | open the selected session |
 | `n` | start a **new** session in the directory you launched the picker from |
+| `d` or `x` | **delete** the selected session's history (asks you to confirm first) |
 | `R` or `l` | reload the list |
 | `q` or `Esc` | quit |
 

@@ -68,6 +68,30 @@ CSP_ACTIVE_BACKEND=$(csp_choose_backend \
   "$(csp_inside_tmux && echo 1 || echo 0)" \
   "${CSP_BACKEND:-}")
 
+# --- Colours & box-drawing ---------------------------------------------------
+# The menu is drawn as a framed "GUI-style" panel. All the escape codes live
+# here so the look is defined in one place. Colour is turned OFF automatically
+# when output is not a terminal, or when the user sets NO_COLOR (a widely
+# respected convention) or CSP_NO_COLOR — so the tool stays readable and its
+# output stays clean everywhere.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ -z "${CSP_NO_COLOR:-}" ]; then
+  CSP_C_RESET=$'\033[0m'
+  CSP_C_FRAME=$'\033[38;5;244m'   # dim grey for the box border
+  CSP_C_TITLE=$'\033[1;38;5;39m'  # bold blue for the app title
+  CSP_C_HEADER=$'\033[38;5;250m'  # column headings
+  CSP_C_SEL=$'\033[7m'            # reverse video for the selected row
+  CSP_C_LIVE=$'\033[38;5;42m'     # green for the ● running marker
+  CSP_C_DIM=$'\033[38;5;244m'     # dim for ages / hints
+  CSP_C_KEY=$'\033[1;38;5;250m'   # bold for key names in the status bar
+else
+  CSP_C_RESET=""; CSP_C_FRAME=""; CSP_C_TITLE=""; CSP_C_HEADER=""
+  CSP_C_SEL=""; CSP_C_LIVE=""; CSP_C_DIM=""; CSP_C_KEY=""
+fi
+
+# Box-drawing characters (Unicode). These render the frame.
+CSP_BX_TL="┌"; CSP_BX_TR="┐"; CSP_BX_BL="└"; CSP_BX_BR="┘"
+CSP_BX_H="─";  CSP_BX_V="│";  CSP_BX_ML="├"; CSP_BX_MR="┤"
+
 # --- Terminal handling -------------------------------------------------------
 # We switch the terminal into "raw-ish" mode to read single keypresses, and we
 # ALWAYS put it back. The trap guarantees restoration even if we crash or are
@@ -192,6 +216,7 @@ csp_ids=()
 csp_titles=()
 csp_projects=()
 csp_fullprojects=()   # full cwd path, kept for the resume `cd`
+csp_files=()          # on-disk .jsonl path, kept for delete
 csp_ages=()
 csp_lives=()
 csp_count=0
@@ -201,7 +226,7 @@ csp_count=0
 csp_load_sessions() {
   local file id meta title fullcwd project mtime now running is_live
   csp_ids=(); csp_titles=(); csp_projects=(); csp_fullprojects=()
-  csp_ages=(); csp_lives=()
+  csp_ages=(); csp_lives=(); csp_files=()
   csp_count=0
   now=$(csp_now_epoch)
   running=$(csp_running_session_ids)
@@ -225,6 +250,8 @@ csp_load_sessions() {
     csp_lives[$csp_count]="$is_live"
     # Remember the full project path alongside the id, for the resume `cd`.
     csp_fullprojects[$csp_count]="$fullcwd"
+    # Remember the on-disk file so we can delete the session if asked.
+    csp_files[$csp_count]="$file"
     csp_count=$((csp_count + 1))
   done <<EOF
 $(csp_list_session_files)
@@ -245,37 +272,130 @@ csp_visible_rows() {
   rows=$(stty size 2>/dev/null | { read -r r _ 2>/dev/null; printf '%s' "$r"; })
   case "$rows" in ''|*[!0-9]*) rows=$(tput lines 2>/dev/null) ;; esac
   case "$rows" in ''|*[!0-9]*) rows=24 ;; esac
-  rows=$((rows - 4))                 # reserve header (2) + spacing/footer (2)
+  # Reserve the frame chrome: top border, subtitle, divider, column header,
+  # divider, status bar, bottom border = 7 lines (8 for a little slack).
+  rows=$((rows - 8))
   [ "$rows" -lt 1 ] && rows=1
   printf '%d' "$rows"
 }
 
-# csp_draw SELECTED — render the menu for the given cursor position, showing
-# only the rows that fit and keeping the selection in view (see
-# csp_window_start). This is what lets a list of hundreds of sessions display
-# correctly on a short terminal without garbling the screen.
-csp_draw() {
-  local selected="$1" i marker line visible start last mode_hint
-  printf '\033[2J\033[H'   # clear screen, move cursor home
-  # The header names the active mode so you always know whether switching leaves
-  # other sessions running (tmux) or returns you here between sessions (hub).
-  if [ "$CSP_ACTIVE_BACKEND" = "tmux" ]; then
-    mode_hint="mode: tmux (others keep running)"
+# csp_term_cols — the terminal width in columns (stty first, then tput, then 80).
+csp_term_cols() {
+  local cols=""
+  cols=$(stty size 2>/dev/null | { read -r _ c 2>/dev/null; printf '%s' "$c"; })
+  case "$cols" in ''|*[!0-9]*) cols=$(tput cols 2>/dev/null) ;; esac
+  case "$cols" in ''|*[!0-9]*) cols=80 ;; esac
+  printf '%d' "$cols"
+}
+
+# csp_repeat STR N — print STR repeated N times (used to draw border rules).
+csp_repeat() {
+  local str="$1" n="$2" out=""
+  while [ "$n" -gt 0 ]; do out="$out$str"; n=$(( n - 1 )); done
+  printf '%s' "$out"
+}
+
+# The inner content width of the framed panel (columns between the │ borders,
+# excluding the one space of padding on each side). Set once per draw.
+CSP_INNER=82
+
+# csp_frame_top / _mid / _bot [TITLE]
+# Print a horizontal frame rule. The top rule embeds the app title.
+csp_frame_top() {
+  local title="$1" tw fill
+  tw=$(csp_display_width "$title")
+  # Layout: ┌─ <title> <fill dashes>┐   with the +2 accounting for the two
+  # spaces around the title, matching the " content " padding of the rows.
+  fill=$(( CSP_INNER + 2 - tw - 3 ))
+  [ "$fill" -lt 0 ] && fill=0
+  printf '%s%s%s %s %s%s%s\n' \
+    "$CSP_C_FRAME" "$CSP_BX_TL" "$CSP_BX_H" \
+    "${CSP_C_TITLE}${title}${CSP_C_RESET}${CSP_C_FRAME}" \
+    "$(csp_repeat "$CSP_BX_H" "$fill")" "$CSP_BX_TR" "$CSP_C_RESET"
+}
+csp_frame_mid() {
+  printf '%s%s%s%s%s%s\n' "$CSP_C_FRAME" "$CSP_BX_ML" \
+    "$(csp_repeat "$CSP_BX_H" "$(( CSP_INNER + 2 ))")" "$CSP_BX_MR" "" "$CSP_C_RESET"
+}
+csp_frame_bot() {
+  printf '%s%s%s%s%s\n' "$CSP_C_FRAME" "$CSP_BX_BL" \
+    "$(csp_repeat "$CSP_BX_H" "$(( CSP_INNER + 2 ))")" "$CSP_BX_BR" "$CSP_C_RESET"
+}
+
+# csp_frame_row CONTENT [SELECTED]
+# Print one content line inside the frame: "│ <content padded to CSP_INNER> │".
+#
+# IMPORTANT: CONTENT must be PLAIN text (no colour escapes), because we measure
+# its display width to pad the row to the exact inner width. We only add colour
+# AFTER padding — otherwise the invisible escape bytes would be counted as width
+# and the row would be truncated too early / the right border would misalign.
+#   • selected row → reverse video across the whole width (a solid highlight)
+#   • otherwise    → tint any green-able ● marker after padding (width is fixed
+#     by then, so recolouring a single glyph can't shift the layout)
+# Optional 3rd arg STYLE: a colour escape applied to the whole (plain) content
+# after padding — used for the dimmed mode line and column header. Passing plain
+# text + a style keeps width measurement correct (see the note above).
+csp_frame_row() {
+  local content="$1" selected="${2:-0}" style="${3:-}" fitted padded
+  fitted=$(csp_truncate_display "$content" "$CSP_INNER")
+  padded=$(csp_pad_display "$fitted" "$CSP_INNER")
+  # One format string used by every branch: left border, a space, the (already
+  # coloured) body, a space, right border, reset. Exactly 6 %s for 6 arguments —
+  # keeping these in lock-step matters: a spare argument makes printf reuse the
+  # format and emit a stray blank line after each row.
+  local body
+  if [ "$selected" = "1" ]; then
+    body="${CSP_C_SEL}${padded}${CSP_C_RESET}"
+  elif [ -n "$style" ]; then
+    body="${style}${padded}${CSP_C_RESET}"
   else
-    mode_hint="mode: hub (quit a session to return here)"
-    # If tmux is installed but the user is in hub, tell them how to unlock
-    # true concurrency — otherwise it's an invisible feature.
-    if csp_tmux_available; then
-      mode_hint="$mode_hint  ·  CSP_BACKEND=tmux for concurrent windows"
-    fi
+    # Recolour the live marker green (safe: width already fixed by padding).
+    [ -n "$CSP_C_LIVE" ] && padded="${padded/$CSP_MARKER_LIVE/${CSP_C_LIVE}${CSP_MARKER_LIVE}${CSP_C_RESET}}"
+    body="$padded"
   fi
-  printf 'Claude Session Picker   ● = running    %s\n' "$mode_hint"
-  printf '%s\n' '(j/k move   Enter open   n new session   R reload   q quit)'
+  printf '%s%s %s %s%s%s\n' \
+    "$CSP_C_FRAME" "$CSP_BX_V" "$body" "$CSP_C_FRAME" "$CSP_BX_V" "$CSP_C_RESET"
+}
+
+# csp_draw SELECTED — render the framed menu for the given cursor position,
+# showing only the rows that fit and keeping the selection in view (see
+# csp_window_start). Draws a GUI-style panel: title bar, mode line, column
+# headings, the session rows (selected one highlighted), and a status bar.
+csp_draw() {
+  local selected="$1" i marker live_row row is_sel visible start last
+  local mode_line header cols
+
+  # Fit the panel to the terminal (with sane min/max), once per frame.
+  cols=$(csp_term_cols)
+  CSP_INNER=$(( cols - 4 ))
+  [ "$CSP_INNER" -gt 92 ] && CSP_INNER=92
+  [ "$CSP_INNER" -lt 40 ] && CSP_INNER=40
+
+  printf '\033[2J\033[H'   # clear screen, move cursor home
+
+  csp_frame_top "Claude Session Picker"
+
+  # Mode line: says whether quitting a session returns you here (hub) or leaves
+  # others running (tmux), and — in hub with tmux present — how to get concurrency.
+  if [ "$CSP_ACTIVE_BACKEND" = "tmux" ]; then
+    mode_line="mode: tmux · each session in its own window, others keep running"
+  else
+    mode_line="mode: hub · quit a session to come back to this menu"
+    csp_tmux_available && mode_line="$mode_line  (CSP_BACKEND=tmux for concurrency)"
+  fi
+  csp_frame_row "$mode_line" 0 "$CSP_C_DIM"
+  csp_frame_mid
 
   if [ "$csp_count" -eq 0 ]; then
-    printf '  (no Claude sessions found under %s/projects)\n' "$CSP_CLAUDE_DIR"
+    csp_frame_row "No Claude sessions found under $CSP_CLAUDE_DIR/projects"
+    csp_frame_row "Start one with:  claude    then reopen this picker."
+    csp_frame_bot
     return
   fi
+
+  # Column headings (● legend + Title / Project / Last active), dimmed.
+  header=$(csp_format_line "●" "Title" "Project" "Last active" 0)
+  csp_frame_row "$header" 0 "$CSP_C_HEADER"
 
   visible=$(csp_visible_rows)
   start=$(csp_window_start "$selected" "$csp_count" "$visible")
@@ -285,16 +405,32 @@ csp_draw() {
   i="$start"
   while [ "$i" -lt "$last" ]; do
     marker=$(csp_marker_for_session "${csp_lives[$i]}")
-    line=$(csp_format_line "$marker" "${csp_titles[$i]}" "${csp_projects[$i]}" \
+    row=$(csp_format_line "$marker" "${csp_titles[$i]}" "${csp_projects[$i]}" \
       "${csp_ages[$i]}" "$([ "$i" -eq "$selected" ] && echo 1 || echo 0)")
-    printf '%s\n' "$line"
+    is_sel=0; [ "$i" -eq "$selected" ] && is_sel=1
+    # csp_frame_row tints the live ● green itself (after padding), so we pass the
+    # plain row and let it handle colour without disturbing the width.
+    csp_frame_row "$row" "$is_sel"
     i=$((i + 1))
   done
 
-  # Show a position hint when the list is scrolled.
-  if [ "$csp_count" -gt "$visible" ]; then
-    printf '%s\n' "-- $((selected + 1))/$csp_count --"
-  fi
+  csp_frame_mid
+  # Status bar: key hints on the left, position (n/total) on the right. We use
+  # plain ASCII key names (j/k, Enter) so their width is unambiguous across
+  # terminals, and colour just the key letters. Spacing is computed from the
+  # PLAIN text widths so the colour escapes never skew the alignment.
+  local keys_plain pos_plain keys pos gap
+  keys_plain="j/k move   Enter open   n new   d del   R reload   q quit"
+  pos_plain="$((selected + 1))/${csp_count}"
+  keys="${CSP_C_KEY}j/k${CSP_C_RESET}${CSP_C_DIM} move   ${CSP_C_KEY}Enter${CSP_C_RESET}${CSP_C_DIM} open   ${CSP_C_KEY}n${CSP_C_RESET}${CSP_C_DIM} new   ${CSP_C_KEY}d${CSP_C_RESET}${CSP_C_DIM} del   ${CSP_C_KEY}R${CSP_C_RESET}${CSP_C_DIM} reload   ${CSP_C_KEY}q${CSP_C_RESET}${CSP_C_DIM} quit${CSP_C_RESET}"
+  pos="${CSP_C_DIM}${pos_plain}${CSP_C_RESET}"
+  gap=$(( CSP_INNER - $(csp_display_width "$keys_plain") - $(csp_display_width "$pos_plain") ))
+  [ "$gap" -lt 1 ] && gap=1
+  printf '%s%s %s %s%s\n' \
+    "$CSP_C_FRAME" "$CSP_BX_V" \
+    "${keys}$(csp_repeat ' ' "$gap")${pos}" \
+    "$CSP_C_FRAME" "$CSP_BX_V" "$CSP_C_RESET"
+  csp_frame_bot
 }
 
 # csp_open ID PROJECT LABEL — open a session through the active backend.
@@ -334,6 +470,52 @@ csp_open() {
   csp_load_sessions
 }
 
+# csp_confirm PROMPT — ask a yes/no question and return 0 only for an explicit
+# "y". We briefly leave raw mode so the user can see what they type and use
+# Backspace, show the cursor, then restore raw mode afterwards. Used to guard
+# the destructive delete action.
+csp_confirm() {
+  local prompt="$1" answer
+  # Drop back to cooked mode + visible cursor for a normal line of input.
+  [ -n "$csp_saved_stty" ] && stty "$csp_saved_stty" 2>/dev/null
+  printf '\033[?25h'
+  printf '\n%s' "$prompt" > /dev/tty
+  IFS= read -r answer < /dev/tty
+  csp_enter_raw_mode
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# csp_action_delete INDEX — confirm, then permanently delete the selected
+# session's transcript file, then reload the list. Deleting throws away that
+# conversation's history, so we always confirm first and we never touch a live
+# session (one Claude is currently running) — killing its file mid-run would be
+# surprising; the user should quit that Claude first.
+csp_action_delete() {
+  local idx="$1" title file
+  [ "$csp_count" -gt 0 ] || return 0
+  title="${csp_titles[$idx]}"
+  file="${csp_files[$idx]}"
+
+  if [ "${csp_lives[$idx]}" = "1" ]; then
+    csp_restore_terminal
+    printf '\n"%s" is running right now — quit that Claude first, then delete.\n' "$title" > /dev/tty
+    printf 'Press Enter to continue…' > /dev/tty; IFS= read -r _ < /dev/tty
+    csp_enter_raw_mode
+    return 0
+  fi
+
+  if csp_confirm "Delete session \"$title\"? This erases its history. [y/N] "; then
+    if csp_delete_session_file "$file"; then
+      # Keep the cursor sensible: if we deleted the last row, step up one.
+      [ "$idx" -ge "$((csp_count - 1))" ] && [ "$idx" -gt 0 ] && csp_selected_after_delete=$((idx - 1))
+    fi
+    csp_load_sessions
+  fi
+}
+
 # --- Main loop ---------------------------------------------------------------
 csp_main() {
   if ! command -v claude >/dev/null 2>&1; then
@@ -367,6 +549,10 @@ csp_main() {
          fi ;;
       n) # Start a brand-new session (in the current directory).
          csp_open "new" "$PWD" "new" ;;
+      d|x) # Delete the selected session (asks to confirm first).
+         csp_selected_after_delete=""
+         csp_action_delete "$selected"
+         [ -n "$csp_selected_after_delete" ] && selected="$csp_selected_after_delete" ;;
       R|l) csp_load_sessions ;;
       q) break ;;
     esac

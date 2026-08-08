@@ -146,12 +146,69 @@ setup() {
   [ "${#output}" -eq 4 ]
 }
 
+# --- display-width helpers (CJK alignment) -----------------------------------
+
+@test "width: ASCII counts one column per character" {
+  run csp_display_width "hello"
+  [ "$output" = "5" ]
+}
+
+@test "width: CJK characters count two columns each" {
+  run csp_display_width "白銀"       # 2 wide chars -> 4 columns
+  [ "$output" = "4" ]
+}
+
+@test "width: mixed ASCII and CJK adds up correctly" {
+  run csp_display_width "abc白d"     # 4 ascii (4) + 1 CJK (2) = 6
+  [ "$output" = "6" ]
+}
+
+@test "pad: pads a short string to the requested display width" {
+  run csp_pad_display "hi" 6
+  [ "$output" = "hi    " ]           # 2 + 4 spaces = 6 columns
+}
+
+@test "pad: pads a CJK string by display width, not char count" {
+  run csp_pad_display "白銀" 6        # width 4 -> add 2 spaces
+  [ "$output" = "白銀  " ]
+}
+
+@test "pad: a string already at/over width is unchanged" {
+  run csp_pad_display "hello" 3
+  [ "$output" = "hello" ]
+}
+
+@test "truncate-display: a CJK title is cut to fit its column width" {
+  # 6 wide chars = 12 columns; fit into 8 -> keep chars whose width <=7 + '…'
+  run csp_truncate_display "實作切換工具" 8
+  [ "$(csp_display_width "$output")" -le 8 ]
+  case "$output" in *…) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
+}
+
 # --- csp_format_line ---------------------------------------------------------
 
-@test "format: selected row starts with the cursor marker" {
+@test "format: selected row starts with the cursor pointer" {
   run csp_format_line "$CSP_MARKER_LIVE" "my title" "proj/dir" "2h ago" 1
-  case "$output" in ">"*) ok=1 ;; *) ok=0 ;; esac
+  case "$output" in "›"*) ok=1 ;; *) ok=0 ;; esac
   [ "$ok" = "1" ]
+}
+
+@test "format: unselected row does not start with the pointer" {
+  run csp_format_line "$CSP_MARKER_NONE" "my title" "proj/dir" "2h ago" 0
+  case "$output" in "›"*) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "0" ]
+}
+
+@test "format: CJK and ASCII rows align to the same project column" {
+  # The project field must start at the same display column regardless of
+  # whether the title is Chinese or English.
+  cjk=$(csp_format_line " " "白銀交易訊號框架研究" "proj/a" "1m ago" 0)
+  ascii=$(csp_format_line " " "Refactor the parser" "proj/b" "1m ago" 0)
+  # Column where "proj" appears, measured in display width of the prefix.
+  cjk_pre="${cjk%%proj/a*}"
+  ascii_pre="${ascii%%proj/b*}"
+  [ "$(csp_display_width "$cjk_pre")" = "$(csp_display_width "$ascii_pre")" ]
 }
 
 @test "format: pathological long title cannot exceed the line cap" {
