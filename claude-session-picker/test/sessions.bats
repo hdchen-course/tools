@@ -12,6 +12,10 @@
 
 setup() {
   export LC_ALL="${LC_ALL:-en_US.UTF-8}"   # stable char counting for titles
+  # Start from a known default regardless of the CALLER's environment — a test
+  # that asserts "the default is 64" must not inherit CSP_META_HEAD_LINES=500
+  # from whoever invoked bats.
+  unset CSP_META_HEAD_LINES
   . "$BATS_TEST_DIRNAME/../lib/core.sh"
   . "$BATS_TEST_DIRNAME/../lib/sessions.sh"
 
@@ -106,6 +110,43 @@ EOF
     . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
     printf "%s" "$CSP_META_HEAD_LINES"'
   [ "$output" = "64" ]
+}
+
+@test "meta: CSP_META_HEAD_LINES=0 and huge values are normalised, not honoured literally" {
+  # 0 would make head read nothing (everything untitled); huge values could be
+  # read differently by BSD head vs Python. Both normalise to a sane number.
+  run env CSP_META_HEAD_LINES=0 bash -c '
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
+    printf "%s" "$CSP_META_HEAD_LINES"'
+  [ "$output" = "64" ]
+  run env CSP_META_HEAD_LINES=999999999 bash -c '
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
+    printf "%s" "$CSP_META_HEAD_LINES"'
+  [ "$output" -le 100000 ]
+  [ "$output" -gt 0 ]
+}
+
+@test "meta: the built-in (no jq/python) reader ALSO honours CSP_META_HEAD_LINES" {
+  # Regression: the grep fallback used to scan the whole file, ignoring the
+  # limit. Force the fallback by shadowing jq/python detection.
+  deep="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-deepfb.jsonl"
+  {
+    printf '%s\n' '{"type":"user","cwd":"/Volumes/demo/real"}'
+    n=0; while [ "$n" -lt 30 ]; do printf '%s\n' '{"type":"assistant"}'; n=$((n+1)); done
+    printf '%s\n' '{"type":"ai-title","aiTitle":"fallback deep title"}'   # ~line 32
+  } > "$deep"
+  # limit=5 via the fallback: the title (line 32) must NOT be found.
+  run env CSP_META_HEAD_LINES=5 CSP_CLAUDE_DIR="$CSP_CLAUDE_DIR" bash -c '
+    command() { if [ "$1" = "-v" ] && { [ "$2" = jq ] || [ "$2" = python3 ]; }; then return 1; fi; builtin command "$@"; }
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
+    m=$(csp_session_meta "'"$deep"'"); csp_field "$m" 1'
+  [ "$output" = "(untitled)" ]
+  # limit=64 via the fallback: now it IS found.
+  run env CSP_META_HEAD_LINES=64 CSP_CLAUDE_DIR="$CSP_CLAUDE_DIR" bash -c '
+    command() { if [ "$1" = "-v" ] && { [ "$2" = jq ] || [ "$2" = python3 ]; }; then return 1; fi; builtin command "$@"; }
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
+    m=$(csp_session_meta "'"$deep"'"); csp_field "$m" 1'
+  [ "$output" = "fallback deep title" ]
 }
 
 @test "id: derived from the file name" {

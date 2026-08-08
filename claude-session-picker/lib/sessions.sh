@@ -195,11 +195,24 @@ CSP_META_TITLE_CLIP=256
 # Claude's layout; the extractor already tolerates missing fields everywhere.
 #
 # Overridable via the environment so an early adopter who hits a format change
-# can widen the window (or set it very large to effectively disable the cap)
-# without editing the source: CSP_META_HEAD_LINES=500 claude-session-picker. A
-# non-numeric value is ignored in favour of the default.
+# can widen the window without editing the source:
+# CSP_META_HEAD_LINES=500 claude-session-picker.
+#
+# We normalise to a SANE POSITIVE integer:
+#   • non-numeric / empty → the default (64);
+#   • 0 (or a leading-zero form that evaluates to 0) → the default, because 0
+#     would make `head -n 0` read nothing and every session show (untitled)/?;
+#   • absurdly large values are capped at CSP_META_HEAD_MAX so a huge digit
+#     string can't be interpreted differently by BSD head vs Python, nor make us
+#     read an unbounded prefix.
+CSP_META_HEAD_MAX=100000
 CSP_META_HEAD_LINES="${CSP_META_HEAD_LINES:-64}"
-case "$CSP_META_HEAD_LINES" in ''|*[!0-9]*) CSP_META_HEAD_LINES=64 ;; esac
+case "$CSP_META_HEAD_LINES" in
+  ''|*[!0-9]*) CSP_META_HEAD_LINES=64 ;;                       # non-numeric
+  *) CSP_META_HEAD_LINES=$(( 10#$CSP_META_HEAD_LINES ))        # strip leading zeros
+     [ "$CSP_META_HEAD_LINES" -le 0 ] && CSP_META_HEAD_LINES=64
+     [ "$CSP_META_HEAD_LINES" -gt "$CSP_META_HEAD_MAX" ] && CSP_META_HEAD_LINES="$CSP_META_HEAD_MAX" ;;
+esac
 
 csp_session_meta() {
   local file="$1" out title cwd tab
@@ -269,14 +282,21 @@ print(chosen + "\t" + cwd)
 PYEOF
 )
   else
-    # No JSON parser available: use the granular grep-based readers, then clip
-    # and sanitise here so this path has the same guarantees as the others.
-    title=$(csp_session_title "$file")
-    cwd=$(csp_session_project "$file")
-    # Clip with a bash substring (short strings only reach here in practice, and
-    # the clip itself bounds the cost), then strip control chars via tr.
-    title=$(printf '%s' "${title:0:$CSP_META_TITLE_CLIP}" | tr -d '\000-\037\177')
-    out="$title$tab$cwd"
+    # No JSON parser available: grep the fields out of just the HEAD of the file,
+    # so this path honours CSP_META_HEAD_LINES exactly like the jq/python paths
+    # (the granular csp_session_* helpers scan the whole file, which would
+    # violate the documented limit and restore expensive full-file scans). This
+    # regex doesn't handle escaped quotes inside a value — acceptable for a title
+    # preview, same limitation the granular reader documents.
+    local head t p c
+    head=$(head -n "$CSP_META_HEAD_LINES" "$file" 2>/dev/null)
+    t=$(printf '%s\n' "$head" | grep -m1 -o '"aiTitle":"[^"]*"'    | sed 's/^"aiTitle":"//; s/"$//')
+    p=$(printf '%s\n' "$head" | grep -m1 -o '"lastPrompt":"[^"]*"' | sed 's/^"lastPrompt":"//; s/"$//')
+    c=$(printf '%s\n' "$head" | grep -m1 -o '"cwd":"[^"]*"'        | sed 's/^"cwd":"//; s/"$//')
+    [ -z "$t" ] && t="$p"
+    # Clip and strip control chars so this path matches the others' guarantees.
+    title=$(printf '%s' "${t:0:$CSP_META_TITLE_CLIP}" | tr -d '\000-\037\177')
+    out="$title$tab$c"
   fi
 
   # Defence in depth: even if an extractor misbehaved, make sure bash never

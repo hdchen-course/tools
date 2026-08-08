@@ -7,6 +7,26 @@ command is a symlink updated in place by `git pull`, so this file (and the
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/);
 this project uses simple `MAJOR.MINOR.PATCH` version numbers.
 
+## 1.1.0
+
+### Added
+- `CSP_META_HEAD_LINES` environment variable — how many lines from the top of
+  each session file are scanned for its title/project (default 64). Raise it if
+  a future Claude Code format ever writes the title lower in the file. The value
+  is normalised to a sane positive integer (non-numeric or `0` → default; very
+  large values are capped).
+- `CSP_TMUX_SOCKET` documented — the dedicated `tmux -L` socket name the tool
+  runs on; change it in the unlikely event of a socket-name collision.
+
+### Fixed
+- The built-in (no-jq/no-python) title reader now honours `CSP_META_HEAD_LINES`
+  too — previously it scanned the whole file, ignoring the limit.
+- tmux mode hardening: `CSP_TMUX_SOCKET` is sanitized (a name with `,`/`/`
+  previously broke the "am I inside our tmux?" check and caused a re-exec into a
+  broken nested attach); the picker window launches via `env VAR=val …` so it
+  works under a csh/tcsh default-shell; `TMUX_TMPDIR` is forwarded across the
+  re-exec.
+
 ## 1.0.0
 
 First tagged release. A zero-dependency, keyboard-driven menu for listing and
