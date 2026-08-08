@@ -33,6 +33,14 @@ CSP_MARKER_NONE=" "       # Idle-and-seen, or no live Claude here.
 # Back-compat alias: some code/tests still refer to the old "live" name.
 CSP_MARKER_LIVE="$CSP_MARKER_WORKING"
 
+# The single-character ellipsis appended when text is truncated. It is stored in
+# a variable, set ONCE here in the (UTF-8) startup locale, and never written as
+# a literal inside a function. Reason: bash 3.2 mis-parses a multibyte literal
+# that appears in a function which has (via a helper) switched LC_ALL to C — the
+# literal's bytes corrupt the following token, breaking the string or tripping
+# `set -u`. Referencing a pre-set variable sidesteps that entirely.
+CSP_ELLIPSIS='…'
+
 # Hard upper bounds. These exist so a broken or hostile input can never make the
 # tool loop forever or build an unbounded string.
 CSP_MAX_SESSIONS=1000  # Never load more sessions than this into the menu.
@@ -236,7 +244,7 @@ csp_truncate() {
   if [ "${#text}" -le "$max" ]; then
     printf '%s' "$text"
   else
-    printf '%s…' "${text:0:$((max - 1))}"
+    printf '%s%s' "${text:0:$((max - 1))}" "$CSP_ELLIPSIS"
   fi
 }
 
@@ -290,6 +298,9 @@ csp_display_width() {
   local i=0 ch wide=0
   while [ "$i" -lt "$chars" ]; do
     ch="${text:$i:1}"                 # one CHARACTER (current UTF-8 locale)
+    # The ellipsis U+2026 is 3 bytes but renders in ONE column, so it's an
+    # exception to the "3+ bytes = wide" rule — skip it (leave it counted as 1).
+    [ "$ch" = "$CSP_ELLIPSIS" ] && { i=$(( i + 1 )); continue; }
     csp_byte_len_var "$ch"            # sets __csp_bl to the byte length
     [ "$__csp_bl" -ge 3 ] && wide=$(( wide + 1 ))
     i=$(( i + 1 ))
@@ -316,23 +327,79 @@ csp_byte_len_var() {
 __csp_bl=0
 
 # -----------------------------------------------------------------------------
-# csp_pad_display TEXT WIDTH
+# csp_fit_field TEXT WIDTH  → result in the global __csp_fit
 #
-# Print TEXT padded with trailing spaces so it occupies exactly WIDTH terminal
-# columns (using csp_display_width, so CJK is measured correctly). If TEXT is
-# already wider than WIDTH it is returned unchanged — truncation is the caller's
-# job (csp_truncate_display). This is the column-alignment primitive that fixes
-# the "中文 rows don't line up" problem printf '%-40s' can't solve.
+# Fit TEXT to EXACTLY WIDTH terminal columns: truncate (with a trailing '…') if
+# it's too wide, pad with spaces if it's too narrow. This is the workhorse for
+# every column in every row, so it is written to be FAST:
+#   • ONE pass over the characters (not the old O(n²) "re-measure the whole
+#     prefix for each character"),
+#   • NO forks — it measures each character's byte length via csp_byte_len_var
+#     (a function call that sets a global), and returns its result in the global
+#     __csp_fit instead of via a $(...) command substitution.
+# Wide (CJK/emoji, 3+ byte) characters count as 2 columns; everything else as 1.
+# When truncating we never split a multi-byte glyph, and we reserve 1 column for
+# the ellipsis. A wide char that would land on the last single column is dropped
+# and the gap is space-padded, so the field is always exactly WIDTH wide.
 # -----------------------------------------------------------------------------
-csp_pad_display() {
-  local text="$1" width="$2" w pad=""
-  w=$(csp_display_width "$text")
-  if [ "$w" -lt "$width" ]; then
-    # Build the padding. A simple loop is fine for the small widths we use.
-    local n=$(( width - w ))
-    while [ "$n" -gt 0 ]; do pad="$pad "; n=$(( n - 1 )); done
+csp_fit_field() {
+  local text="$1" width="$2"
+  local i=0 n="${#text}" w=0 out="" ch cw truncated=0
+
+  # First, does the whole text fit? Walk it once accumulating column width.
+  # If at any point adding the next character would exceed `width`, we know we
+  # must truncate — and we rebuild a shorter prefix that leaves 1 column for the
+  # ellipsis. Building FORWARD (never trimming from the end) avoids the fragile
+  # `${out: -1}` slice on multibyte data and keeps everything single-pass.
+  while [ "$i" -lt "$n" ]; do
+    ch="${text:$i:1}"
+    cw=1
+    if [ "$ch" != "$CSP_ELLIPSIS" ]; then     # … is 3 bytes but 1 column
+      csp_byte_len_var "$ch"
+      [ "$__csp_bl" -ge 3 ] && cw=2
+    fi
+    if [ "$(( w + cw ))" -gt "$width" ]; then truncated=1; break; fi
+    out="$out$ch"
+    w=$(( w + cw ))
+    i=$(( i + 1 ))
+  done
+
+  if [ "$truncated" = "1" ]; then
+    # Rebuild a prefix that fits in width-1 columns, then append the ellipsis.
+    local limit=$(( width - 1 ))
+    i=0; w=0; out=""
+    while [ "$i" -lt "$n" ]; do
+      ch="${text:$i:1}"
+      cw=1
+      if [ "$ch" != "$CSP_ELLIPSIS" ]; then
+        csp_byte_len_var "$ch"
+        [ "$__csp_bl" -ge 3 ] && cw=2
+      fi
+      if [ "$(( w + cw ))" -gt "$limit" ]; then break; fi
+      out="$out$ch"
+      w=$(( w + cw ))
+      i=$(( i + 1 ))
+    done
+    out="$out$CSP_ELLIPSIS"       # variable, NOT a literal — see CSP_ELLIPSIS
+    w=$(( w + 1 ))
   fi
-  printf '%s%s' "$text" "$pad"
+
+  # Pad to the exact width.
+  while [ "$w" -lt "$width" ]; do out="$out "; w=$(( w + 1 )); done
+  __csp_fit="$out"
+}
+__csp_fit=""
+
+# csp_pad_display / csp_truncate_display — thin wrappers kept for the tests and
+# any external caller. They print their result (a fork at the call site), so the
+# hot draw path uses csp_fit_field directly instead. pad only grows; truncate
+# only shrinks — csp_fit_field does both, so we clamp accordingly.
+csp_pad_display() {
+  local text="$1" width="$2" w
+  w=$(csp_display_width "$text")
+  if [ "$w" -ge "$width" ]; then printf '%s' "$text"; return 0; fi
+  csp_fit_field "$text" "$width"
+  printf '%s' "$__csp_fit"
 }
 
 # -----------------------------------------------------------------------------
@@ -343,23 +410,18 @@ csp_pad_display() {
 # the next one. Adds a trailing '…' when it had to cut.
 # -----------------------------------------------------------------------------
 csp_truncate_display() {
-  local text="$1" max="$2"
-  if [ "$(csp_display_width "$text")" -le "$max" ]; then
+  local text="$1" max="$2" w
+  w=$(csp_display_width "$text")
+  if [ "$w" -le "$max" ]; then
     printf '%s' "$text"
     return 0
   fi
-  # Grow a prefix one character at a time until adding the next char would
-  # exceed max-1 (leaving one column for the ellipsis). Character-by-character
-  # keeps us from ever splitting a multi-byte glyph.
-  local out="" i=0 ch w
-  while [ "$i" -lt "${#text}" ]; do
-    ch="${text:$i:1}"
-    w=$(csp_display_width "$out$ch")
-    [ "$w" -gt "$(( max - 1 ))" ] && break
-    out="$out$ch"
-    i=$(( i + 1 ))
-  done
-  printf '%s…' "$out"
+  # csp_fit_field truncates AND pads to exactly max; this helper only truncates,
+  # so strip the trailing pad spaces it added after the ellipsis.
+  csp_fit_field "$text" "$max"
+  local r="$__csp_fit"
+  while [ "${r% }" != "$r" ]; do r="${r% }"; done   # drop trailing spaces
+  printf '%s' "$r"
 }
 
 # -----------------------------------------------------------------------------
@@ -387,9 +449,10 @@ csp_format_line() {
 
   [ "$selected" = "1" ] && pointer="› "
 
-  # Fit each variable-width field to its column, then pad to align the next one.
-  title_col=$(csp_pad_display "$(csp_truncate_display "$title" "$CSP_COL_TITLE")" "$CSP_COL_TITLE")
-  project_col=$(csp_pad_display "$(csp_truncate_display "$project" "$CSP_COL_PROJECT")" "$CSP_COL_PROJECT")
+  # Fit each variable-width field to its exact column in ONE fork-free pass each
+  # (csp_fit_field both truncates and pads, returning via __csp_fit).
+  csp_fit_field "$title" "$CSP_COL_TITLE";     title_col="$__csp_fit"
+  csp_fit_field "$project" "$CSP_COL_PROJECT"; project_col="$__csp_fit"
 
   line="${pointer}${marker} ${title_col}  ${project_col}  ${age}"
 

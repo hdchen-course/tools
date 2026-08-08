@@ -298,14 +298,42 @@ csp_files=()          # on-disk .jsonl path, kept for delete
 csp_ages=()
 csp_lives=()
 csp_states=()         # per-session hook state: working/waiting/"" (for ●/✳)
+csp_rows=()           # fully-formatted row body, precomputed once at load
+csp_line_normal=()    # display-ready line (marker tinted), per row
+csp_line_selected=()  # display-ready line (reverse video + cursor), per row
 csp_count=0
+
+# csp_precompute_lines INDEX ROW — build the two display-ready line forms for a
+# row (see the comment at the call site). Depends on the colour variables and on
+# CSP_INNER (for the selected row's full-width reverse-video bar), so it is also
+# re-run for every row by csp_build_chrome when the terminal width changes.
+csp_precompute_lines() {
+  local idx="$1" row="$2" mk tint padded
+
+  # Normal line: colour just the marker glyph (3rd char: after "  " cursor gap).
+  mk="${row:2:1}"; tint=""
+  case "$mk" in
+    "$CSP_MARKER_ATTENTION") tint="$CSP_C_ATTN" ;;
+    "$CSP_MARKER_WORKING")   tint="$CSP_C_LIVE" ;;
+  esac
+  if [ -n "$tint" ]; then
+    csp_line_normal[$idx]=" ${row:0:2}${tint}${mk}${CSP_C_RESET}${row:3}"
+  else
+    csp_line_normal[$idx]=" ${row}"
+  fi
+
+  # Selected line: cursor pointer + full-width reverse-video bar.
+  csp_fit_field "› ${row:2}" "$CSP_INNER"; padded="$__csp_fit"
+  csp_line_selected[$idx]="${CSP_C_SEL} ${padded}${CSP_C_RESET}"
+}
 
 # csp_load_sessions — build the model from Claude's session store. Enforces the
 # CSP_MAX_SESSIONS cap (via csp_list_session_files) so memory stays bounded.
 csp_load_sessions() {
-  local file id meta title fullcwd project mtime now running is_live
+  local file id meta title fullcwd project mtime now running is_live marker row
   csp_ids=(); csp_titles=(); csp_projects=(); csp_fullprojects=()
-  csp_ages=(); csp_lives=(); csp_files=(); csp_states=()
+  csp_ages=(); csp_lives=(); csp_files=(); csp_states=(); csp_rows=()
+  csp_line_normal=(); csp_line_selected=()
   csp_count=0
   now=$(csp_now_epoch)
   running=$(csp_running_session_ids)
@@ -334,6 +362,21 @@ csp_load_sessions() {
     csp_fullprojects[$csp_count]="$fullcwd"
     # Remember the on-disk file so we can delete the session if asked.
     csp_files[$csp_count]="$file"
+
+    # PRECOMPUTE the two display-ready line forms ONCE here, at load time. A
+    # row's content (marker + aligned title/project/age) is identical on every
+    # draw — only WHICH row is selected changes — so doing the width/column and
+    # tinting work per keypress is what made moving feel slow. We render each row
+    # once into:
+    #   csp_line_normal[i]   — plain row, live/attention marker tinted
+    #   csp_line_selected[i] — same content padded to full width in reverse video
+    #                          with the "› " cursor pointer
+    # and the draw loop just appends the right one (no forks, no width work).
+    marker=$(csp_marker_for_session "$is_live" "${csp_states[$csp_count]}")
+    row=$(csp_format_line "$marker" "$title" "$project" "${csp_ages[$csp_count]}" 0)
+    csp_rows[$csp_count]="$row"
+    csp_precompute_lines "$csp_count" "$row"
+
     csp_count=$((csp_count + 1))
   done <<EOF
 $(csp_list_session_files)
@@ -427,12 +470,21 @@ csp_rule() {
 csp_buf_row() {
   local content="$1" selected="${2:-0}" style="${3:-}" padded
   if [ "$selected" = "1" ]; then
-    padded=$(csp_pad_display "$(csp_truncate_display "$content" "$CSP_INNER")" "$CSP_INNER")
+    # csp_fit_field returns via the global __csp_fit — no fork, unlike a
+    # $(csp_pad_display …) command substitution. This runs for every drawn row.
+    csp_fit_field "$content" "$CSP_INNER"; padded="$__csp_fit"
     csp_buf_line "${CSP_C_SEL} ${padded}${CSP_C_RESET}"
   elif [ -n "$style" ]; then
-    csp_buf_line "${style} $(csp_truncate_display "$content" "$CSP_INNER")${CSP_C_RESET}"
+    csp_fit_field "$content" "$CSP_INNER"
+    # Strip trailing pad so a styled line (mode/header) isn't a full-width block.
+    local s="$__csp_fit"; while [ "${s% }" != "$s" ]; do s="${s% }"; done
+    csp_buf_line "${style} ${s}${CSP_C_RESET}"
   else
-    content=$(csp_truncate_display "$content" "$CSP_INNER")
+    csp_fit_field "$content" "$CSP_INNER"
+    content="$__csp_fit"
+    # trailing pad is desired here? no — rows shouldn't be full-width padded;
+    # strip it so the plain row is its natural width.
+    while [ "${content% }" != "$content" ]; do content="${content% }"; done
     # Colour ONLY the marker, at its known position, never a content-wide search
     # (a title can legitimately contain ● or ✳, and we must not tint that). The
     # row from csp_format_line is: 2-char cursor pointer, then the 1-char marker,
@@ -450,6 +502,60 @@ csp_buf_row() {
   fi
 }
 
+# --- Cached, terminal-size-dependent chrome ----------------------------------
+# These are recomputed ONLY when the terminal size changes (see csp_build_chrome),
+# not on every keypress — computing them per draw is what made movement slow.
+CSP_CHROME_COLS=""      # last cols we built chrome for ("" = not built yet)
+CSP_CHROME_ROWS=""      # last visible-row count
+CSP_CHROME_TOP=""       # top rule line (with title), ready for csp_buf_line
+CSP_CHROME_MID=""       # middle rule line
+CSP_CHROME_BOT=""       # bottom rule line
+CSP_CHROME_HEADER=""    # column-heading row (styled), ready for csp_buf_line
+CSP_CHROME_VISIBLE=1    # how many session rows fit
+CSP_CHROME_KEYS=""      # coloured key-hints string for the status bar
+CSP_CHROME_KEYS_W=0     # display width of the PLAIN key-hints text (for spacing)
+
+# csp_build_chrome COLS ROWS — (re)build the cached chrome for a terminal size.
+# Called from csp_draw only when the size changed, so the forky width/rule work
+# here happens at most once per resize instead of once per keypress.
+csp_build_chrome() {
+  local cols="$1" rows="$2" header keys_plain
+  CSP_CHROME_COLS="$cols"
+  CSP_CHROME_ROWS="$rows"
+
+  CSP_INNER=$(( cols - 2 ))
+  [ "$CSP_INNER" -gt 96 ] && CSP_INNER=96
+  [ "$CSP_INNER" -lt 40 ] && CSP_INNER=40
+  CSP_CHROME_VISIBLE="$rows"
+
+  # Rules (top carries the title). csp_rule appends to CSP_BUF, so capture via a
+  # temporary swap instead of duplicating its logic.
+  local save="$CSP_BUF"
+  CSP_BUF=""; csp_rule top "Claude Session Picker"; CSP_CHROME_TOP="${CSP_BUF%$'\033[K\n'}"
+  CSP_BUF=""; csp_rule mid;                          CSP_CHROME_MID="${CSP_BUF%$'\033[K\n'}"
+  CSP_BUF=""; csp_rule bot;                          CSP_CHROME_BOT="${CSP_BUF%$'\033[K\n'}"
+  CSP_BUF="$save"
+
+  # Column-heading row (fit to width, dimmed).
+  header=$(csp_format_line "●" "Title" "Project" "Last active" 0)
+  csp_fit_field "$header" "$CSP_INNER"
+  local h="$__csp_fit"; while [ "${h% }" != "$h" ]; do h="${h% }"; done
+  CSP_CHROME_HEADER="${CSP_C_HEADER} ${h}${CSP_C_RESET}"
+
+  # Status-bar key hints (coloured) + the plain text's width for spacing math.
+  keys_plain="j/k move   Enter open   n new   d del   t tmux   R reload   q quit"
+  CSP_CHROME_KEYS_W=$(csp_display_width "$keys_plain")
+  CSP_CHROME_KEYS="${CSP_C_KEY}j/k${CSP_C_RESET}${CSP_C_DIM} move   ${CSP_C_KEY}Enter${CSP_C_RESET}${CSP_C_DIM} open   ${CSP_C_KEY}n${CSP_C_RESET}${CSP_C_DIM} new   ${CSP_C_KEY}d${CSP_C_RESET}${CSP_C_DIM} del   ${CSP_C_KEY}t${CSP_C_RESET}${CSP_C_DIM} tmux   ${CSP_C_KEY}R${CSP_C_RESET}${CSP_C_DIM} reload   ${CSP_C_KEY}q${CSP_C_RESET}${CSP_C_DIM} quit${CSP_C_RESET}"
+
+  # The selected-row line is padded to CSP_INNER, so rebuild every row's cached
+  # display lines whenever the width (and thus CSP_INNER) changed.
+  local j=0
+  while [ "$j" -lt "$csp_count" ]; do
+    csp_precompute_lines "$j" "${csp_rows[$j]}"
+    j=$(( j + 1 ))
+  done
+}
+
 # csp_draw SELECTED — build the whole menu into CSP_BUF and paint it in ONE
 # write, so moving the cursor never flickers. Layout: title rule, mode line,
 # rule, column headings, session rows (selected one highlighted), rule, and a
@@ -458,15 +564,19 @@ csp_draw() {
   local selected="$1" i marker row is_sel visible start last
   local mode_line header cols
 
-  # Fit the layout to the terminal (with sane min/max), once per frame.
+  # Fit the layout to the terminal. Terminal size rarely changes between key
+  # presses, so we only recompute the size-dependent CHROME (rules, header,
+  # visible-row count, status-bar spacing) when the width/height actually
+  # changes. Every other keypress reuses the cached chrome — that's what keeps
+  # cursor movement instant instead of re-forking a dozen helpers per draw.
   cols=$(csp_term_cols)
-  CSP_INNER=$(( cols - 2 ))
-  [ "$CSP_INNER" -gt 96 ] && CSP_INNER=96
-  [ "$CSP_INNER" -lt 40 ] && CSP_INNER=40
+  local rows_now; rows_now=$(csp_visible_rows)
+  if [ "$cols" != "$CSP_CHROME_COLS" ] || [ "$rows_now" != "$CSP_CHROME_ROWS" ]; then
+    csp_build_chrome "$cols" "$rows_now"
+  fi
 
-  CSP_BUF=""   # start a fresh frame in the buffer
-
-  csp_rule top "Claude Session Picker"
+  CSP_BUF=""                       # start a fresh frame in the buffer
+  csp_buf_line "$CSP_CHROME_TOP"   # cached top rule (with title)
 
   if [ "$CSP_ACTIVE_BACKEND" = "tmux" ]; then
     # Note it hands off + exits, so "switch with Ctrl-b" isn't mistaken for
@@ -488,48 +598,50 @@ csp_draw() {
     CSP_STARTUP_NOTICE=""
   fi
   csp_buf_row "$mode_line" 0 "$CSP_C_DIM"
-  csp_rule mid
+  csp_buf_line "$CSP_CHROME_MID"
 
   if [ "$csp_count" -eq 0 ]; then
     csp_buf_row "No Claude sessions found under $CSP_CLAUDE_DIR/projects"
     csp_buf_row "Start one with:  claude    then reopen this picker."
-    csp_rule bot
+    csp_buf_line "$CSP_CHROME_BOT"
     # Paint: home the cursor, write the buffer, clear anything below.
     printf '\033[H%s\033[J' "$CSP_BUF"
     return
   fi
 
-  header=$(csp_format_line "●" "Title" "Project" "Last active" 0)
-  csp_buf_row "$header" 0 "$CSP_C_HEADER"
+  csp_buf_line "$CSP_CHROME_HEADER"   # cached column-heading row
 
-  visible=$(csp_visible_rows)
+  visible="$CSP_CHROME_VISIBLE"
   start=$(csp_window_start "$selected" "$csp_count" "$visible")
   last=$((start + visible))
   [ "$last" -gt "$csp_count" ] && last="$csp_count"
 
+  # Emit the precomputed, display-ready lines directly (no per-row width work or
+  # forks — that's the hot path). Each row was rendered once at load into two
+  # ready forms: csp_line_normal (marker tinted) and csp_line_selected (reverse
+  # video, cursor pointer). We just pick one and append it.
   i="$start"
   while [ "$i" -lt "$last" ]; do
-    marker=$(csp_marker_for_session "${csp_lives[$i]}" "${csp_states[$i]}")
-    row=$(csp_format_line "$marker" "${csp_titles[$i]}" "${csp_projects[$i]}" \
-      "${csp_ages[$i]}" "$([ "$i" -eq "$selected" ] && echo 1 || echo 0)")
-    is_sel=0; [ "$i" -eq "$selected" ] && is_sel=1
-    csp_buf_row "$row" "$is_sel"
+    if [ "$i" -eq "$selected" ]; then
+      csp_buf_line "${csp_line_selected[$i]}"
+    else
+      csp_buf_line "${csp_line_normal[$i]}"
+    fi
     i=$((i + 1))
   done
 
-  csp_rule mid
-  # Status bar: key hints on the left, position (n/total) on the right. Plain
-  # ASCII key names keep their width unambiguous; spacing uses plain-text widths
-  # so the colour escapes don't skew alignment.
-  local keys_plain pos_plain keys pos gap
-  keys_plain="j/k move   Enter open   n new   d del   t tmux   R reload   q quit"
-  pos_plain="$((selected + 1))/${csp_count}"
-  keys="${CSP_C_KEY}j/k${CSP_C_RESET}${CSP_C_DIM} move   ${CSP_C_KEY}Enter${CSP_C_RESET}${CSP_C_DIM} open   ${CSP_C_KEY}n${CSP_C_RESET}${CSP_C_DIM} new   ${CSP_C_KEY}d${CSP_C_RESET}${CSP_C_DIM} del   ${CSP_C_KEY}t${CSP_C_RESET}${CSP_C_DIM} tmux   ${CSP_C_KEY}R${CSP_C_RESET}${CSP_C_DIM} reload   ${CSP_C_KEY}q${CSP_C_RESET}${CSP_C_DIM} quit${CSP_C_RESET}"
-  pos="${CSP_C_DIM}${pos_plain}${CSP_C_RESET}"
-  gap=$(( CSP_INNER - $(csp_display_width "$keys_plain") - $(csp_display_width "$pos_plain") ))
+  csp_buf_line "$CSP_CHROME_MID"
+  # Status bar: cached key hints on the left (CSP_CHROME_KEYS, with its cached
+  # left-pad width CSP_CHROME_KEYS_W) + the position indicator on the right.
+  # Only the position changes per keypress, so we compute just its short pad
+  # here (no forks): total inner width - keys width - position width.
+  local pos_plain="$((selected + 1))/${csp_count}"
+  local gap=$(( CSP_INNER - CSP_CHROME_KEYS_W - ${#pos_plain} ))
   [ "$gap" -lt 1 ] && gap=1
-  csp_buf_line " ${keys}$(csp_repeat ' ' "$gap")${pos}"
-  csp_rule bot
+  local pad="" k=0
+  while [ "$k" -lt "$gap" ]; do pad="$pad "; k=$(( k + 1 )); done
+  csp_buf_line " ${CSP_CHROME_KEYS}${pad}${CSP_C_DIM}${pos_plain}${CSP_C_RESET}"
+  csp_buf_line "$CSP_CHROME_BOT"
 
   # Paint the whole frame in one write: home the cursor (no full clear → no
   # flicker), write the buffer (each line self-clears to EOL), then clear any
