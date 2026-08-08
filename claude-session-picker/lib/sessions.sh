@@ -50,7 +50,11 @@ csp_read_state() {
   local f v=""
   f=$(csp_state_file "$1")
   if [ -f "$f" ]; then
-    { IFS= read -r -n 16 v < "$f"; } 2>/dev/null || v=""
+    # Do NOT `|| v=""` here: `read -n` returns non-zero at end-of-file when the
+    # value has no trailing newline, but it has still populated v — a state file
+    # written without a newline (a crash mid-write, or hand-edited) would lose
+    # its value if we cleared it on that non-zero. The `case` below validates.
+    { IFS= read -r -n 16 v < "$f"; } 2>/dev/null
   fi
   v="${v%$'\r'}"
   case "$v" in working|waiting) printf '%s' "$v" ;; esac

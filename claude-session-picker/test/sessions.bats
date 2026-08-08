@@ -310,6 +310,15 @@ EOF
   [ -z "$output" ]
 }
 
+@test "state: a value with NO trailing newline still loads" {
+  # A crash mid-write or a hand-edited file may lack the trailing newline; the
+  # value must not be dropped just because `read -n` reports EOF.
+  mkdir -p "$CSP_STATE_DIR"
+  printf 'working' > "$(csp_state_file "sess-nonl")"   # no \n
+  run csp_read_state "sess-nonl"
+  [ "$output" = "working" ]
+}
+
 @test "state: clear removes the recorded state" {
   csp_write_state "sess-2" "waiting"
   [ -n "$(csp_read_state "sess-2")" ]

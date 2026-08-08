@@ -99,16 +99,29 @@ setup() {
 }
 
 @test "toggle: refusing tmux (not available) must NOT persist a tmux preference" {
-  # Simulate a box without tmux by overriding csp_tmux_available to false, and
-  # feed the confirmation prompt's read from /dev/null so it doesn't block.
+  # Simulate a box without tmux. The refusal path prints a prompt and waits for
+  # Enter on the terminal — point CSP_TTY at /dev/null so it can't block the
+  # test (this is exactly why the tty access is abstracted). Terminal-mode calls
+  # are stubbed since there's no real terminal here.
   rm -f "$CSP_PREF_FILE"
+  export CSP_TTY=/dev/null
   CSP_ACTIVE_BACKEND="hub"
   csp_tmux_available() { return 1; }
-  # csp_toggle_backend reads from /dev/tty on the refusal path; redirect it.
-  csp_restore_terminal() { :; }   # stub out terminal ops for the test
+  csp_restore_terminal() { :; }
   csp_enter_raw_mode() { :; }
-  csp_toggle_backend < /dev/null > /dev/null 2>&1 || true
-  [ "$CSP_ACTIVE_BACKEND" = "hub" ]          # stayed hub
-  [ ! -f "$CSP_PREF_FILE" ] || {             # and did not write tmux
+  csp_toggle_backend > /dev/null 2>&1
+  [ "$CSP_ACTIVE_BACKEND" = "hub" ]          # stayed hub, did not switch
+  [ ! -f "$CSP_PREF_FILE" ] || {             # and did not write a tmux pref
     run csp_load_backend_pref; [ "$output" != "tmux" ]; }
+}
+
+@test "toggle: switching to hub from tmux persists hub without touching the tty" {
+  export CSP_TTY=/dev/null
+  CSP_ACTIVE_BACKEND="tmux"
+  csp_restore_terminal() { :; }
+  csp_enter_raw_mode() { :; }
+  csp_toggle_backend
+  [ "$CSP_ACTIVE_BACKEND" = "hub" ]
+  run csp_load_backend_pref
+  [ "$output" = "hub" ]
 }

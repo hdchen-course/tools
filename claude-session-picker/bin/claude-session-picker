@@ -73,7 +73,9 @@ CSP_PREF_FILE="${CSP_PREF_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-session
 csp_load_backend_pref() {
   local v=""
   if [ -f "$CSP_PREF_FILE" ]; then
-    { IFS= read -r -n 16 v < "$CSP_PREF_FILE"; } 2>/dev/null || v=""
+    # No `|| v=""`: `read -n` returns non-zero at EOF-without-newline but has
+    # already set v; clearing it would drop a value from a newline-less file.
+    { IFS= read -r -n 16 v < "$CSP_PREF_FILE"; } 2>/dev/null
   fi
   v="${v%$'\r'}"          # tolerate CRLF from a hand-edited file
   v="${v%% *}"            # tolerate a trailing space/comment
@@ -154,6 +156,30 @@ CSP_BX_H="─";  CSP_BX_V="│";  CSP_BX_ML="├"; CSP_BX_MR="┤"
 # always put the terminal back the way the user's shell handed it to us.
 csp_saved_stty=""
 csp_stty_captured=0
+
+# The terminal device we talk to for interactive prompts (delete confirmation,
+# "press Enter to continue"). It defaults to the real controlling terminal, but
+# is overridable so tests can point it at a pipe/file — a plain `< /dev/null`
+# on the command can't redirect /dev/tty, which would otherwise make a prompt
+# block forever in a headless test run.
+CSP_TTY="${CSP_TTY:-/dev/tty}"
+
+# csp_tty_print TEXT… — write a prompt to the terminal (no trailing newline).
+csp_tty_print() {
+  printf '%s' "$*" > "$CSP_TTY" 2>/dev/null || true
+}
+
+# csp_tty_readline VARNAME — read one line from the terminal into VARNAME.
+# Returns non-zero (and leaves VARNAME empty) if the terminal can't be read, so
+# a caller in a non-interactive context degrades to "no input" instead of
+# hanging.
+csp_tty_readline() {
+  local __var="$1" __line=""
+  if [ -r "$CSP_TTY" ] || [ "$CSP_TTY" != "/dev/tty" ]; then
+    IFS= read -r __line < "$CSP_TTY" 2>/dev/null || __line=""
+  fi
+  eval "$__var=\$__line"
+}
 
 csp_capture_pristine_stty() {
   # Capture only the first time; later calls are deliberate no-ops.
@@ -407,13 +433,19 @@ csp_buf_row() {
     csp_buf_line "${style} $(csp_truncate_display "$content" "$CSP_INNER")${CSP_C_RESET}"
   else
     content=$(csp_truncate_display "$content" "$CSP_INNER")
-    # Tint the markers after truncation (width already fixed, so recolouring a
-    # single glyph is layout-safe): ✳ yellow for "needs attention", ● green for
-    # "working". Only the first matching marker on the row is coloured.
-    if [ -n "$CSP_C_ATTN" ]; then
-      content="${content/$CSP_MARKER_ATTENTION/${CSP_C_ATTN}${CSP_MARKER_ATTENTION}${CSP_C_RESET}}"
+    # Colour ONLY the marker, at its known position, never a content-wide search
+    # (a title can legitimately contain ● or ✳, and we must not tint that). The
+    # row from csp_format_line is: 2-char cursor pointer, then the 1-char marker,
+    # then the rest. So the marker is exactly the 3rd character. Recolouring one
+    # fixed-width glyph after truncation is layout-safe.
+    local mk="${content:2:1}" tint=""
+    case "$mk" in
+      "$CSP_MARKER_ATTENTION") tint="$CSP_C_ATTN" ;;
+      "$CSP_MARKER_WORKING")   tint="$CSP_C_LIVE" ;;
+    esac
+    if [ -n "$tint" ]; then
+      content="${content:0:2}${tint}${mk}${CSP_C_RESET}${content:3}"
     fi
-    [ -n "$CSP_C_LIVE" ] && content="${content/$CSP_MARKER_WORKING/${CSP_C_LIVE}${CSP_MARKER_WORKING}${CSP_C_RESET}}"
     csp_buf_line " ${content}"
   fi
 }
@@ -551,8 +583,8 @@ csp_confirm() {
   # Drop back to cooked mode + visible cursor for a normal line of input.
   [ -n "$csp_saved_stty" ] && stty "$csp_saved_stty" 2>/dev/null
   printf '\033[?25h'
-  printf '\n%s' "$prompt" > /dev/tty
-  IFS= read -r answer < /dev/tty
+  csp_tty_print "$(printf '\n%s' "$prompt")"
+  csp_tty_readline answer
   csp_enter_raw_mode
   case "$answer" in
     y|Y|yes|YES) return 0 ;;
@@ -573,14 +605,17 @@ csp_action_delete() {
 
   if [ "${csp_lives[$idx]}" = "1" ]; then
     csp_restore_terminal
-    printf '\n"%s" is running right now — quit that Claude first, then delete.\n' "$title" > /dev/tty
-    printf 'Press Enter to continue…' > /dev/tty; IFS= read -r _ < /dev/tty
+    local _
+    csp_tty_print "$(printf '\n"%s" is running right now — quit that Claude first, then delete.\nPress Enter to continue…' "$title")"
+    csp_tty_readline _
     csp_enter_raw_mode
     return 0
   fi
 
   if csp_confirm "Delete session \"$title\"? This erases its history. [y/N] "; then
     if csp_delete_session_file "$file"; then
+      # Forget any recorded ●/✳ state for the now-deleted session (no residue).
+      csp_clear_state "$(csp_session_id_from_path "$file")"
       # Keep the cursor sensible: if we deleted the last row, step up one.
       [ "$idx" -ge "$((csp_count - 1))" ] && [ "$idx" -gt 0 ] && csp_selected_after_delete=$((idx - 1))
     fi
@@ -599,9 +634,9 @@ csp_toggle_backend() {
   else
     if ! csp_tmux_available; then
       csp_restore_terminal
-      printf '\ntmux mode needs the tmux command, which is not installed.\n' > /dev/tty
-      printf 'Install it (e.g. brew install tmux) then press t again. Enter to continue…' > /dev/tty
-      IFS= read -r _ < /dev/tty
+      local _
+      csp_tty_print "$(printf '\ntmux mode needs the tmux command, which is not installed.\nInstall it (e.g. brew install tmux) then press t again. Enter to continue…')"
+      csp_tty_readline _
       csp_enter_raw_mode
       return 0
     fi

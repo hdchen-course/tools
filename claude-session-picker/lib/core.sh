@@ -113,33 +113,47 @@ csp_backend_is_valid() {
 #              "waiting"  → Claude stopped and wants your input (unseen)
 #              ""/other   → unknown (no hooks installed, or nothing recorded)
 #
-# The rule, with the reconciler baked in (this is the crash-resilient part):
-#   • A live process + state "waiting"  → ✳  (finished, wants you)
-#   • A live process + state "working"/unknown → ●  (busy)
-#   • NOT live but state says "working" → ✳  (the reconciler: the hook said
-#       "working" but the process is gone, so Claude was killed/crashed
-#       mid-turn; surface it as "needs attention" rather than a stuck ●)
-#   • NOT live, anything else           → blank (idle & seen, or no Claude)
+# IMPORTANT — STATE is authoritative, IS_LIVE is only a hint. Liveness is
+# detected by finding a `claude --resume <id>` process (see csp_running_session_ids),
+# which is a LOWER BOUND: a session started as a bare `claude` (including a new
+# one you start here with `n`) has no `--resume <id>`, so it reads as not-live
+# even while it's very much alive. If we trusted IS_LIVE over STATE, such a
+# session would show the WRONG marker — worst of all, a bare session that is
+# waiting for you would go blank. So the hook's STATE decides the marker, and
+# IS_LIVE is used only to disambiguate the one genuinely ambiguous case.
 #
-# Falling back to IS_LIVE alone when STATE is empty means a user who hasn't set
-# up the hooks still gets the original ●/blank behaviour with no surprises.
+# The rule:
+#   • STATE "waiting"           → ✳  (Claude explicitly stopped and wants you —
+#                                     true regardless of whether we saw a process)
+#   • STATE "working" + live    → ●  (definitely busy)
+#   • STATE "working" + not live→ ✳  (the reconciler: the hook said "working"
+#                                     but we can't see the process. If it really
+#                                     crashed mid-turn this is exactly right; if
+#                                     it's a bare session still working, "come
+#                                     look" is a harmless over-nudge, never an
+#                                     invisible one.)
+#   • no/again-unknown STATE    → fall back to IS_LIVE alone: live → ●, else
+#                                 blank. This is the behaviour when the hooks
+#                                 aren't installed, unchanged from before.
 # -----------------------------------------------------------------------------
 csp_marker_for_session() {
   local is_live="$1" state="${2:-}"
+  case "$state" in
+    waiting)
+      printf '%s' "$CSP_MARKER_ATTENTION"; return 0 ;;
+    working)
+      if [ "$is_live" = "1" ]; then
+        printf '%s' "$CSP_MARKER_WORKING"
+      else
+        printf '%s' "$CSP_MARKER_ATTENTION"   # reconciler
+      fi
+      return 0 ;;
+  esac
+  # No hook state recorded → original live/blank behaviour.
   if [ "$is_live" = "1" ]; then
-    if [ "$state" = "waiting" ]; then
-      printf '%s' "$CSP_MARKER_ATTENTION"
-    else
-      printf '%s' "$CSP_MARKER_WORKING"
-    fi
+    printf '%s' "$CSP_MARKER_WORKING"
   else
-    # Not live. If the hook last said "working", the process vanished without a
-    # clean stop — treat that as needs-attention (reconciler).
-    if [ "$state" = "working" ]; then
-      printf '%s' "$CSP_MARKER_ATTENTION"
-    else
-      printf '%s' "$CSP_MARKER_NONE"
-    fi
+    printf '%s' "$CSP_MARKER_NONE"
   fi
 }
 
@@ -234,20 +248,72 @@ csp_truncate() {
 # emoji take TWO columns, while ASCII takes one. Getting this right is what lets
 # us line the menu up into neat columns even when titles mix English and 中文.
 #
-# How it works without any external tool: in a UTF-8 locale ${#TEXT} counts
-# CHARACTERS, and the same measurement in the C locale counts BYTES. A wide
-# (CJK/emoji) glyph is a multi-byte character, so (chars + bytes) / 2 yields the
-# column width: an ASCII char is 1 char + 1 byte -> 1; a 3-byte CJK char is
-# 1 char + 3 bytes -> 2. This holds for the scripts we display and needs no fork.
+# How it works without any external tool: a character is "wide" (2 columns) when
+# its UTF-8 encoding is 3+ bytes — that captures CJK and most emoji. Everything
+# else (ASCII, and also 2-byte characters like accented Latin, Greek, Cyrillic)
+# is 1 column. So the width is: (number of characters) + (number of wide chars).
+#
+# We must NOT use the tempting shortcut (chars + bytes) / 2: it assumes every
+# non-ASCII character is 3 bytes, which over-counts 2-byte characters — e.g. two
+# Cyrillic letters are 2 chars / 4 bytes, giving 3 instead of the correct 2, and
+# any accented/Greek/Cyrillic title would then misalign. Counting only the 3+
+# byte characters as wide fixes that.
+#
+# In a UTF-8 locale ${#char} is 1 per character; re-measuring the same character
+# in the C locale gives its byte length. We loop per character, but callers clip
+# titles well before this (CSP_META_TITLE_CLIP), so the input is always short.
 # -----------------------------------------------------------------------------
 csp_display_width() {
-  local text="$1" chars bytes
-  chars=${#text}
-  # Re-measure the SAME string as bytes by switching to the C locale locally.
-  local LC_ALL=C
-  bytes=${#text}
-  printf '%d' "$(( (chars + bytes) / 2 ))"
+  local text="$1" chars
+  chars=${#text}                      # character count (UTF-8 locale)
+
+  # Measure the whole string's byte length fork-free (csp_byte_len_var sets the
+  # global __csp_bl). If bytes == chars the string is pure single-byte (ASCII) →
+  # width == chars, with no per-character work at all (the common case).
+  csp_byte_len_var "$text"
+  if [ "$__csp_bl" -eq "$chars" ]; then
+    printf '%d' "$chars"
+    return 0
+  fi
+
+  # There is at least one multi-byte character. Width = chars + (number of WIDE
+  # chars), where a wide char (2 columns) is one encoded in 3+ UTF-8 bytes (CJK,
+  # emoji); 2-byte chars (accented Latin, Greek, Cyrillic) stay 1 column.
+  #
+  # We loop per character, measuring each character's byte length with
+  # csp_byte_len_var — a plain function call (NOT a $(...) command substitution)
+  # that returns its answer in the global __csp_bl. That keeps the loop
+  # fork-free, which matters because this runs for every row on every redraw.
+  # (We can't use `printf %d "'X"` for the code point: bash 3.2 returns the
+  # first BYTE there, not the code point, so it's unreliable on macOS.) Callers
+  # clip titles (CSP_META_TITLE_CLIP), so the loop is always over a short string.
+  local i=0 ch wide=0
+  while [ "$i" -lt "$chars" ]; do
+    ch="${text:$i:1}"                 # one CHARACTER (current UTF-8 locale)
+    csp_byte_len_var "$ch"            # sets __csp_bl to the byte length
+    [ "$__csp_bl" -ge 3 ] && wide=$(( wide + 1 ))
+    i=$(( i + 1 ))
+  done
+  printf '%d' "$(( chars + wide ))"
 }
+
+# csp_byte_len STRING — print the number of BYTES in STRING, by switching to the
+# C locale (where ${#..} counts bytes, not characters). Convenient for callers
+# that want the value via $(...) (e.g. tests).
+csp_byte_len() {
+  local LC_ALL=C
+  printf '%d' "${#1}"
+}
+
+# csp_byte_len_var STRING — same measurement, but returned in the global
+# __csp_bl instead of printed. This exists so hot loops (csp_display_width) can
+# get a byte length WITHOUT the fork a $(csp_byte_len …) command substitution
+# would cost — important because it runs per character, per row, per redraw.
+csp_byte_len_var() {
+  local LC_ALL=C
+  __csp_bl=${#1}
+}
+__csp_bl=0
 
 # -----------------------------------------------------------------------------
 # csp_pad_display TEXT WIDTH

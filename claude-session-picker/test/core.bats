@@ -97,9 +97,13 @@ setup() {
   [ "$output" = "$CSP_MARKER_ATTENTION" ]
 }
 
-@test "marker: not live + state 'waiting' shows nothing (idle & seen)" {
+@test "marker: state 'waiting' ALWAYS shows attention, even when not detected live" {
+  # STATE is authoritative: a session started as a bare `claude` (e.g. via 'n')
+  # reads as not-live because it has no `--resume <id>` to match, but if the
+  # hook says it's waiting for you it MUST still show ✳ — never go blank. This
+  # is the inversion bug the marker rule is designed to prevent.
   run csp_marker_for_session 0 waiting
-  [ "$output" = "$CSP_MARKER_NONE" ]
+  [ "$output" = "$CSP_MARKER_ATTENTION" ]
 }
 
 @test "marker: an unknown state falls back to the live/blank rule" {
@@ -190,6 +194,29 @@ setup() {
 @test "width: mixed ASCII and CJK adds up correctly" {
   run csp_display_width "abc白d"     # 4 ascii (4) + 1 CJK (2) = 6
   [ "$output" = "6" ]
+}
+
+@test "width: 2-byte characters (Cyrillic/accented/Greek) count as ONE column" {
+  # Regression: the old (chars+bytes)/2 heuristic over-counted these as ~1.5x,
+  # misaligning any accented-Latin/Greek/Cyrillic title.
+  run csp_display_width "ДД"          # 2 Cyrillic → 2 columns (not 3)
+  [ "$output" = "2" ]
+  run csp_display_width "éé"          # 2 accented Latin → 2
+  [ "$output" = "2" ]
+  run csp_display_width "αβγ"         # 3 Greek → 3
+  [ "$output" = "3" ]
+}
+
+@test "width: an emoji counts as two columns" {
+  run csp_display_width "🎉"
+  [ "$output" = "2" ]
+}
+
+@test "byte-len: measures UTF-8 byte length, not character count" {
+  run csp_byte_len "白"              # one 3-byte CJK char
+  [ "$output" = "3" ]
+  run csp_byte_len "a"
+  [ "$output" = "1" ]
 }
 
 @test "pad: pads a short string to the requested display width" {

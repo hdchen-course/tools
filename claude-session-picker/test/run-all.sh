@@ -40,3 +40,6 @@ printf '\n== install/uninstall tests (arg guard, safe symlink handling) ==\n'
 
 printf '\n== backend-preference tests (the t toggle persistence) ==\n'
 "$BATS" "$HERE/pref.bats"
+
+printf '\n== hook tests (●/✳ state recording) ==\n'
+"$BATS" "$HERE/hook.bats"
