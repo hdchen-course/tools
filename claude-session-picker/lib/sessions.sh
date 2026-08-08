@@ -193,7 +193,13 @@ CSP_META_TITLE_CLIP=256
 # a crash. The fix if that ever happens: raise this number (or drop the head cap
 # and rely on the title-clip for speed). This is the single place coupled to
 # Claude's layout; the extractor already tolerates missing fields everywhere.
-CSP_META_HEAD_LINES=64
+#
+# Overridable via the environment so an early adopter who hits a format change
+# can widen the window (or set it very large to effectively disable the cap)
+# without editing the source: CSP_META_HEAD_LINES=500 claude-session-picker. A
+# non-numeric value is ignored in favour of the default.
+CSP_META_HEAD_LINES="${CSP_META_HEAD_LINES:-64}"
+case "$CSP_META_HEAD_LINES" in ''|*[!0-9]*) CSP_META_HEAD_LINES=64 ;; esac
 
 csp_session_meta() {
   local file="$1" out title cwd tab

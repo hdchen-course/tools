@@ -79,6 +79,35 @@ EOF
   [ "$(csp_field "$output" 2)" = "/Volumes/demo/real" ]
 }
 
+@test "meta: CSP_META_HEAD_LINES override widens the scan window" {
+  # A title that only appears PAST the default 64-line window: with the default
+  # it's missed (untitled); with a raised override it's found. Proves the env
+  # override is honoured (and re-read at source time).
+  deep="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-deep.jsonl"
+  {
+    printf '%s\n' '{"type":"user","cwd":"/Volumes/demo/real"}'
+    n=0; while [ "$n" -lt 100 ]; do printf '%s\n' '{"type":"assistant","content":"x"}'; n=$((n+1)); done
+    printf '%s\n' '{"type":"ai-title","aiTitle":"deep title"}'   # ~line 102
+  } > "$deep"
+  # Default (64): title is beyond the window → (untitled).
+  run csp_session_meta "$deep"
+  [ "$(csp_field "$output" 1)" = "(untitled)" ]
+  # Override to 500 (re-source so the constant is recomputed): now found.
+  run env CSP_META_HEAD_LINES=500 CSP_CLAUDE_DIR="$CSP_CLAUDE_DIR" bash -c '
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh
+    . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
+    m=$(csp_session_meta "'"$deep"'"); csp_field "$m" 1'
+  [ "$output" = "deep title" ]
+}
+
+@test "meta: a non-numeric CSP_META_HEAD_LINES falls back to the default" {
+  run env CSP_META_HEAD_LINES=bogus bash -c '
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh
+    . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
+    printf "%s" "$CSP_META_HEAD_LINES"'
+  [ "$output" = "64" ]
+}
+
 @test "id: derived from the file name" {
   run csp_session_id_from_path "/a/b/id-alpha.jsonl"
   [ "$output" = "id-alpha" ]

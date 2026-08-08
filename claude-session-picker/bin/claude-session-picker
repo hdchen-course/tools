@@ -662,12 +662,16 @@ csp_draw() {
   # forks — that's the hot path). Each row was rendered once at load into two
   # ready forms: csp_line_normal (marker tinted) and csp_line_selected (reverse
   # video, cursor pointer). We just pick one and append it.
+  # The precomputed arrays are populated by the same sequential counter that
+  # sets csp_count, so index i (start..last-1) is always present. The `:-`
+  # defaults are belt-and-suspenders: should a gap ever occur, we draw a blank
+  # row instead of aborting under `set -u`.
   i="$start"
   while [ "$i" -lt "$last" ]; do
     if [ "$i" -eq "$selected" ]; then
-      csp_buf_line "${csp_line_selected[$i]}"
+      csp_buf_line "${csp_line_selected[$i]:-}"
     else
-      csp_buf_line "${csp_line_normal[$i]}"
+      csp_buf_line "${csp_line_normal[$i]:-}"
     fi
     i=$((i + 1))
   done
