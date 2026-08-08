@@ -772,14 +772,21 @@ csp_toggle_backend() {
       return 0
     fi
     CSP_ACTIVE_BACKEND="tmux"
-    csp_save_backend_pref "$CSP_ACTIVE_BACKEND"
-    # If we're not already inside tmux, relaunch into the holding session now so
-    # the picker becomes window 0 (same as starting in tmux mode). This execs
-    # and does not return; the re-launched copy runs inside tmux.
+    # If we're not already inside our tmux, relaunch into the holding session so
+    # the picker becomes window 0. csp_tmux_enter normally execs and never
+    # returns; if it DOES return, it failed — so we must NOT have saved a tmux
+    # preference (that would make every future plain launch re-enter and fail
+    # too), and we must put the terminal back into raw mode and carry on in hub.
     if ! csp_inside_tmux; then
       csp_restore_terminal
       csp_tmux_enter "$CSP_ROOT/bin/claude-session-picker"
+      # Reached only if entering tmux failed: stay in hub for this run.
+      CSP_ACTIVE_BACKEND="hub"
+      csp_enter_raw_mode
+      return 0
     fi
+    # Already inside our tmux — safe to remember the choice.
+    csp_save_backend_pref "$CSP_ACTIVE_BACKEND"
     return 0
   fi
   csp_save_backend_pref "$CSP_ACTIVE_BACKEND"
@@ -793,14 +800,16 @@ csp_main() {
     exit 1
   fi
 
-  # tmux mode, and we're not yet inside tmux → relaunch ourselves INSIDE the
+  # tmux mode, and we're not yet inside our tmux → relaunch ourselves INSIDE the
   # holding tmux session as window 0 (see csp_tmux_enter). This is what makes
   # the picker resident: every session you open becomes another window and the
-  # picker stays put in window 0 (Ctrl-b 0 to come back). csp_tmux_enter execs
-  # tmux and does not return; the re-launched copy comes back here already
-  # inside tmux and just runs the menu loop below.
+  # picker stays put in window 0 (Ctrl-b 0 to come back). csp_tmux_enter normally
+  # execs tmux and never returns; the re-launched copy comes back here already
+  # inside tmux and runs the menu loop below. If it RETURNS, entering tmux failed
+  # — fall back to hub for this run rather than continuing in a broken state.
   if [ "$CSP_ACTIVE_BACKEND" = "tmux" ] && ! csp_inside_tmux; then
     csp_tmux_enter "$CSP_ROOT/bin/claude-session-picker"
+    CSP_ACTIVE_BACKEND="hub"     # only reached if the exec failed
   fi
 
   local selected=0 key label

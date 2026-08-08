@@ -25,7 +25,14 @@
 # The name of the single tmux session that holds all our Claude windows. Using
 # one well-known name means re-running the picker re-attaches to the same place
 # instead of spawning duplicates.
+#
+# We STRIP ':' and '.' from it: tmux target syntax is "session:window.pane", so a
+# session name containing those makes every `-t "=name:win"` target mis-parse
+# (has-session then always fails → we'd endlessly try to re-create it and hit
+# "duplicate session"). Stripping keeps targeting unambiguous; empty falls back.
 CSP_TMUX_SESSION="${CSP_TMUX_SESSION:-claude-sessions}"
+CSP_TMUX_SESSION="$(printf '%s' "$CSP_TMUX_SESSION" | tr -d ':.')"
+[ -z "$CSP_TMUX_SESSION" ] && CSP_TMUX_SESSION="claude-sessions"
 
 # We run our tmux on a DEDICATED SOCKET (tmux -L "$CSP_TMUX_SOCKET"), completely
 # separate from the user's normal tmux server. This is what lets us:
@@ -50,15 +57,19 @@ csp_tmux_available() {
 }
 
 # csp_inside_tmux — returns 0 if we are currently running inside OUR tmux (the
-# dedicated socket). We check that TMUX points at our socket, not just that some
-# tmux is present, so that launching the picker from inside the user's UNRELATED
-# tmux still correctly re-execs into our own socket rather than piggy-backing on
-# theirs. TMUX looks like "<socket-path>,<pid>,<session>".
+# dedicated socket). We check that TMUX points at our socket specifically, not
+# just that some tmux is present, so launching the picker from inside the user's
+# UNRELATED tmux still re-execs into our own socket rather than piggy-backing on
+# theirs. TMUX is "<socket-path>,<pid>,<session>"; the socket file's BASENAME is
+# our socket name. We compare that basename EXACTLY (not a substring) so
+# "claude-sessions" doesn't spuriously match "claude-sessions-extra" or a
+# directory that merely ends in the name.
 csp_inside_tmux() {
-  case "${TMUX:-}" in
-    *"/$CSP_TMUX_SOCKET,"*|*"/$CSP_TMUX_SOCKET-"*) return 0 ;;
-  esac
-  return 1
+  local t="${TMUX:-}" path base
+  [ -n "$t" ] || return 1
+  path="${t%%,*}"          # the socket path (before the first comma)
+  base="${path##*/}"       # its basename
+  [ "$base" = "$CSP_TMUX_SOCKET" ]
 }
 
 # =============================================================================
@@ -94,18 +105,21 @@ csp_hub_open() {
 # =============================================================================
 
 # csp_tmux_sanitize_label LABEL — make a safe, non-empty tmux window name.
-# tmux rejects names containing newlines and treats a leading '-' as a flag, so
-# we replace disallowed BYTES with '_' but KEEP multi-byte (CJK) characters, so
-# a 工作/專案 project name shows as itself rather than collapsing to "_/_". We
-# then trim and cap it, falling back to "session" if nothing usable is left.
+# tmux rejects names containing newlines, treats a leading '-' as a flag, and
+# SPLITS ITS COMMAND LINE on ';' — a name ending in ';' makes tmux parse the
+# window's shell command as a second tmux command, so new-window fails. We drop
+# ';' entirely, flatten control chars, but KEEP multi-byte (CJK) characters so a
+# 工作/專案 project shows as itself rather than collapsing to "_/_". Then trim
+# and cap, falling back to "session" if nothing usable is left.
 csp_tmux_sanitize_label() {
   local label="$1" clean
-  # Flatten only control chars and the few characters tmux/globbing dislike;
-  # leave everything else (including UTF-8 bytes) intact.
-  clean=$(printf '%s' "$label" | tr '\000-\037\177' ' ' | tr -s ' ')
+  # Remove semicolons (tmux command separator), flatten control chars to spaces,
+  # and squeeze repeats; leave other bytes (incl. UTF-8) intact.
+  clean=$(printf '%s' "$label" | tr -d ';' | tr '\000-\037\177' ' ' | tr -s ' ')
   clean="${clean#[-_ ]}"                # never start with '-', '_' or space
   clean="${clean%[ ]}"                  # no trailing space
   clean="${clean:0:32}"
+  clean="${clean%[ ]}"                  # cap may re-expose a trailing space
   [ -z "$clean" ] && clean="session"
   printf '%s' "$clean"
 }
@@ -173,13 +187,21 @@ csp_tmux_enter() {
 
   if csp_tmux has-session -t "=$CSP_TMUX_SESSION" 2>/dev/null; then
     csp_tmux_configure_home
-    # Ensure there's a live menu to land on: if window 0 isn't named "menu",
-    # (re)create it so quitting the menu earlier can't strand you.
-    if [ "$(csp_tmux display-message -p -t "=$CSP_TMUX_SESSION:0" '#{window_name}' 2>/dev/null)" != "menu" ]; then
-      csp_tmux new-window -t "=$CSP_TMUX_SESSION" -n menu "$env_prefix $(csp_shell_quote "$self")" 2>/dev/null
-      csp_tmux move-window -s "=$CSP_TMUX_SESSION:\$" -t "=$CSP_TMUX_SESSION:0" 2>/dev/null
+    # Ensure there's a live menu to land on: if no window is named "menu" (e.g.
+    # a previous quit closed it), create one and make it window 0. We SWAP it
+    # into index 0 rather than move-window -k (which would KILL whatever session
+    # occupies index 0 — destroying a running Claude); swap is non-destructive.
+    if ! csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_name}' 2>/dev/null \
+         | grep -qx menu; then
+      csp_tmux new-window -t "=$CSP_TMUX_SESSION" -n menu \
+        "$env_prefix $(csp_shell_quote "$self")" 2>/dev/null
+      csp_tmux swap-window -s "=$CSP_TMUX_SESSION:\$" -t "=$CSP_TMUX_SESSION:0" 2>/dev/null
     fi
-    exec csp_tmux attach-session -t "=$CSP_TMUX_SESSION"
+    # exec the REAL tmux (a bare `exec csp_tmux` fails — exec can't run a shell
+    # function). If exec somehow can't replace us, return non-zero so the caller
+    # restores the terminal instead of falling through in a broken state.
+    exec command tmux -L "$CSP_TMUX_SOCKET" attach-session -t "=$CSP_TMUX_SESSION"
+    return 1
   fi
 
   # Fresh: create the holding session with the picker in window 0 (named
@@ -188,7 +210,8 @@ csp_tmux_enter() {
   csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu \
     "$env_prefix $(csp_shell_quote "$self")" 2>/dev/null || return 1
   csp_tmux_configure_home
-  exec csp_tmux attach-session -t "=$CSP_TMUX_SESSION"
+  exec command tmux -L "$CSP_TMUX_SOCKET" attach-session -t "=$CSP_TMUX_SESSION"
+  return 1
 }
 
 # csp_tmux_open ID PROJECT LABEL

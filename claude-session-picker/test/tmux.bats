@@ -119,3 +119,57 @@ make_home() {
   TMUX="/private/tmp/$CSP_TMUX_SOCKET,123,0" run csp_inside_tmux
   [ "$status" -eq 0 ]
 }
+
+@test "inside-tmux: a socket whose name merely EXTENDS ours is not a match (bug 6)" {
+  # Exact basename compare: 'claude-sessions' must not match 'claude-sessions-x'
+  # nor a directory that ends in the name.
+  CSP_TMUX_SOCKET="claude-sessions"
+  TMUX="/private/tmp/claude-sessions-extra,1,0" run csp_inside_tmux
+  [ "$status" -ne 0 ]
+  TMUX="/tmp/evil/claude-sessions,1,0" run csp_inside_tmux
+  [ "$status" -eq 0 ]     # basename IS exactly our socket → correctly inside
+}
+
+@test "label: a project name ending in ';' does not break new-window (bug 3)" {
+  # A trailing ';' would make tmux parse the window command as a 2nd tmux command.
+  run csp_tmux_sanitize_label "tmp/PWNED;"
+  case "$output" in *';'*) bad=1 ;; *) bad=0 ;; esac
+  [ "$bad" = "0" ]
+  # And it really opens a window (the failure mode was new-window returning 1).
+  make_home
+  run csp_tmux_open id-x "/tmp" "tmp/danger;"
+  [ "$status" -eq 0 ]
+}
+
+@test "enter: reaches the real tmux attach (regression for the exec-a-function blocker)" {
+  # Blocker #1 was `exec csp_tmux ...` — exec can't run a shell function, so it
+  # died with "exec: csp_tmux: not found" and tmux mode never worked. We can't
+  # actually attach without a client, but we CAN assert the failure signature is
+  # gone: run csp_tmux_enter with no controlling terminal and confirm it does
+  # NOT emit "csp_tmux: not found" / "exec:". The holding session should get
+  # created (proving we got past has-session into the create+attach path).
+  self="$BATS_TEST_DIRNAME/../bin/claude-session-picker"
+  run bash -c "CSP_TMUX_SOCKET='$CSP_TMUX_SOCKET' CSP_TMUX_SESSION='$CSP_TMUX_SESSION' \
+    bash -c '. \"$BATS_TEST_DIRNAME/../lib/core.sh\"; . \"$BATS_TEST_DIRNAME/../lib/backend.sh\"; \
+    csp_tmux_enter \"$self\"' </dev/null 2>&1"
+  case "$output" in
+    *"csp_tmux: not found"*|*"exec: csp_tmux"*) bad=1 ;;
+    *) bad=0 ;;
+  esac
+  [ "$bad" = "0" ]
+  # And the holding session exists (we reached the create step, not an early
+  # function-not-found death).
+  csp_tmux has-session -t "=$CSP_TMUX_SESSION" 2>/dev/null
+}
+
+@test "session name: ':' and '.' are stripped so tmux targets don't mis-parse (bug 4)" {
+  # Re-source with a hostile session name and confirm it's been sanitised.
+  CSP_TMUX_SESSION="a:b.c" bash -c '
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh
+    . '"$BATS_TEST_DIRNAME"'/../lib/backend.sh
+    printf "%s" "$CSP_TMUX_SESSION"' > "$BATS_TEST_TMPDIR/sess"
+  run cat "$BATS_TEST_TMPDIR/sess"
+  case "$output" in *[:.]*) bad=1 ;; *) bad=0 ;; esac
+  [ "$bad" = "0" ]
+  [ "$output" = "abc" ]
+}
