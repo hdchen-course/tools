@@ -53,12 +53,15 @@ the background; you switch between them with tmux's own keys (`Ctrl-b n` for the
 next window, `Ctrl-b p` for the previous, `Ctrl-b` then a number to jump, and
 `Ctrl-b d` to detach). See [Optional: tmux](#optional-tmux).
 
-Force a mode with the `CSP_BACKEND` environment variable:
+The easiest way to switch is the **`t` key inside the menu** — it flips between
+hub and tmux and remembers your choice for next time. You can also force a mode
+for a single run with the `CSP_BACKEND` environment variable (it takes
+precedence over the remembered choice):
 
 ```sh
-claude-session-picker                     # default: hub (returns to the menu)
-CSP_BACKEND=tmux claude-session-picker    # opt in to concurrent tmux windows
-CSP_BACKEND=hub  claude-session-picker    # explicit hub (same as default)
+claude-session-picker                     # your saved choice, or hub by default
+CSP_BACKEND=tmux claude-session-picker    # force concurrent tmux windows this run
+CSP_BACKEND=hub  claude-session-picker    # force hub this run
 ```
 
 Forcing `tmux` on a machine without the `tmux` command falls back to `hub`
@@ -132,11 +135,17 @@ claude-session-picker
 | `Enter` | open the selected session |
 | `n` | start a **new** session in the directory you launched the picker from |
 | `d` or `x` | **delete** the selected session's history (asks you to confirm first) |
+| `t` | **toggle** between hub and tmux mode (see below); the choice is remembered |
 | `R` or `l` | reload the list |
 | `q` or `Esc` | quit |
 
-Only ↑ and ↓ are recognised as arrows; **← and → quit the picker**, so use `j`
-and `k` if that bites you.
+Only ↑ and ↓ are recognised as arrows; ← and → do nothing (a stray press won't
+quit). Just `q` or `Esc` quits.
+
+Press `t` to switch modes right from the menu — no need to remember an
+environment variable. If tmux isn't installed it tells you so instead of
+switching. Your choice is saved, so next time the picker starts in the same
+mode.
 
 Opening a session `cd`s into that session's original project directory first (if
 it still exists) and runs `claude --resume <id>`, so you land where you left off.
@@ -151,9 +160,10 @@ terminal are drawn, the highlighted row is always kept in view, and a
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CSP_BACKEND` | `hub` | set to `tmux` to opt in to concurrent windows; `hub` (or unset) is the default |
+| `CSP_BACKEND` | *(saved choice, else `hub`)* | force `hub` or `tmux` for this run; overrides the remembered `t` choice |
 | `CSP_TMUX_SESSION` | `claude-sessions` | name of the tmux session that holds the windows |
 | `CSP_CLAUDE_DIR` | `~/.claude` | where to look for Claude's data (used by the tests) |
+| `CSP_PREF_FILE` | `~/.config/claude-session-picker/backend` | where the `t` toggle saves your mode choice |
 
 ## Uninstall
 

@@ -37,3 +37,6 @@ printf '\n== key-decoding tests (arrows, no-op, quit) ==\n'
 
 printf '\n== install/uninstall tests (arg guard, safe symlink handling) ==\n'
 "$BATS" "$HERE/install.bats"
+
+printf '\n== backend-preference tests (the t toggle persistence) ==\n'
+"$BATS" "$HERE/pref.bats"

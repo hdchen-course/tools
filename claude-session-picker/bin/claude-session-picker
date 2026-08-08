@@ -55,18 +55,51 @@ CSP_ROOT="$(cd "$(dirname "$csp_self")/.." && pwd)"
 # shellcheck source=../lib/backend.sh
 . "$CSP_ROOT/lib/backend.sh"
 
-# Which backend runs sessions (see csp_choose_backend / lib/backend.sh). The
-# CSP_BACKEND environment variable forces "hub" or "tmux" (case-sensitive);
-# empty means auto. If it's set to something unrecognised, warn instead of
-# silently falling back to auto (which would look like the flag was ignored).
-if ! csp_backend_is_valid "${CSP_BACKEND:-}"; then
-  printf 'Warning: CSP_BACKEND="%s" is not recognised (use "hub" or "tmux"); using auto-detect.\n' \
+# Where we remember the user's backend choice between runs (set by the 't' key
+# in the menu). A tiny one-line file; overridable for tests.
+CSP_PREF_FILE="${CSP_PREF_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-session-picker/backend}"
+
+# csp_load_backend_pref — read the saved backend preference ("hub"/"tmux"), or
+# print nothing if there isn't a valid one. Always returns 0: "no preference"
+# is a normal outcome, not an error, so this stays safe to use in a command
+# substitution even under `set -e`.
+csp_load_backend_pref() {
+  local v=""
+  [ -f "$CSP_PREF_FILE" ] && IFS= read -r v < "$CSP_PREF_FILE" 2>/dev/null
+  if csp_backend_is_valid "$v" && [ -n "$v" ]; then
+    printf '%s' "$v"
+  fi
+  return 0
+}
+
+# csp_save_backend_pref VALUE — persist the chosen backend so it sticks next
+# time. Best-effort: if the directory can't be made or written, we just skip it
+# (the choice still applies for this run).
+csp_save_backend_pref() {
+  local v="$1" dir
+  dir=$(dirname "$CSP_PREF_FILE")
+  mkdir -p "$dir" 2>/dev/null || return 0
+  printf '%s\n' "$v" > "$CSP_PREF_FILE" 2>/dev/null || true
+}
+
+# Decide the starting backend. Precedence:
+#   1. CSP_BACKEND env var, if set and valid (an explicit per-run override)
+#   2. the saved preference from the 't' toggle
+#   3. the default (hub)
+# The env var never gets a warning-then-ignored surprise: validate it first.
+if [ -n "${CSP_BACKEND:-}" ] && ! csp_backend_is_valid "${CSP_BACKEND}"; then
+  printf 'Warning: CSP_BACKEND="%s" is not recognised (use "hub" or "tmux"); ignoring it.\n' \
     "${CSP_BACKEND}" >&2
+fi
+if [ -n "${CSP_BACKEND:-}" ] && csp_backend_is_valid "${CSP_BACKEND}"; then
+  CSP_BACKEND_CHOICE="${CSP_BACKEND}"
+else
+  CSP_BACKEND_CHOICE=$(csp_load_backend_pref)
 fi
 CSP_ACTIVE_BACKEND=$(csp_choose_backend \
   "$(csp_tmux_available && echo 1 || echo 0)" \
   "$(csp_inside_tmux && echo 1 || echo 0)" \
-  "${CSP_BACKEND:-}")
+  "${CSP_BACKEND_CHOICE:-}")
 
 # --- Colours & box-drawing ---------------------------------------------------
 # The menu is drawn as a framed "GUI-style" panel. All the escape codes live
@@ -378,10 +411,10 @@ csp_draw() {
   csp_rule top "Claude Session Picker"
 
   if [ "$CSP_ACTIVE_BACKEND" = "tmux" ]; then
-    mode_line="mode: tmux · each session in its own window, others keep running"
+    mode_line="mode: tmux ON · sessions run concurrently — switch with Ctrl-b n/p/w  (t: turn off)"
   else
-    mode_line="mode: hub · quit a session to come back to this menu"
-    csp_tmux_available && mode_line="$mode_line  (CSP_BACKEND=tmux for concurrency)"
+    mode_line="mode: hub · one session at a time, quit to return here"
+    csp_tmux_available && mode_line="$mode_line  (press t: enable tmux for concurrency)"
   fi
   csp_buf_row "$mode_line" 0 "$CSP_C_DIM"
   csp_rule mid
@@ -418,9 +451,9 @@ csp_draw() {
   # ASCII key names keep their width unambiguous; spacing uses plain-text widths
   # so the colour escapes don't skew alignment.
   local keys_plain pos_plain keys pos gap
-  keys_plain="j/k move   Enter open   n new   d del   R reload   q quit"
+  keys_plain="j/k move   Enter open   n new   d del   t tmux   R reload   q quit"
   pos_plain="$((selected + 1))/${csp_count}"
-  keys="${CSP_C_KEY}j/k${CSP_C_RESET}${CSP_C_DIM} move   ${CSP_C_KEY}Enter${CSP_C_RESET}${CSP_C_DIM} open   ${CSP_C_KEY}n${CSP_C_RESET}${CSP_C_DIM} new   ${CSP_C_KEY}d${CSP_C_RESET}${CSP_C_DIM} del   ${CSP_C_KEY}R${CSP_C_RESET}${CSP_C_DIM} reload   ${CSP_C_KEY}q${CSP_C_RESET}${CSP_C_DIM} quit${CSP_C_RESET}"
+  keys="${CSP_C_KEY}j/k${CSP_C_RESET}${CSP_C_DIM} move   ${CSP_C_KEY}Enter${CSP_C_RESET}${CSP_C_DIM} open   ${CSP_C_KEY}n${CSP_C_RESET}${CSP_C_DIM} new   ${CSP_C_KEY}d${CSP_C_RESET}${CSP_C_DIM} del   ${CSP_C_KEY}t${CSP_C_RESET}${CSP_C_DIM} tmux   ${CSP_C_KEY}R${CSP_C_RESET}${CSP_C_DIM} reload   ${CSP_C_KEY}q${CSP_C_RESET}${CSP_C_DIM} quit${CSP_C_RESET}"
   pos="${CSP_C_DIM}${pos_plain}${CSP_C_RESET}"
   gap=$(( CSP_INNER - $(csp_display_width "$keys_plain") - $(csp_display_width "$pos_plain") ))
   [ "$gap" -lt 1 ] && gap=1
@@ -516,6 +549,28 @@ csp_action_delete() {
   fi
 }
 
+# csp_toggle_backend — flip between hub and tmux from inside the menu (the 't'
+# key). tmux mode is what lets you keep several sessions running and jump
+# between them with tmux's own keys (Ctrl-b n/p/w); hub runs one at a time and
+# returns here on exit. The choice is saved so it sticks next time. If tmux
+# isn't installed we can't offer tmux mode, so we say so instead of pretending.
+csp_toggle_backend() {
+  if [ "$CSP_ACTIVE_BACKEND" = "tmux" ]; then
+    CSP_ACTIVE_BACKEND="hub"
+  else
+    if ! csp_tmux_available; then
+      csp_restore_terminal
+      printf '\ntmux mode needs the tmux command, which is not installed.\n' > /dev/tty
+      printf 'Install it (e.g. brew install tmux) then press t again. Enter to continue…' > /dev/tty
+      IFS= read -r _ < /dev/tty
+      csp_enter_raw_mode
+      return 0
+    fi
+    CSP_ACTIVE_BACKEND="tmux"
+  fi
+  csp_save_backend_pref "$CSP_ACTIVE_BACKEND"
+}
+
 # --- Main loop ---------------------------------------------------------------
 csp_main() {
   if ! command -v claude >/dev/null 2>&1; then
@@ -553,6 +608,7 @@ csp_main() {
          csp_selected_after_delete=""
          csp_action_delete "$selected"
          [ -n "$csp_selected_after_delete" ] && selected="$csp_selected_after_delete" ;;
+      t) csp_toggle_backend ;;   # switch hub <-> tmux (concurrency on/off)
       R|l) csp_load_sessions ;;
       q) break ;;
     esac

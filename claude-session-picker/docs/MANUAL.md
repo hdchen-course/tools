@@ -99,6 +99,7 @@ itself and always keeps the cursor visible.
 | `Enter` | open the selected session |
 | `n` | start a brand-new session, in the folder you ran the picker from |
 | `d` or `x` | delete the selected session's transcript — asks you to confirm, and won't delete a session that's currently running |
+| `t` | toggle between hub and tmux mode (concurrency on/off); your choice is remembered next time |
 | `R` or `l` | reload the list (picks up new sessions and refreshes the `●` markers) |
 | `q` or `Esc` | quit back to your shell |
 
@@ -182,17 +183,31 @@ are all you really need.
 
 The picker defaults to **hub mode everywhere** — even if you have `tmux`
 installed. tmux mode is an opt-in for when you specifically want several sessions
-running at once. Choose it for a single run with the `CSP_BACKEND` variable:
+running at once.
+
+**The easy way — the `t` key.** While the menu is open, press `t` to flip
+between hub and tmux. The top line updates to show which mode you're in, and
+your choice is **saved**, so the next time you start the picker it opens in the
+same mode. If `tmux` isn't installed, pressing `t` tells you so and stays in hub
+rather than switching to a mode it can't run.
+
+Once you've toggled tmux **on**, opening a session puts it in its own tmux
+window; the ones you've already opened keep running in the background, and you
+move between them with tmux's own keys — `Ctrl-b n` (next), `Ctrl-b p`
+(previous), `Ctrl-b w` (list and pick). Toggle back to hub with `t` any time.
+
+**The manual way — `CSP_BACKEND`.** You can also force a mode for a single run,
+which overrides the remembered choice:
 
 ```sh
-CSP_BACKEND=hub  claude-session-picker    # force one-at-a-time
+CSP_BACKEND=hub  claude-session-picker    # force one-at-a-time this run
 CSP_BACKEND=tmux claude-session-picker    # force windows that keep running
 ```
 
-To make an override permanent, put it in your shell rc file:
+To make a mode your permanent default without using `t`, put it in your shell rc:
 
 ```sh
-export CSP_BACKEND=hub      # in ~/.zshrc or ~/.bashrc
+export CSP_BACKEND=tmux      # in ~/.zshrc or ~/.bashrc
 ```
 
 Asking for `tmux` on a machine that doesn't have `tmux` installed quietly gives
@@ -292,12 +307,11 @@ older install of this same tool. Re-run `./install.sh --force` to replace it, or
 `./install.sh --prefix ~/some/other/bin` to put it somewhere else.
 
 **I installed tmux but the header still says `mode: hub`**
-That's expected — hub is the default even with tmux installed. Installing tmux
-doesn't switch modes on its own; you opt in per run with
-`CSP_BACKEND=tmux claude-session-picker` (or `export CSP_BACKEND=tmux` in your
-shell rc). If you set that and it *still* says hub, check tmux is really on your
-`PATH` with `command -v tmux` (forcing tmux without the command falls back to
-hub).
+That's expected — hub is the default even with tmux installed. Just press `t`
+in the menu to switch to tmux mode (it's remembered afterwards). If pressing `t`
+says tmux isn't available, check it's really on your `PATH` with
+`command -v tmux`. You can also force it with `CSP_BACKEND=tmux`; forcing tmux
+without the command installed falls back to hub.
 
 **tmux mode opened a window but Claude isn't there**
 The window runs `claude --resume <id>` in the session's project folder. If that
