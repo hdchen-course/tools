@@ -20,7 +20,11 @@ set -eu
 PREFIX="$HOME/.local/bin"
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --prefix) PREFIX="$2"; shift 2 ;;
+    --prefix)
+      # Guard against a missing argument: `--prefix` with nothing after it would
+      # otherwise trip `set -u` with an unbound $2 and abort with a cryptic error.
+      [ "$#" -ge 2 ] || { printf '%s\n' '--prefix needs a directory argument' >&2; exit 1; }
+      PREFIX="$2"; shift 2 ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'Unknown option: %s\n' "$1" >&2; exit 1 ;;
   esac

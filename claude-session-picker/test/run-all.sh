@@ -34,3 +34,6 @@ printf '\n== backend tests (quoting + hub returns control) ==\n'
 
 printf '\n== key-decoding tests (arrows, no-op, quit) ==\n'
 "$BATS" "$HERE/keys.bats"
+
+printf '\n== install/uninstall tests (arg guard, safe symlink handling) ==\n'
+"$BATS" "$HERE/install.bats"
