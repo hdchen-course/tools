@@ -201,6 +201,38 @@ EOF
   [ "$count" -le 2 ]
 }
 
+@test "list: ordering is GLOBAL newest-first, and the cap keeps the newest" {
+  # Regression for the batched-sort bug: build many files with a known newest,
+  # cap to 1, and require that the single kept file is the globally newest —
+  # which fails if each xargs batch were sorted independently.
+  many="$CSP_CLAUDE_DIR/projects/-Volumes-demo-many"
+  mkdir -p "$many"
+  n=1
+  while [ "$n" -le 60 ]; do
+    touch -t "202601010000.$(printf '%02d' "$((n % 60))")" "$many/s$n.jsonl" 2>/dev/null \
+      || touch "$many/s$n.jsonl"
+    n=$((n + 1))
+  done
+  # Make one specific file unambiguously the newest.
+  sleep 1; touch "$many/WINNER.jsonl"
+  CSP_MAX_SESSIONS=1
+  run csp_list_session_files
+  first=$(printf '%s\n' "$output" | head -1)
+  case "$first" in *WINNER.jsonl) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
+}
+
+@test "list: an existing but EMPTY store yields nothing (no cwd leak)" {
+  # Regression for the xargs-with-no-input bug: a project dir with no *.jsonl
+  # must produce zero lines, not fall back to listing the current directory.
+  empty="$BATS_TEST_TMPDIR/emptystore"
+  mkdir -p "$empty/projects/-Volumes-demo-empty"
+  # Run from a directory that DOES contain files, to catch a cwd-listing leak.
+  run bash -c "cd '$BATS_TEST_DIRNAME' && CSP_CLAUDE_DIR='$empty' bash -c '. \"$BATS_TEST_DIRNAME/../lib/core.sh\"; . \"$BATS_TEST_DIRNAME/../lib/sessions.sh\"; csp_list_session_files'"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
 @test "mtime: returns a positive epoch for an existing file" {
   run csp_file_mtime "$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-alpha.jsonl"
   [ "$output" -gt 0 ]

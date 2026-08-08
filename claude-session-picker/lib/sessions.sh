@@ -258,25 +258,53 @@ csp_running_session_ids() {
 # csp_list_session_files
 #
 # Print the path of every session .jsonl under the Claude projects directory,
-# newest first, capped at CSP_MAX_SESSIONS so the menu can never grow without
-# bound. Newest-first (by modification time) is exactly the order a user wants
-# to scan, and that mtime is the "last active" time shown in the menu.
+# newest first (by modification time — the "last active" time shown in the
+# menu), capped at CSP_MAX_SESSIONS so the menu can never grow without bound.
 #
-# WHY `find … | xargs`, not a plain `ls *.jsonl` glob: a shell glob expands to
-# one giant argument list, which can exceed the OS "argument list too long"
-# limit (ARG_MAX) once you have very many sessions. `find` emits the paths as a
-# NUL-separated stream instead, and `xargs -0` feeds them to `ls -t` in safe
-# batches — so this stays correct no matter how many session files exist.
-# NUL separation (-print0 / -0) also makes it safe for paths containing spaces.
-# `-maxdepth 2` matches the projects/<dir>/<file>.jsonl layout exactly. Both the
-# find and xargs flags used here are available on macOS (BSD) and Linux (GNU).
+# HOW, and why it's built this way:
+#   • `find … -print0` streams the paths NUL-separated, so we never build one
+#     giant argument list (which could blow past the OS ARG_MAX limit with very
+#     many sessions) and paths with spaces stay intact. `-mindepth/-maxdepth 2`
+#     matches the projects/<dir>/<file>.jsonl layout exactly.
+#   • `xargs -0 -r stat` prints "<mtime> <path>" for each file. We must sort by
+#     mtime OURSELVES with a single global `sort -rn`, NOT rely on `ls -t`:
+#     `ls -t` sorts only within each xargs batch, so once the file count exceeds
+#     the xargs batch size the batches would each be sorted but the combined
+#     stream would NOT be globally newest-first, and the cap below would then
+#     drop the wrong files. Sorting centrally fixes that.
+#   • `-r` (skip the command on empty input) stops `stat`/`ls` from running with
+#     no arguments — which on GNU would otherwise list the current directory and
+#     inject bogus paths — so an existing-but-empty store yields nothing. `-r`
+#     is the GNU fix and is also accepted by modern BSD/macOS xargs.
+#   • `stat` differs across platforms, so we try BSD (`-f '%m %N'`) then GNU
+#     (`-c '%Y %n'`); the winner is chosen once per call.
+#   • `cut -d' ' -f2-` strips only the leading "<mtime> " field, so a path that
+#     itself contains spaces survives intact.
 # -----------------------------------------------------------------------------
 csp_list_session_files() {
-  local dir="$CSP_CLAUDE_DIR/projects"
+  local dir="$CSP_CLAUDE_DIR/projects" statfmt
   [ -d "$dir" ] || return 0
-  find "$dir" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' -print0 2>/dev/null \
-    | xargs -0 ls -t 2>/dev/null \
-    | head -n "$CSP_MAX_SESSIONS"
+
+  # Pick the stat dialect once (BSD prints mtime for a probe; else assume GNU).
+  if stat -f '%m' "$dir" >/dev/null 2>&1; then
+    statfmt="bsd"
+  else
+    statfmt="gnu"
+  fi
+
+  if [ "$statfmt" = "bsd" ]; then
+    find "$dir" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' -print0 2>/dev/null \
+      | xargs -0 -r stat -f '%m %N' 2>/dev/null \
+      | sort -rn -k1,1 \
+      | cut -d' ' -f2- \
+      | head -n "$CSP_MAX_SESSIONS"
+  else
+    find "$dir" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' -print0 2>/dev/null \
+      | xargs -0 -r stat -c '%Y %n' 2>/dev/null \
+      | sort -rn -k1,1 \
+      | cut -d' ' -f2- \
+      | head -n "$CSP_MAX_SESSIONS"
+  fi
 }
 
 # -----------------------------------------------------------------------------
