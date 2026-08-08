@@ -184,6 +184,15 @@ CSP_META_TITLE_CLIP=256
 # MB and thousands of lines) was ~6x slower for no benefit. We read a generous
 # head window instead, which cut per-file parse time from ~70ms to ~12ms. 64 is
 # far more than needed but leaves ample margin if the log format shifts.
+#
+# FILE-FORMAT ASSUMPTION (this tool reads Claude Code's UNDOCUMENTED store):
+# we assume the fields `aiTitle`, `lastPrompt` and `cwd` all appear within the
+# first CSP_META_HEAD_LINES lines of a `~/.claude/projects/**/*.jsonl` file. If a
+# future Claude Code version writes those fields LATER in the file, the symptom
+# is graceful — titles show as "(untitled)" and the project column as "?" — not
+# a crash. The fix if that ever happens: raise this number (or drop the head cap
+# and rely on the title-clip for speed). This is the single place coupled to
+# Claude's layout; the extractor already tolerates missing fields everywhere.
 CSP_META_HEAD_LINES=64
 
 csp_session_meta() {

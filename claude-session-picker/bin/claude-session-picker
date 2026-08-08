@@ -27,11 +27,21 @@
 # =============================================================================
 
 set -u  # Treat use of an unset variable as an error — catches typos early.
-# NOTE: we intentionally do NOT use `set -e` here. This is an interactive loop,
-# and many commands (a `read` that times out, a `grep` that finds nothing) exit
-# non-zero as normal control flow; `set -e` would abort the whole picker on
-# those and could leave the terminal half-restored. We handle errors explicitly
-# instead. Please don't add `set -e`.
+#
+# ERROR-HANDLING PHILOSOPHY (why some failures are silent by design):
+#   • We intentionally do NOT use `set -e`. This is an interactive loop where
+#     non-zero is normal control flow — a `read` that times out, a `grep` with
+#     no match, tmux reporting "no such session". `set -e` would abort the whole
+#     picker (possibly mid-draw, leaving the terminal half-restored). Please
+#     don't add it.
+#   • READS are best-effort and silent: anything that only gathers data to
+#     display (parsing a title, statting a file, reading hook state) degrades to
+#     an empty/placeholder value rather than erroring — a read-only tool should
+#     never nag about a file it merely failed to summarise.
+#   • ACTIONS that change or launch something check their result and surface it:
+#     delete verifies the path and reports refusal; opening a session checks the
+#     backend and falls back to hub; the terminal is restored on every exit path.
+# In short: displaying is forgiving, doing is checked.
 
 # Version, reported by --version. Bump this in the same commit as user-visible
 # changes and add a matching CHANGELOG.md entry; because the install is a
@@ -820,6 +830,8 @@ csp_main() {
       printf 'Usage: claude-session-picker [-V|--version] [-h|--help]\n\n'
       printf 'Run with no arguments to open the menu. Keys: j/k move, Enter open,\n'
       printf 'n new, d delete, t toggle hub/tmux, R reload, q quit.\n'
+      printf 'Markers: %s working, %s stopped/needs you (needs hooks — see README\n' "●" "✳"
+      printf '"Status markers"). A session started with n shows no %s until hooks are set up.\n' "●"
       printf 'Env: CSP_BACKEND=hub|tmux. Full docs: README.md and docs/MANUAL.md.\n'
       exit 0 ;;
   esac
