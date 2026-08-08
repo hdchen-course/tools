@@ -43,7 +43,18 @@ CSP_TMUX_SESSION="$(printf '%s' "$CSP_TMUX_SESSION" | tr -d ':.')"
 #   • never touch the shared root key table.
 # In short: everything we configure lives and dies with this socket, so the
 # "we never touch your tmux" promise is literally true.
+#
+# We STRIP '/', ',', '.' and control chars from the socket NAME. Reasons:
+#   • '/' or '..' would make `tmux -L` create the socket at an arbitrary path,
+#     breaking the "lives and dies with our socket" guarantee;
+#   • the TMUX env var is "<socket-path>,<pid>,<session>", and csp_inside_tmux
+#     recovers our name as the path's basename by cutting at the first ','. A
+#     name containing ',' or '/' would make that recovery wrong, so the picker
+#     would think it is OUTSIDE tmux and re-exec into a broken nested attach.
+# Empty after stripping falls back to the default.
 CSP_TMUX_SOCKET="${CSP_TMUX_SOCKET:-claude-sessions}"
+CSP_TMUX_SOCKET="$(printf '%s' "$CSP_TMUX_SOCKET" | tr -d '/,.[:cntrl:]')"
+[ -z "$CSP_TMUX_SOCKET" ] && CSP_TMUX_SOCKET="claude-sessions"
 
 # csp_tmux — run tmux on our dedicated socket. Every tmux call in this file goes
 # through this wrapper so the socket is applied consistently in one place.
@@ -174,16 +185,24 @@ csp_tmux_configure_home() {
 # a picker (e.g. the user pressed q, killing the menu window), we recreate the
 # menu window first so "attach" always lands you on a working menu.
 csp_tmux_enter() {
-  local self="$1" env_prefix v val
+  local self="$1" cmd v val
   csp_inside_tmux && return 0
 
-  # Build the command tmux runs for the picker window, carrying our CSP_* env
-  # across the re-launch (tmux starts it with a fresh environment). Quoted.
-  env_prefix="CSP_BACKEND=tmux CSP_IN_TMUX_HOME=1"
-  for v in CSP_CLAUDE_DIR CSP_TMUX_SESSION CSP_TMUX_SOCKET CSP_PREF_FILE CSP_STATE_DIR CSP_NO_COLOR; do
+  # Build the command tmux runs for the picker window, carrying our environment
+  # across the re-launch (tmux starts the window with a fresh environment). We
+  # prefix with `env VAR=val …` rather than the shell's own `VAR=val cmd` form,
+  # because tmux runs the command through the user's DEFAULT-SHELL — which may be
+  # csh/tcsh, where `VAR=val cmd` is a syntax error and the window would silently
+  # die. `env` is a real program and works under any shell. We forward our CSP_*
+  # settings and TMUX_TMPDIR (so `tmux -L` resolves to the SAME socket directory
+  # the parent used; otherwise csp_tmux_open could target a different, empty
+  # server and every Enter would fall back to hub).
+  cmd="env CSP_BACKEND=tmux"
+  for v in CSP_CLAUDE_DIR CSP_TMUX_SESSION CSP_TMUX_SOCKET CSP_PREF_FILE CSP_STATE_DIR CSP_NO_COLOR TMUX_TMPDIR; do
     eval "val=\${$v:-}"
-    [ -n "$val" ] && env_prefix="$env_prefix $v=$(csp_shell_quote "$val")"
+    [ -n "$val" ] && cmd="$cmd $v=$(csp_shell_quote "$val")"
   done
+  cmd="$cmd $(csp_shell_quote "$self")"
 
   if csp_tmux has-session -t "=$CSP_TMUX_SESSION" 2>/dev/null; then
     csp_tmux_configure_home
@@ -193,8 +212,7 @@ csp_tmux_enter() {
     # occupies index 0 — destroying a running Claude); swap is non-destructive.
     if ! csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_name}' 2>/dev/null \
          | grep -qx menu; then
-      csp_tmux new-window -t "=$CSP_TMUX_SESSION" -n menu \
-        "$env_prefix $(csp_shell_quote "$self")" 2>/dev/null
+      csp_tmux new-window -t "=$CSP_TMUX_SESSION" -n menu "$cmd" 2>/dev/null
       csp_tmux swap-window -s "=$CSP_TMUX_SESSION:\$" -t "=$CSP_TMUX_SESSION:0" 2>/dev/null
     fi
     # exec the REAL tmux (a bare `exec csp_tmux` fails — exec can't run a shell
@@ -206,11 +224,13 @@ csp_tmux_enter() {
 
   # Fresh: create the holding session with the picker in window 0 (named
   # "menu"), configure it, then attach. Detached-first so options apply before
-  # the client draws.
-  csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu \
-    "$env_prefix $(csp_shell_quote "$self")" 2>/dev/null || return 1
+  # the client draws. If the attach can't happen (exec fails), don't leave the
+  # freshly-created detached session orphaned — tear it down and return so the
+  # caller falls back to hub cleanly.
+  csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu "$cmd" 2>/dev/null || return 1
   csp_tmux_configure_home
   exec command tmux -L "$CSP_TMUX_SOCKET" attach-session -t "=$CSP_TMUX_SESSION"
+  csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null   # only if exec failed
   return 1
 }
 

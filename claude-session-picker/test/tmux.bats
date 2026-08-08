@@ -173,3 +173,28 @@ make_home() {
   [ "$bad" = "0" ]
   [ "$output" = "abc" ]
 }
+
+@test "socket name: '/' ',' '.' are stripped so inside-tmux detection can't break (safety 1)" {
+  # A socket containing ',' or '/' would corrupt csp_inside_tmux's basename parse
+  # of the TMUX env var and make the picker re-exec into a broken nested attach.
+  CSP_TMUX_SOCKET="a,b/c.d" bash -c '
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh
+    . '"$BATS_TEST_DIRNAME"'/../lib/backend.sh
+    printf "%s" "$CSP_TMUX_SOCKET"' > "$BATS_TEST_TMPDIR/sock"
+  run cat "$BATS_TEST_TMPDIR/sock"
+  [ "$output" = "abcd" ]
+  # And the sanitized socket now round-trips through inside-tmux detection.
+  CSP_TMUX_SOCKET=abcd TMUX="/private/tmp/tmux-0/abcd,1,0" bash -c '
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh
+    . '"$BATS_TEST_DIRNAME"'/../lib/backend.sh
+    csp_inside_tmux'
+}
+
+@test "socket name: empty after stripping falls back to the default" {
+  CSP_TMUX_SOCKET="..." bash -c '
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh
+    . '"$BATS_TEST_DIRNAME"'/../lib/backend.sh
+    printf "%s" "$CSP_TMUX_SOCKET"' > "$BATS_TEST_TMPDIR/sock2"
+  run cat "$BATS_TEST_TMPDIR/sock2"
+  [ "$output" = "claude-sessions" ]
+}
