@@ -16,7 +16,7 @@
 # WHY IT NEEDS NOTHING INSTALLED:
 #   It reads Claude's own files under ~/.claude and resumes with the `claude`
 #   command you already have. No tmux, no fzf, no Homebrew. It runs on a bare
-#   remote Cloud Desktop exactly as it does on a Mac.
+#   remote Linux host exactly as it does on a Mac.
 #
 # HOW IT STAYS SAFE:
 #   - All decision logic lives in lib/core.sh as pure, unit-tested functions.
@@ -27,11 +27,18 @@
 # =============================================================================
 
 set -u  # Treat use of an unset variable as an error — catches typos early.
+# NOTE: we intentionally do NOT use `set -e` here. This is an interactive loop,
+# and many commands (a `read` that times out, a `grep` that finds nothing) exit
+# non-zero as normal control flow; `set -e` would abort the whole picker on
+# those and could leave the terminal half-restored. We handle errors explicitly
+# instead. Please don't add `set -e`.
 
 # --- Locate our own library files, following symlinks -----------------------
 # The installer symlinks this script into a bin dir, so we resolve the real
-# location to find lib/ next to it.
-csp_self="$0"
+# location to find lib/ next to it. We start from ${BASH_SOURCE[0]} rather than
+# $0 because it names THIS file both when the script is run normally and when a
+# test sources it (where $0 would instead be the shell/bats runner).
+csp_self="${BASH_SOURCE[0]:-$0}"
 while [ -L "$csp_self" ]; do
   csp_link_target=$(readlink "$csp_self")
   case "$csp_link_target" in
@@ -66,7 +73,14 @@ csp_restore_terminal() {
   printf '\033[?25h'                 # make the cursor visible again
   [ -n "$csp_saved_stty" ] && stty "$csp_saved_stty" 2>/dev/null
 }
-trap 'csp_restore_terminal' EXIT INT TERM
+# Install the restore trap only for real runs. When a test merely sources this
+# file to poke at a function, we must NOT install an EXIT trap: it would fire on
+# the test subshell's exit and print the cursor-restore escape onto the output
+# the test is trying to read. (The trap does nothing to fix a real terminal in
+# that context anyway, since no raw mode was entered.)
+if [ -z "${CSP_SOURCED_FOR_TEST:-}" ]; then
+  trap 'csp_restore_terminal' EXIT INT TERM
+fi
 
 csp_enter_raw_mode() {
   csp_saved_stty=$(stty -g 2>/dev/null) || csp_saved_stty=""
@@ -77,15 +91,21 @@ csp_enter_raw_mode() {
 # csp_read_key — read one keypress, decoding arrow-key escape sequences into
 # simple letters (k for up, j for down) so the rest of the code handles one
 # vocabulary. Returns the key on stdout.
+#
+# Left/Right arrows are deliberately turned into a harmless no-op ('_'), NOT
+# quit: it's easy to fumble onto them, and losing the menu on a stray keypress
+# would be annoying. Only a bare Esc (no bracket sequence after it) quits.
 csp_read_key() {
   local k rest
   IFS= read -r -n 1 k 2>/dev/null || { printf 'q'; return; }
   if [ "$k" = $'\033' ]; then          # an escape sequence (likely an arrow)
     IFS= read -r -n 2 -t 1 rest 2>/dev/null
     case "$rest" in
-      '[A') printf 'k' ;;              # up arrow  → up
-      '[B') printf 'j' ;;              # down arrow → down
-      *)    printf 'q' ;;              # bare Esc  → quit
+      '[A') printf 'k' ;;              # up arrow    → up
+      '[B') printf 'j' ;;              # down arrow  → down
+      '[C'|'[D') printf '_' ;;         # right/left arrow → ignore (no-op)
+      '')   printf 'q' ;;              # bare Esc (nothing followed) → quit
+      *)    printf '_' ;;              # any other sequence → ignore
     esac
     return
   fi
@@ -262,4 +282,9 @@ csp_main() {
   done
 }
 
-csp_main "$@"
+# Run the picker only when this file is executed directly. When a test sources
+# it (CSP_SOURCED_FOR_TEST=1) we skip main so individual functions like
+# csp_read_key can be exercised in isolation without launching the whole TUI.
+if [ -z "${CSP_SOURCED_FOR_TEST:-}" ]; then
+  csp_main "$@"
+fi

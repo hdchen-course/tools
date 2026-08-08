@@ -127,6 +127,35 @@ EOF
   [ "$(csp_field "$output" 2)" = "?" ]
 }
 
+@test "list: handles a very large number of sessions without ARG_MAX errors" {
+  # The find|xargs approach must cope with far more files than a shell glob
+  # could pass as one argument list. 1500 keeps the test fast but well past the
+  # point a naive glob would risk "argument list too long" on small ARG_MAX.
+  many="$CSP_CLAUDE_DIR/projects/-Volumes-demo-many"
+  mkdir -p "$many"
+  i=1
+  while [ "$i" -le 1500 ]; do
+    printf '{"type":"mode"}\n' > "$many/s$i.jsonl"
+    i=$((i + 1))
+  done
+  run csp_list_session_files
+  [ "$status" -eq 0 ]
+  count=$(printf '%s\n' "$output" | grep -c . || true)
+  # Capped at CSP_MAX_SESSIONS (1000) and definitely produced output.
+  [ "$count" -gt 0 ]
+  [ "$count" -le "$CSP_MAX_SESSIONS" ]
+}
+
+@test "list: finds sessions even when the project path contains spaces" {
+  # NUL-separated find|xargs must not split on spaces in directory names.
+  spaced="$CSP_CLAUDE_DIR/projects/-Volumes-my project-dir"
+  mkdir -p "$spaced"
+  printf '{"type":"ai-title","aiTitle":"spaced"}\n' > "$spaced/sp.jsonl"
+  run csp_list_session_files
+  case "$output" in *"my project"*"/sp.jsonl") ok=1 ;; *"my project"*) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
+}
+
 @test "cap: never lists more than CSP_MAX_SESSIONS files" {
   CSP_MAX_SESSIONS=2
   # Create 5 sessions; expect only 2 back.

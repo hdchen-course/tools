@@ -31,3 +31,6 @@ printf '\n== session-store tests (fake ~/.claude) ==\n'
 
 printf '\n== backend tests (quoting + hub returns control) ==\n'
 "$BATS" "$HERE/backend.bats"
+
+printf '\n== key-decoding tests (arrows, no-op, quit) ==\n'
+"$BATS" "$HERE/keys.bats"

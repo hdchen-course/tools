@@ -12,6 +12,9 @@
 # =============================================================================
 
 setup() {
+  # A UTF-8 locale so ${#text} counts CHARACTERS, not bytes — this is what makes
+  # the multibyte (Chinese) truncation test meaningful and stable across shells.
+  export LC_ALL="${LC_ALL:-en_US.UTF-8}"
   . "$BATS_TEST_DIRNAME/../lib/core.sh"
 }
 

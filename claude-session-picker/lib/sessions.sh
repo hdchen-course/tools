@@ -134,11 +134,16 @@ csp_session_meta() {
     # We then pick the first non-null aiTitle, lastPrompt and cwd across the
     # surviving objects. Doing it in one jq invocation keeps loading fast, and
     # gsub flattens tabs/newlines in the title so the TAB separator is safe.
+    #
+    # Memory note: we keep only the three small fields we care about from each
+    # line ({title,prompt,cwd}) rather than the whole parsed object, so even a
+    # session log with large messages doesn't pull megabytes into memory here.
     out=$(jq -rRn '
-      [inputs | fromjson? // empty] as $o
-    | ($o | map(.aiTitle)    | map(select(. != null)) | .[0]) as $t
-    | ($o | map(.lastPrompt) | map(select(. != null)) | .[0]) as $p
-    | ($o | map(.cwd)        | map(select(. != null)) | .[0]) as $c
+      [inputs | fromjson? // empty
+        | {t: .aiTitle, p: .lastPrompt, c: .cwd}] as $o
+    | ($o | map(.t) | map(select(. != null)) | .[0]) as $t
+    | ($o | map(.p) | map(select(. != null)) | .[0]) as $p
+    | ($o | map(.c) | map(select(. != null)) | .[0]) as $c
     | ((($t // $p // "") | gsub("[\t\n\r]"; " ")) + "\t" + ($c // ""))
     ' "$file" 2>/dev/null)
   elif command -v python3 >/dev/null 2>&1; then
@@ -210,8 +215,12 @@ csp_file_mtime() {
 # guarantee, and its absence never causes wrong behaviour.
 # -----------------------------------------------------------------------------
 csp_running_session_ids() {
-  # -ww so long argument lists aren't truncated; grep only the resume ids.
-  ps -eo args=w 2>/dev/null \
+  # `ps -eo args=` prints every process's full command line with no header. We
+  # use a bare `args=` (empty header) rather than `-ww`, because macOS ps does
+  # not accept `-ww` and already prints untruncated output, while GNU ps accepts
+  # `args=` fine — so this one form is portable across macOS and Linux. We then
+  # pull out just the session id that follows each "--resume".
+  ps -eo args= 2>/dev/null \
     | grep -oE -- '--resume [0-9a-fA-F-]{8,}' \
     | awk '{print $2}' \
     | sort -u
@@ -222,15 +231,24 @@ csp_running_session_ids() {
 #
 # Print the path of every session .jsonl under the Claude projects directory,
 # newest first, capped at CSP_MAX_SESSIONS so the menu can never grow without
-# bound. `ls -t` sorts by modification time (most recently active first), which
-# is exactly the order a user wants to scan.
+# bound. Newest-first (by modification time) is exactly the order a user wants
+# to scan, and that mtime is the "last active" time shown in the menu.
+#
+# WHY `find … | xargs`, not a plain `ls *.jsonl` glob: a shell glob expands to
+# one giant argument list, which can exceed the OS "argument list too long"
+# limit (ARG_MAX) once you have very many sessions. `find` emits the paths as a
+# NUL-separated stream instead, and `xargs -0` feeds them to `ls -t` in safe
+# batches — so this stays correct no matter how many session files exist.
+# NUL separation (-print0 / -0) also makes it safe for paths containing spaces.
+# `-maxdepth 2` matches the projects/<dir>/<file>.jsonl layout exactly. Both the
+# find and xargs flags used here are available on macOS (BSD) and Linux (GNU).
 # -----------------------------------------------------------------------------
 csp_list_session_files() {
   local dir="$CSP_CLAUDE_DIR/projects"
   [ -d "$dir" ] || return 0
-  # List newest-first; head enforces the hard cap. `2>/dev/null` hides the
-  # "no matches" noise when a project folder has no sessions yet.
-  ls -t "$dir"/*/*.jsonl 2>/dev/null | head -n "$CSP_MAX_SESSIONS"
+  find "$dir" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' -print0 2>/dev/null \
+    | xargs -0 ls -t 2>/dev/null \
+    | head -n "$CSP_MAX_SESSIONS"
 }
 
 # -----------------------------------------------------------------------------
