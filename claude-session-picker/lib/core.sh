@@ -55,7 +55,10 @@ CSP_MAX_LINE_LEN=200   # Longest rendered line; anything longer is truncated.
 #             dependency default that works on a bare Linux host.
 #
 # The override always wins, EXCEPT we never promise "tmux" when tmux is absent,
-# because that backend simply cannot work without the tmux command.
+# because that backend simply cannot work without the tmux command. FORCED is
+# matched case-sensitively; an unrecognised value (e.g. "Hub", "screen") is
+# treated as auto — callers should first validate with csp_backend_is_valid so
+# they can warn the user rather than silently ignoring a typo.
 # -----------------------------------------------------------------------------
 csp_choose_backend() {
   local tmux_available="$1" inside_tmux="$2" forced="$3"
@@ -73,6 +76,21 @@ csp_choose_backend() {
   else
     printf 'hub'
   fi
+}
+
+# -----------------------------------------------------------------------------
+# csp_backend_is_valid VALUE
+#
+# Return 0 if VALUE is a value csp_choose_backend actually honours as an
+# override — i.e. empty (auto), "hub", or "tmux". Anything else returns 1 so a
+# caller can warn "CSP_BACKEND=Hub is not recognised; using auto" instead of a
+# user silently getting the wrong mode from a typo.
+# -----------------------------------------------------------------------------
+csp_backend_is_valid() {
+  case "$1" in
+    ''|hub|tmux) return 0 ;;
+    *)           return 1 ;;
+  esac
 }
 
 # -----------------------------------------------------------------------------

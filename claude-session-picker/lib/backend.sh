@@ -79,6 +79,19 @@ csp_tmux_ensure_session() {
   tmux new-session -d -s "$CSP_TMUX_SESSION" 2>/dev/null
 }
 
+# csp_tmux_sanitize_label LABEL — make a safe, non-empty tmux window name.
+# tmux rejects names containing newlines and treats a leading '-' as a flag, so
+# we keep only tame characters and fall back to "session" if nothing is left.
+# Returned via stdout.
+csp_tmux_sanitize_label() {
+  local label="$1" clean
+  clean=$(printf '%s' "$label" | tr -c 'A-Za-z0-9._/-' '_' | tr -s '_')
+  clean="${clean#[-_]}"                 # never start with '-' or '_'
+  clean="${clean:0:40}"
+  [ -z "$clean" ] && clean="session"
+  printf '%s' "$clean"
+}
+
 # csp_tmux_open ID PROJECT LABEL
 #
 # Open a session in its own tmux window and focus it. Other windows keep running
@@ -86,15 +99,22 @@ csp_tmux_ensure_session() {
 #
 #   ID       session id to resume, or "new" for a fresh session
 #   PROJECT  working directory to start in (optional)
-#   LABEL    short human name for the tmux window
+#   LABEL    short human name for the tmux window (sanitized here)
 #
-# We build the command as a string for tmux to run. ID/PROJECT come from our own
-# session files (ids are hex+dashes, projects are real paths), and we quote them
-# for the shell tmux spawns, so there is no room for injection.
+# Returns 0 on success, NON-ZERO if the window could not be created or focused.
+# The caller MUST check this: a silent failure would make the picker vanish with
+# nothing opened. We build the command as a string for tmux to run; ID/PROJECT
+# come from our own session files and are single-quoted, so there is no room for
+# shell injection.
+#
+# When we are already inside tmux we create the window in the CURRENT session
+# (so we never yank the user out of their own long-lived tmux work into our
+# holding session), and select it. Otherwise we create it in the dedicated
+# holding session and attach to that.
 csp_tmux_open() {
-  local id="$1" project="$2" label="$3" cmd
+  local id="$1" project="$2" label="$3" cmd target win
 
-  csp_tmux_ensure_session
+  label=$(csp_tmux_sanitize_label "$label")
 
   # Compose the shell command the new window will run.
   if [ -n "$project" ] && [ -d "$project" ]; then
@@ -108,15 +128,20 @@ csp_tmux_open() {
     cmd="${cmd}claude --resume $(csp_shell_quote "$id")"
   fi
 
-  # Create the window (running our command) inside the holding session.
-  tmux new-window -t "=$CSP_TMUX_SESSION" -n "$label" "$cmd" 2>/dev/null
-
-  # Bring the user to it: switch if we're already in tmux, else attach.
   if csp_inside_tmux; then
-    tmux switch-client -t "=$CSP_TMUX_SESSION" 2>/dev/null
+    # Already in tmux: open in the user's current session and switch to it.
+    # -P -F prints the new window id so we can select exactly that window.
+    win=$(tmux new-window -P -F '#{window_id}' -n "$label" "$cmd" 2>/dev/null) \
+      || return 1
+    tmux select-window -t "$win" 2>/dev/null || return 1
   else
-    tmux attach-session -t "=$CSP_TMUX_SESSION" 2>/dev/null
+    # Not in tmux: use (creating if needed) the dedicated holding session.
+    csp_tmux_ensure_session || return 1
+    target="$CSP_TMUX_SESSION"
+    tmux new-window -t "=$target" -n "$label" "$cmd" 2>/dev/null || return 1
+    tmux attach-session -t "=$target" 2>/dev/null || return 1
   fi
+  return 0
 }
 
 # csp_shell_quote STRING — wrap STRING in single quotes for safe use inside a

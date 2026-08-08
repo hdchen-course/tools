@@ -56,7 +56,13 @@ CSP_ROOT="$(cd "$(dirname "$csp_self")/.." && pwd)"
 . "$CSP_ROOT/lib/backend.sh"
 
 # Which backend runs sessions (see csp_choose_backend / lib/backend.sh). The
-# CSP_BACKEND environment variable forces "hub" or "tmux"; empty means auto.
+# CSP_BACKEND environment variable forces "hub" or "tmux" (case-sensitive);
+# empty means auto. If it's set to something unrecognised, warn instead of
+# silently falling back to auto (which would look like the flag was ignored).
+if ! csp_backend_is_valid "${CSP_BACKEND:-}"; then
+  printf 'Warning: CSP_BACKEND="%s" is not recognised (use "hub" or "tmux"); using auto-detect.\n' \
+    "${CSP_BACKEND}" >&2
+fi
 CSP_ACTIVE_BACKEND=$(csp_choose_backend \
   "$(csp_tmux_available && echo 1 || echo 0)" \
   "$(csp_inside_tmux && echo 1 || echo 0)" \
@@ -68,48 +74,115 @@ CSP_ACTIVE_BACKEND=$(csp_choose_backend \
 # killed — this is the core of "never leave the terminal broken". The trap is
 # installed BEFORE we ever change terminal modes, so there is no window in which
 # a failure could skip the cleanup.
+# csp_saved_stty holds the PRISTINE terminal settings, captured exactly ONCE
+# before we ever touch the terminal (see csp_capture_pristine_stty). We must
+# never re-capture after that: if we did, and a crashed Claude left the terminal
+# in a broken mode, we would "restore" that broken mode. Capturing once means we
+# always put the terminal back the way the user's shell handed it to us.
 csp_saved_stty=""
-csp_restore_terminal() {
-  printf '\033[?25h'                 # make the cursor visible again
-  [ -n "$csp_saved_stty" ] && stty "$csp_saved_stty" 2>/dev/null
+csp_stty_captured=0
+
+csp_capture_pristine_stty() {
+  # Capture only the first time; later calls are deliberate no-ops.
+  [ "$csp_stty_captured" = "1" ] && return 0
+  csp_saved_stty=$(stty -g 2>/dev/null) || csp_saved_stty=""
+  csp_stty_captured=1
 }
-# Install the restore trap only for real runs. When a test merely sources this
-# file to poke at a function, we must NOT install an EXIT trap: it would fire on
-# the test subshell's exit and print the cursor-restore escape onto the output
-# the test is trying to read. (The trap does nothing to fix a real terminal in
-# that context anyway, since no raw mode was entered.)
+
+# csp_restore_terminal — put the terminal fully back to normal. It is safe to
+# call more than once and on any exit path. It undoes everything a raw-mode TUI
+# (ours or a crashed Claude we returned from) could have left on:
+#   • show the cursor again
+#   • leave the alternate screen buffer, and turn mouse reporting off — a
+#     crashed Claude often leaves these on, which otherwise spews escape
+#     garbage or hides the shell prompt
+#   • restore the exact saved settings; if we never captured any (or capture
+#     failed), fall back to `stty sane`, a known-good cooked mode, so the user
+#     is never left with no echo / no Ctrl-C.
+csp_restore_terminal() {
+  printf '\033[?25h\033[?1049l\033[?1000l\033[?1006l' 2>/dev/null
+  if [ -n "$csp_saved_stty" ]; then
+    stty "$csp_saved_stty" 2>/dev/null || stty sane 2>/dev/null
+  else
+    stty sane 2>/dev/null
+  fi
+}
+
+# Interrupt handling has ONE designed outcome: restore the terminal and exit.
+# Falling back into the raw-mode loop after an interrupt (the previous bug)
+# could leave the terminal cooked while the menu kept running, or even open a
+# session on an empty keypress. We give INT/TERM/QUIT/HUP/PIPE a single clean
+# destination. Not installed when a test merely sources this file.
+csp_on_signal() {
+  csp_restore_terminal
+  exit 130
+}
 if [ -z "${CSP_SOURCED_FOR_TEST:-}" ]; then
-  trap 'csp_restore_terminal' EXIT INT TERM
+  trap 'csp_restore_terminal' EXIT
+  trap 'csp_on_signal' INT TERM QUIT HUP PIPE
 fi
 
 csp_enter_raw_mode() {
-  csp_saved_stty=$(stty -g 2>/dev/null) || csp_saved_stty=""
+  csp_capture_pristine_stty           # captures once; safe to call repeatedly
   stty -echo -icanon min 1 time 0 2>/dev/null
   printf '\033[?25l'                 # hide the cursor while the menu is drawn
 }
 
-# csp_read_key — read one keypress, decoding arrow-key escape sequences into
-# simple letters (k for up, j for down) so the rest of the code handles one
-# vocabulary. Returns the key on stdout.
+# csp_read_key — read one keypress and return a single normalised token:
+#   j / k        down / up      (from 'j','k' or the ↓/↑ arrows)
+#   g / G        first / last
+#   n            new session
+#   R / l        reload
+#   q            quit           (also a bare Esc)
+#   _            "ignore me"    (any other arrow / escape sequence)
+#   <char>       any other single character, passed through unchanged
 #
-# Left/Right arrows are deliberately turned into a harmless no-op ('_'), NOT
-# quit: it's easy to fumble onto them, and losing the menu on a stray keypress
-# would be annoying. Only a bare Esc (no bracket sequence after it) quits.
+# The tricky part is escape sequences. An arrow key sends three-plus bytes
+# (ESC [ A). Home/End/PageUp send ESC [ 1 ~ etc., and a stray mouse click from a
+# terminal left in mouse-reporting mode sends ESC [ M followed by raw bytes.
+# The previous version read a FIXED two bytes after ESC, which left the tail of
+# longer sequences (the '~', the mouse coordinates) sitting in the input to be
+# misread as if the user had typed them — a stray click could even quit the
+# picker. We instead CONSUME THE WHOLE sequence: after ESC-[ we read bytes until
+# the terminating "final byte" (in the 0x40–0x7E range), so nothing is left
+# behind. Only a bare Esc — an ESC with nothing following — quits.
 csp_read_key() {
-  local k rest
+  local k rest c
   IFS= read -r -n 1 k 2>/dev/null || { printf 'q'; return; }
-  if [ "$k" = $'\033' ]; then          # an escape sequence (likely an arrow)
-    IFS= read -r -n 2 -t 1 rest 2>/dev/null
-    case "$rest" in
-      '[A') printf 'k' ;;              # up arrow    → up
-      '[B') printf 'j' ;;              # down arrow  → down
-      '[C'|'[D') printf '_' ;;         # right/left arrow → ignore (no-op)
-      '')   printf 'q' ;;              # bare Esc (nothing followed) → quit
-      *)    printf '_' ;;              # any other sequence → ignore
-    esac
+
+  if [ "$k" != $'\033' ]; then
+    printf '%s' "$k"
     return
   fi
-  printf '%s' "$k"
+
+  # We saw ESC. Read the next byte (short timeout) to see if a sequence follows.
+  IFS= read -r -n 1 -t 1 rest 2>/dev/null
+  if [ -z "$rest" ]; then
+    printf 'q'                     # bare Esc → quit
+    return
+  fi
+  if [ "$rest" != '[' ] && [ "$rest" != 'O' ]; then
+    printf '_'                     # ESC + something we don't handle → ignore
+    return
+  fi
+
+  # It's a CSI/SS3 sequence. Read the (up to few) parameter/final bytes, mapping
+  # the arrows and discarding everything else. Loop until a final byte or EOF.
+  IFS= read -r -n 1 -t 1 c 2>/dev/null
+  case "$c" in
+    'A') printf 'k'; return ;;     # up
+    'B') printf 'j'; return ;;     # down
+    'C'|'D') printf '_'; return ;; # right/left → no-op
+  esac
+  # Longer sequence (e.g. Home = ESC [ 1 ~, or a mouse report): drain to its end
+  # so no leftover bytes are read as keystrokes, then report "ignore".
+  while [ -n "$c" ]; do
+    case "$c" in
+      [A-Za-z~]) break ;;          # a final byte — sequence complete
+    esac
+    IFS= read -r -n 1 -t 1 c 2>/dev/null
+  done
+  printf '_'
 }
 
 # --- In-memory session model -------------------------------------------------
@@ -232,13 +305,22 @@ csp_draw() {
 #   • tmux — we hand off to tmux (attach/switch) and then exit the picker: tmux
 #     owns the screen from here, and the other sessions keep running in their
 #     own windows. We restore the terminal first so tmux starts from a clean
-#     state.
+#     state. If tmux FAILS (server won't start, window couldn't be created), we
+#     do NOT silently vanish — we fall back to hub for this one launch so the
+#     user still gets their session, then return to the menu.
 csp_open() {
   local id="$1" project="$2" label="$3"
   if [ "$CSP_ACTIVE_BACKEND" = "tmux" ]; then
     csp_restore_terminal
-    csp_tmux_open "$id" "$project" "$label"
-    exit 0
+    if csp_tmux_open "$id" "$project" "$label"; then
+      exit 0
+    fi
+    # tmux launch failed — tell the user and fall back to running it here.
+    printf 'tmux could not open the session; running it here instead.\n' >&2
+    csp_hub_open "$id" "$project"
+    csp_enter_raw_mode
+    csp_load_sessions
+    return 0
   fi
   # hub mode
   csp_restore_terminal
@@ -255,10 +337,14 @@ csp_main() {
     exit 1
   fi
 
-  csp_enter_raw_mode
   local selected=0 key label
 
+  # Load the session list BEFORE switching the terminal to raw mode. Loading
+  # reads files and can take a moment on a big store; doing it first means the
+  # terminal is never sitting in raw mode during that work (so nothing can leave
+  # it raw if loading is interrupted), and the first frame appears fully built.
   csp_load_sessions
+  csp_enter_raw_mode
   while :; do
     selected=$(csp_clamp_index "$selected" "$csp_count")
     csp_draw "$selected"

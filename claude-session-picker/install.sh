@@ -28,7 +28,11 @@ FORCE=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --prefix) PREFIX="$2"; shift 2 ;;
+    --prefix)
+      # Guard against a missing argument: `--prefix` with nothing after it would
+      # otherwise trip `set -u` with an unbound $2 and abort with a cryptic error.
+      [ "$#" -ge 2 ] || { printf '%s\n' '--prefix needs a directory argument' >&2; exit 1; }
+      PREFIX="$2"; shift 2 ;;
     --force)  FORCE=1; shift ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'Unknown option: %s\n' "$1" >&2; exit 1 ;;
@@ -54,13 +58,20 @@ mkdir -p "$PREFIX"
 chmod +x "$ROOT/bin/claude-session-picker"
 
 DST="$PREFIX/claude-session-picker"
-if [ -e "$DST" ] || [ -L "$DST" ]; then
+if [ -L "$DST" ]; then
+  # It's a symlink. Safe to replace on --force (uninstall would remove it too).
   if [ "$FORCE" -eq 1 ]; then
     rm -f "$DST"
   else
     warn "Already exists (use --force to overwrite): $DST"
     exit 1
   fi
+elif [ -e "$DST" ]; then
+  # It's a REAL file or directory we did not create. We never delete that, even
+  # with --force — it could be something the user cares about. Make them move it.
+  warn "Refusing to overwrite an existing non-symlink at: $DST"
+  warn "Move or remove it yourself, then re-run install."
+  exit 1
 fi
 ln -s "$ROOT/bin/claude-session-picker" "$DST"
 say "Linked $DST -> $ROOT/bin/claude-session-picker"
@@ -76,13 +87,20 @@ else
   say ""
   say "Optional: install tmux to run multiple sessions at the SAME time"
   say "(without it, the picker runs one session at a time — still fully usable)."
-  if command -v brew >/dev/null 2>&1; then
+  if command -v brew >/dev/null 2>&1 && [ -t 0 ]; then
+    # Only prompt when stdin is an interactive terminal ([ -t 0 ]). When the
+    # installer is run non-interactively (e.g. piped from curl, or in CI), a
+    # `read` would get EOF and — under `set -e` — abort the whole script AFTER
+    # the symlink was already made, falsely reporting failure. In that case we
+    # just print guidance and continue.
     printf 'Install tmux now with Homebrew? [y/N] '
-    read -r reply
+    read -r reply || reply=n
     case "$reply" in
       y|Y) brew install tmux && say "✓ tmux installed — concurrent mode unlocked." ;;
       *)   say "Skipped. You can install it later with: brew install tmux" ;;
     esac
+  elif command -v brew >/dev/null 2>&1; then
+    say "Non-interactive run — skipping the tmux prompt. Install later with: brew install tmux"
   else
     say "To enable it later: install tmux via your package manager"
     say "(macOS: brew install tmux   |   Debian/Ubuntu: sudo apt install tmux)."

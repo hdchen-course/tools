@@ -11,6 +11,7 @@
 # =============================================================================
 
 setup() {
+  export LC_ALL="${LC_ALL:-en_US.UTF-8}"   # stable char counting for titles
   . "$BATS_TEST_DIRNAME/../lib/core.sh"
   . "$BATS_TEST_DIRNAME/../lib/sessions.sh"
 
@@ -119,6 +120,39 @@ EOF
   [ "$(csp_field "$output" 1)" = "(untitled)" ]
 }
 
+@test "meta: control characters and ANSI escapes are stripped from the title" {
+  # A title from conversation content could contain an escape sequence that
+  # would clear the screen or retitle the window when drawn. It must be neutered.
+  esc="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-esc.jsonl"
+  printf '{"type":"ai-title","aiTitle":"%b"}\n' 'a[2J[Hbc' > "$esc"
+  printf '{"type":"user","cwd":"/Volumes/demo/alpha"}\n' >> "$esc"
+  run csp_session_meta "$esc"
+  title="$(csp_field "$output" 1)"
+  # No ESC (0x1b) or BEL (0x07) may survive.
+  case "$title" in *$'\033'*) bad=1 ;; *$'\007'*) bad=1 ;; *) bad=0 ;; esac
+  [ "$bad" = "0" ]
+  # cwd still intact.
+  [ "$(csp_field "$output" 2)" = "/Volumes/demo/alpha" ]
+}
+
+@test "meta: a huge tab-less title is handled quickly (no quadratic freeze)" {
+  # Regression test for the quadratic bash-3.2 string split. A ~256KB single
+  # title must be clipped by the extractor, so this returns effectively instantly
+  # rather than freezing. We assert it finishes and the title is clipped short.
+  big="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-big.jsonl"
+  {
+    printf '{"type":"last-prompt","lastPrompt":"'
+    # 256K of 'x' with no tabs/newlines.
+    i=0; while [ "$i" -lt 256 ]; do printf '%01024d' 0 | tr '0' 'x'; i=$((i + 1)); done
+    printf '","cwd":"/Volumes/demo/alpha"}\n'
+  } > "$big"
+  run csp_session_meta "$big"
+  [ "$status" -eq 0 ]
+  title="$(csp_field "$output" 1)"
+  # Clipped well below the raw size (extractor clip is CSP_META_TITLE_CLIP=256).
+  [ "${#title}" -le 300 ]
+}
+
 @test "meta: missing everything yields (untitled) and ?" {
   empty="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-empty2.jsonl"
   printf '{"type":"mode","mode":"normal"}\n' > "$empty"
@@ -170,6 +204,16 @@ EOF
 @test "mtime: returns a positive epoch for an existing file" {
   run csp_file_mtime "$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-alpha.jsonl"
   [ "$output" -gt 0 ]
+}
+
+@test "mtime: a non-numeric stat result is coerced to 0 (never breaks arithmetic)" {
+  # Simulate the wrong-platform stat dialect that "succeeds" but prints junk.
+  stat() { printf 'not-a-number\n'; return 0; }
+  run csp_file_mtime "/whatever"
+  [ "$output" = "0" ]
+  # And the value is safe to use in arithmetic (the real consumer does now-mtime).
+  run bash -c "m=$output; echo \$((100 - m))"
+  [ "$output" = "100" ]
 }
 
 @test "missing projects dir is handled without error" {

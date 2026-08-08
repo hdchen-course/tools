@@ -53,3 +53,25 @@ decode() {
   run decode '\033[H'
   [ "$output" = "_" ]
 }
+
+@test "key: Home (ESC [ 1 ~) is a no-op and its tail is fully consumed" {
+  # The whole multi-byte sequence must be drained so the trailing '~' is not
+  # left behind to be misread as a keystroke.
+  run decode '\033[1~'
+  [ "$output" = "_" ]
+  [ "$output" != "q" ]
+  [ "$output" != "~" ]
+}
+
+@test "key: a mouse report (ESC [ M ...) does not quit the picker" {
+  # A stray click from a terminal left in mouse mode sends ESC [ M then bytes.
+  # It must be swallowed, never interpreted as 'q'.
+  run decode '\033[M abc'
+  [ "$output" = "_" ]
+  [ "$output" != "q" ]
+}
+
+@test "key: SS3-style arrow (ESC O A) also decodes to up" {
+  run decode '\033OA'
+  [ "$output" = "k" ]
+}

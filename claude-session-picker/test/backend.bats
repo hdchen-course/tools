@@ -30,6 +30,32 @@ setup() {
   [ "$output" = "'it'\\''s mine'" ]
 }
 
+# --- csp_tmux_sanitize_label -------------------------------------------------
+
+@test "label: a normal project path is kept" {
+  run csp_tmux_sanitize_label "EnglishTraining/tools"
+  [ "$output" = "EnglishTraining/tools" ]
+}
+
+@test "label: newlines and odd characters are replaced" {
+  run csp_tmux_sanitize_label "$(printf 'a\nb c!')"
+  case "$output" in *$'\n'*) bad=1 ;; *) bad=0 ;; esac
+  [ "$bad" = "0" ]        # no newline survives (tmux would reject it)
+}
+
+@test "label: an empty or all-stripped label falls back to 'session'" {
+  run csp_tmux_sanitize_label ""
+  [ "$output" = "session" ]
+  run csp_tmux_sanitize_label "$(printf '\n\n')"
+  [ "$output" = "session" ]
+}
+
+@test "label: a leading dash is removed so tmux can't read it as a flag" {
+  run csp_tmux_sanitize_label "-badflag"
+  case "$output" in -*) bad=1 ;; *) bad=0 ;; esac
+  [ "$bad" = "0" ]
+}
+
 @test "quote: a shell-injection attempt is neutralised" {
   # If someone crafted a project path with a command in it, quoting must keep it
   # a literal string, so `eval`-ing our composed command can't run `rm`.

@@ -115,15 +115,28 @@ csp_session_project() {
 # Fallback order matches csp_json_first_value: jq, then python3, then a small
 # built-in reader. Missing fields come back empty and callers tolerate that.
 # -----------------------------------------------------------------------------
+# How many characters of the title we ever keep. The extractor clips to this
+# BEFORE handing the string to bash. This matters for more than tidiness:
+#   • Speed — bash 3.2's ${var%%…}/${var#…} string operations are QUADRATIC in
+#     the string length, so splitting a multi-megabyte title (a long pasted
+#     prompt lands in lastPrompt) would freeze the picker for minutes. Clipping
+#     inside jq/python/awk keeps every bash operation tiny and instant.
+#   • Safety — clipping early also bounds how much we ever hold or scan.
+# It is generously larger than CSP_MAX_TITLE_LEN (the display width) so the
+# later display truncation still has room to add its ellipsis.
+CSP_META_TITLE_CLIP=256
+
 csp_session_meta() {
   local file="$1" out title cwd tab
   tab=$'\t'
 
   # IMPORTANT: we join title and cwd with a TAB and split on it below, so the
   # title itself must contain no tabs or newlines — otherwise a title like
-  # "fix\ttest" would be mistaken for two fields. Each branch therefore replaces
-  # any tab/newline INSIDE the title with a space before joining. (Paths in cwd
-  # never contain tabs, so the separator stays unambiguous.)
+  # "fix\ttest" would be mistaken for two fields. Each branch therefore strips
+  # tabs/newlines AND all other control characters from the title before
+  # joining. Stripping control characters also stops a title that contains
+  # terminal escape sequences (from arbitrary conversation content) from
+  # clearing the screen or retitling the window when we later draw it.
   if command -v jq >/dev/null 2>&1; then
     # One jq program that emits "title<TAB>cwd".
     #   -R  reads each line as RAW text (not pre-parsed), and
@@ -131,24 +144,21 @@ csp_session_meta() {
     #   `fromjson? // empty` can SKIP any malformed/truncated line instead of
     #   aborting the whole file. (A single corrupt line is common in a live
     #   session log and must not blank out an otherwise-good title.)
-    # We then pick the first non-null aiTitle, lastPrompt and cwd across the
-    # surviving objects. Doing it in one jq invocation keeps loading fast, and
-    # gsub flattens tabs/newlines in the title so the TAB separator is safe.
-    #
-    # Memory note: we keep only the three small fields we care about from each
-    # line ({title,prompt,cwd}) rather than the whole parsed object, so even a
-    # session log with large messages doesn't pull megabytes into memory here.
-    out=$(jq -rRn '
+    # We keep only the three small fields per line (memory), pick the first
+    # non-null aiTitle/lastPrompt/cwd, strip control chars, and CLIP the title
+    # to CSP_META_TITLE_CLIP so bash never touches a huge string.
+    out=$(jq -rRn --argjson clip "$CSP_META_TITLE_CLIP" '
       [inputs | fromjson? // empty
         | {t: .aiTitle, p: .lastPrompt, c: .cwd}] as $o
     | ($o | map(.t) | map(select(. != null)) | .[0]) as $t
     | ($o | map(.p) | map(select(. != null)) | .[0]) as $p
     | ($o | map(.c) | map(select(. != null)) | .[0]) as $c
-    | ((($t // $p // "") | gsub("[\t\n\r]"; " ")) + "\t" + ($c // ""))
+    | ((($t // $p // "")[:$clip] | gsub("[[:cntrl:]]"; " ")) + "\t" + ($c // ""))
     ' "$file" 2>/dev/null)
   elif command -v python3 >/dev/null 2>&1; then
-    out=$(python3 - "$file" <<'PYEOF' 2>/dev/null
-import json, sys
+    out=$(CSP_CLIP="$CSP_META_TITLE_CLIP" python3 - "$file" <<'PYEOF' 2>/dev/null
+import json, os, sys
+clip = int(os.environ.get("CSP_CLIP", "256"))
 title = prompt = cwd = ""
 with open(sys.argv[1], "r", errors="replace") as fh:
     for line in fh:
@@ -167,20 +177,28 @@ with open(sys.argv[1], "r", errors="replace") as fh:
             prompt = o["lastPrompt"]
         if not cwd and isinstance(o.get("cwd"), str):
             cwd = o["cwd"]
-# Flatten any tab/newline in the title so the TAB separator stays unambiguous.
-chosen = (title or prompt or "")
-for ch in ("\t", "\n", "\r"):
-    chosen = chosen.replace(ch, " ")
+# Clip first (bounds work), then replace every control character with a space so
+# the TAB separator stays unambiguous and no escape sequence reaches the screen.
+chosen = (title or prompt or "")[:clip]
+chosen = "".join(" " if ord(c) < 32 or ord(c) == 127 else c for c in chosen)
 print(chosen + "\t" + cwd)
 PYEOF
 )
   else
-    # No JSON parser: fall back to the granular grep-based readers. csp_session_title
-    # already flattens tabs/newlines, so the join below stays unambiguous.
+    # No JSON parser available: use the granular grep-based readers, then clip
+    # and sanitise here so this path has the same guarantees as the others.
     title=$(csp_session_title "$file")
     cwd=$(csp_session_project "$file")
+    # Clip with a bash substring (short strings only reach here in practice, and
+    # the clip itself bounds the cost), then strip control chars via tr.
+    title=$(printf '%s' "${title:0:$CSP_META_TITLE_CLIP}" | tr -d '\000-\037\177')
     out="$title$tab$cwd"
   fi
+
+  # Defence in depth: even if an extractor misbehaved, make sure bash never
+  # splits a huge string here. `out` is already clipped title + short cwd path,
+  # but cap its total length before the (quadratic) parameter expansions.
+  out="${out:0:8192}"
 
   # Split on the FIRST tab (the separator) and apply the same empty-value
   # fallbacks the granular helpers use.
@@ -195,14 +213,23 @@ PYEOF
 # -----------------------------------------------------------------------------
 # csp_file_mtime FILE
 #
-# Last-modified time of FILE in epoch seconds — our "last active" signal. Uses
-# BSD `stat` (macOS) first, then GNU `stat` (Linux). Prints 0 if
-# neither works, which csp_humanize_age renders as "just now" rather than
-# crashing.
+# Last-modified time of FILE in epoch seconds — our "last active" signal. Tries
+# BSD `stat` (macOS) first, then GNU `stat` (Linux).
+#
+# CRUCIAL GUARD: the two `stat` dialects use the SAME flags for different things
+# (`-f` is a format on BSD but "report on the filesystem" on GNU), so relying on
+# exit status alone is unsafe — a wrong-platform call can "succeed" yet print
+# something non-numeric. We therefore VALIDATE the result: anything that isn't
+# all digits becomes 0. That makes the OS question moot and guarantees the value
+# we return is always a safe integer for the caller's arithmetic. 0 is rendered
+# by csp_humanize_age as "just now" rather than crashing.
 # -----------------------------------------------------------------------------
 csp_file_mtime() {
   local file="$1" m
   m=$(stat -f '%m' "$file" 2>/dev/null) || m=$(stat -c '%Y' "$file" 2>/dev/null) || m=0
+  case "$m" in
+    ''|*[!0-9]*) m=0 ;;   # empty or non-numeric (wrong stat dialect) → 0
+  esac
   printf '%s' "$m"
 }
 
@@ -215,12 +242,13 @@ csp_file_mtime() {
 # guarantee, and its absence never causes wrong behaviour.
 # -----------------------------------------------------------------------------
 csp_running_session_ids() {
-  # `ps -eo args=` prints every process's full command line with no header. We
-  # use a bare `args=` (empty header) rather than `-ww`, because macOS ps does
-  # not accept `-ww` and already prints untruncated output, while GNU ps accepts
-  # `args=` fine — so this one form is portable across macOS and Linux. We then
-  # pull out just the session id that follows each "--resume".
-  ps -eo args= 2>/dev/null \
+  # We want every process's FULL command line so a "--resume <id>" late in a
+  # long line isn't cut off. `-ww` (double wide) disables width-based truncation
+  # on GNU/Linux ps; macOS ps ignores `-ww` but doesn't truncate piped output
+  # anyway, so `ps -eww -o args=` is safe on both. The empty `args=` header
+  # keeps the output header-free. We then pull the id after each "--resume".
+  # If the first form is rejected on some ps, fall back to the plainer one.
+  { ps -eww -o args= 2>/dev/null || ps -eo args= 2>/dev/null; } \
     | grep -oE -- '--resume [0-9a-fA-F-]{8,}' \
     | awk '{print $2}' \
     | sort -u
@@ -262,21 +290,6 @@ csp_session_id_from_path() {
   printf '%s' "${base%.jsonl}"   # strip extension
 }
 
-# -----------------------------------------------------------------------------
-# csp_resume_session ID PROJECT
-#
-# Hand control to Claude Code, resuming session ID. We `cd` into the session's
-# original project directory first (if it still exists) so the resumed session
-# has the right working directory, then `exec` claude so it replaces this
-# process — when you quit Claude you're back at your shell, not this picker.
-# -----------------------------------------------------------------------------
-csp_resume_session() {
-  local id="$1" project="$2"
-  # cd into the project if it still exists. If the cd fails for any reason we
-  # deliberately continue from the current directory rather than aborting — the
-  # session can still be resumed, just from wherever we already are.
-  if [ -n "$project" ] && [ -d "$project" ]; then
-    cd "$project" 2>/dev/null || true
-  fi
-  exec claude --resume "$id"
-}
+# NOTE: launching a session now lives entirely in lib/backend.sh (hub and tmux
+# backends). There is intentionally no single "resume and exec" helper here —
+# whether we hand off with exec or return to the menu is a per-backend decision.

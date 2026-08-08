@@ -46,6 +46,26 @@ setup() {
   [ "$output" = "hub" ]
 }
 
+@test "backend: an unrecognised forced value falls through to auto" {
+  # e.g. a typo like "Hub" is not honoured as an override.
+  run csp_choose_backend 1 0 "Hub"
+  [ "$output" = "tmux" ]   # auto, because tmux is available here
+}
+
+# --- csp_backend_is_valid ----------------------------------------------------
+
+@test "backend-valid: empty, hub, tmux are valid" {
+  run csp_backend_is_valid "";     [ "$status" -eq 0 ]
+  run csp_backend_is_valid "hub";  [ "$status" -eq 0 ]
+  run csp_backend_is_valid "tmux"; [ "$status" -eq 0 ]
+}
+
+@test "backend-valid: typos and unknown values are invalid" {
+  run csp_backend_is_valid "Hub";    [ "$status" -ne 0 ]
+  run csp_backend_is_valid "screen"; [ "$status" -ne 0 ]
+  run csp_backend_is_valid "tmx";    [ "$status" -ne 0 ]
+}
+
 # --- csp_marker_for_session --------------------------------------------------
 
 @test "marker: a live session shows the running dot" {
