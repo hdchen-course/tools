@@ -837,9 +837,32 @@ csp_main() {
          [ -n "$csp_selected_after_delete" ] && selected="$csp_selected_after_delete" ;;
       t) csp_toggle_backend ;;   # switch hub <-> tmux (concurrency on/off)
       R|l) csp_load_sessions ;;
-      q) break ;;
+      q) csp_quit; break ;;
     esac
   done
+}
+
+# csp_quit — how leaving the menu behaves.
+#   • hub: just break out of the loop; the EXIT trap restores the terminal and
+#     you're back at your shell.
+#   • tmux: the picker IS window 0 of the holding session. If we just exited,
+#     window 0 would close and — with other sessions still open — tmux would
+#     drop you onto an arbitrary neighbouring window with no menu; quit the last
+#     one and tmux ends entirely. That's the "q is a footgun" problem. Instead,
+#     if there are OTHER windows (sessions) still alive, we DETACH the client
+#     (everything keeps running, you get your shell back, and `claude-session-picker`
+#     later re-attaches to the same menu). If the menu is the only window, there's
+#     nothing to strand, so we just exit normally.
+csp_quit() {
+  if [ "$CSP_ACTIVE_BACKEND" = "tmux" ] && csp_inside_tmux; then
+    local wins
+    wins=$(csp_tmux list-windows -t "=$CSP_TMUX_SESSION" 2>/dev/null | grep -c . || printf '0')
+    if [ "$wins" -gt 1 ]; then
+      csp_restore_terminal
+      csp_tmux detach-client 2>/dev/null
+      exit 0
+    fi
+  fi
 }
 
 # Run the picker only when this file is executed directly. When a test sources

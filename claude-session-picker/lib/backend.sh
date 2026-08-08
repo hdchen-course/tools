@@ -27,15 +27,38 @@
 # instead of spawning duplicates.
 CSP_TMUX_SESSION="${CSP_TMUX_SESSION:-claude-sessions}"
 
+# We run our tmux on a DEDICATED SOCKET (tmux -L "$CSP_TMUX_SOCKET"), completely
+# separate from the user's normal tmux server. This is what lets us:
+#   • set the status bar / base-index / renumber-windows GLOBALLY (so every
+#     session window inherits them — window-status-format is a per-window option
+#     that a session-scoped set can't reach), WITHOUT polluting the user's own
+#     tmux config or other sessions;
+#   • never touch the shared root key table.
+# In short: everything we configure lives and dies with this socket, so the
+# "we never touch your tmux" promise is literally true.
+CSP_TMUX_SOCKET="${CSP_TMUX_SOCKET:-claude-sessions}"
+
+# csp_tmux — run tmux on our dedicated socket. Every tmux call in this file goes
+# through this wrapper so the socket is applied consistently in one place.
+csp_tmux() {
+  command tmux -L "$CSP_TMUX_SOCKET" "$@"
+}
+
 # csp_tmux_available — returns 0 if the tmux command exists, else 1.
 csp_tmux_available() {
   command -v tmux >/dev/null 2>&1
 }
 
-# csp_inside_tmux — returns 0 if we are currently running inside tmux.
-# tmux sets the TMUX environment variable for every program it runs.
+# csp_inside_tmux — returns 0 if we are currently running inside OUR tmux (the
+# dedicated socket). We check that TMUX points at our socket, not just that some
+# tmux is present, so that launching the picker from inside the user's UNRELATED
+# tmux still correctly re-execs into our own socket rather than piggy-backing on
+# theirs. TMUX looks like "<socket-path>,<pid>,<session>".
 csp_inside_tmux() {
-  [ -n "${TMUX:-}" ]
+  case "${TMUX:-}" in
+    *"/$CSP_TMUX_SOCKET,"*|*"/$CSP_TMUX_SOCKET-"*) return 0 ;;
+  esac
+  return 1
 }
 
 # =============================================================================
@@ -70,118 +93,102 @@ csp_hub_open() {
 # TMUX backend — many sessions running concurrently in tmux windows.
 # =============================================================================
 
-# csp_tmux_ensure_session
-#
-# Make sure our holding tmux session exists (detached). `new-session -d` creates
-# it only if absent; if it already exists tmux reports an error which we ignore.
-csp_tmux_ensure_session() {
-  tmux has-session -t "=$CSP_TMUX_SESSION" 2>/dev/null && return 0
-  tmux new-session -d -s "$CSP_TMUX_SESSION" 2>/dev/null
-}
-
 # csp_tmux_sanitize_label LABEL — make a safe, non-empty tmux window name.
 # tmux rejects names containing newlines and treats a leading '-' as a flag, so
-# we keep only tame characters and fall back to "session" if nothing is left.
-# Returned via stdout.
+# we replace disallowed BYTES with '_' but KEEP multi-byte (CJK) characters, so
+# a 工作/專案 project name shows as itself rather than collapsing to "_/_". We
+# then trim and cap it, falling back to "session" if nothing usable is left.
 csp_tmux_sanitize_label() {
   local label="$1" clean
-  clean=$(printf '%s' "$label" | tr -c 'A-Za-z0-9._/-' '_' | tr -s '_')
-  clean="${clean#[-_]}"                 # never start with '-' or '_'
-  clean="${clean:0:40}"
+  # Flatten only control chars and the few characters tmux/globbing dislike;
+  # leave everything else (including UTF-8 bytes) intact.
+  clean=$(printf '%s' "$label" | tr '\000-\037\177' ' ' | tr -s ' ')
+  clean="${clean#[-_ ]}"                # never start with '-', '_' or space
+  clean="${clean%[ ]}"                  # no trailing space
+  clean="${clean:0:32}"
   [ -z "$clean" ] && clean="session"
   printf '%s' "$clean"
 }
 
-# csp_tmux_configure_home — make the holding session friendly to switch in,
-# WITHOUT touching the user's ~/.tmux.conf. Everything here is set on our own
-# session only. The goal is that you never need to memorise tmux keys:
-#   • a visible status bar lists every window (= every session), current one
-#     highlighted, so you can SEE what's open;
-#   • plain function keys (no prefix) jump straight to a window — F1 = the menu
-#     (window 0), F2..F8 = sessions — and the status bar spells that out;
-#   • Ctrl-b n/p still work for anyone who prefers them.
-# All best-effort: if any set fails we carry on (switching still works, just
-# with less polish). Uses the plain session name (tmux set-option rejects "=").
+# csp_tmux_configure_home — configure our dedicated-socket tmux server so the
+# holding session is easy to navigate, WITHOUT touching the user's config.
+# Because we run on our own socket (csp_tmux / -L), we can safely set options
+# GLOBALLY (-g): they apply to every window we open — crucial because
+# window-status-format is a per-window option a session-scoped set can't reach —
+# yet they live only on this socket and vanish when it does. All best-effort.
 csp_tmux_configure_home() {
-  local s="$CSP_TMUX_SESSION"
-  tmux set-option -t "$s" status on 2>/dev/null
-  tmux set-option -t "$s" status-interval 2 2>/dev/null
-  tmux set-option -t "$s" status-justify left 2>/dev/null
-  tmux set-option -t "$s" status-left "#[bold] Claude sessions #[default]" 2>/dev/null
-  tmux set-option -t "$s" status-left-length 20 2>/dev/null
-  # Each window is a session; number + name. The current one is highlighted so
-  # you can always SEE where you are and what else is open.
-  tmux set-option -t "$s" window-status-format " #I #W " 2>/dev/null
-  tmux set-option -t "$s" window-status-current-format "#[reverse,bold] #I #W #[default]" 2>/dev/null
-  # The always-visible hint on the right is the fix for "Ctrl-b gives no
-  # feedback": it constantly reminds you which keys switch windows and return to
-  # the menu (window 0), so nothing has to be memorised.
-  tmux set-option -t "$s" status-right "#[bold]Ctrl-b#[default] then: n/p=switch  0=menu  w=list  d=detach " 2>/dev/null
-  tmux set-option -t "$s" status-right-length 70 2>/dev/null
+  # Window numbering: force base 0 and keep it gapless, so "window 0 = menu" and
+  # "Ctrl-b <n> = the nth session" are always true regardless of the user's own
+  # base-index, and numbers don't go stale after a session is closed.
+  csp_tmux set-option -g base-index 0 2>/dev/null
+  csp_tmux set-option -g renumber-windows on 2>/dev/null
 
-  # We deliberately do NOT bind prefix-free F-keys (or any -n key): a root-table
-  # binding is server-global and would STEAL that key from Claude Code (and any
-  # editor) running inside every window — verified. The standard Ctrl-b prefix,
-  # made discoverable by the status bar above, is the safe choice.
-  #
-  # An earlier build DID bind F1..F8 with `-n`. Those persist server-wide, so
-  # proactively remove them here — otherwise upgrading would leave a user's
-  # F-keys hijacked for every tmux program. Unbinding a key that isn't bound is
-  # a harmless no-op.
-  local n=1
-  while [ "$n" -le 8 ]; do
-    tmux unbind-key -n "F$n" 2>/dev/null
-    n=$(( n + 1 ))
-  done
-
-  # A safe, non-stealing nicety: keep an on-screen message visible a bit longer.
-  tmux set-option -t "$s" display-time 1500 2>/dev/null
+  csp_tmux set-option -g status on 2>/dev/null
+  csp_tmux set-option -g status-interval 2 2>/dev/null
+  csp_tmux set-option -g status-justify left 2>/dev/null
+  # Keep status-left tiny so the window list (the map of what's open) has room
+  # even at 80 columns.
+  csp_tmux set-option -g status-left "" 2>/dev/null
+  csp_tmux set-option -g status-left-length 0 2>/dev/null
+  # Each window is a session: number + name, name truncated to 9 display cells
+  # so several fit at 80 cols. Current window highlighted so you see where you are.
+  csp_tmux set-option -g window-status-format " #I #{=9:window_name} " 2>/dev/null
+  csp_tmux set-option -g window-status-current-format "#[reverse,bold] #I #{=9:window_name} #[default]" 2>/dev/null
+  # Always-visible hint — this is the fix for "Ctrl-b gives no feedback": the
+  # keys are on screen at all times. Kept short so it fits beside the window list.
+  csp_tmux set-option -g status-right " Ctrl-b 0=menu n/p=switch w=list d=detach " 2>/dev/null
+  csp_tmux set-option -g status-right-length 44 2>/dev/null
+  csp_tmux set-option -g display-time 1500 2>/dev/null
 }
 
 # csp_tmux_enter SELF_PATH — put the picker itself inside the holding tmux
-# session as window 0, so it stays resident as your "home base".
+# session (on our dedicated socket) as window 0, so it stays resident as your
+# "home base".
 #
-# The model: tmux mode runs everything inside one tmux session (default
-# "claude-sessions"). The picker lives in window 0; each session you open
-# becomes window 1, 2, … You return to the picker with Ctrl-b 0 and switch
-# between running sessions with Ctrl-b n/p/w — all of them stay alive in the
-# background. A persistent status bar (see csp_tmux_configure_home) lists the
-# windows and spells out those keys, so the Ctrl-b prefix is no longer invisible.
+# The model: tmux mode runs everything inside one tmux session on our own socket.
+# The picker lives in window 0 ("menu"); each session you open becomes window
+# 1, 2, … You return to the picker with Ctrl-b 0 and switch between running
+# sessions with Ctrl-b n/p/w — all of them stay alive in the background. A
+# persistent status bar (see csp_tmux_configure_home) lists the windows and
+# spells out those keys, so the Ctrl-b prefix is no longer invisible.
 #
-# This function is only relevant when we are NOT yet inside tmux. It creates the
-# holding session running THIS picker (via SELF_PATH) in window 0 and attaches
-# to it, then never returns (the exec/attach replaces us). Inside the new tmux
-# the picker starts again — this time already inside tmux — and just runs its
-# menu loop. If we're already inside tmux, it does nothing and returns 0.
+# Only relevant when we are NOT yet inside OUR tmux. It creates the holding
+# session running THIS picker (via SELF_PATH) in window 0 and attaches, then
+# never returns (exec replaces us). The re-launched picker comes back here
+# already inside our tmux and just runs its menu loop. If a holding session
+# already exists, we (re)configure and attach; but if its window 0 is no longer
+# a picker (e.g. the user pressed q, killing the menu window), we recreate the
+# menu window first so "attach" always lands you on a working menu.
 csp_tmux_enter() {
-  local self="$1"
+  local self="$1" env_prefix v val
   csp_inside_tmux && return 0
 
-  if tmux has-session -t "=$CSP_TMUX_SESSION" 2>/dev/null; then
-    # Holding session already exists (from a previous run) — refresh its config
-    # and attach; its window 0 is already the picker.
-    csp_tmux_configure_home
-    exec tmux attach-session -t "=$CSP_TMUX_SESSION"
-  fi
-  # Build the command tmux will run in window 0: the picker, in tmux mode, with
-  # our CSP_* environment carried across the re-launch. We must pass these
-  # explicitly because the new process is started by tmux (a fresh environment),
-  # not forked from us — otherwise an overridden CSP_CLAUDE_DIR / CSP_TMUX_SESSION
-  # / CSP_PREF_FILE / CSP_STATE_DIR would be silently lost. Each value is quoted.
-  local env_prefix="CSP_BACKEND=tmux CSP_IN_TMUX_HOME=1"
-  local v val
-  for v in CSP_CLAUDE_DIR CSP_TMUX_SESSION CSP_PREF_FILE CSP_STATE_DIR CSP_NO_COLOR; do
+  # Build the command tmux runs for the picker window, carrying our CSP_* env
+  # across the re-launch (tmux starts it with a fresh environment). Quoted.
+  env_prefix="CSP_BACKEND=tmux CSP_IN_TMUX_HOME=1"
+  for v in CSP_CLAUDE_DIR CSP_TMUX_SESSION CSP_TMUX_SOCKET CSP_PREF_FILE CSP_STATE_DIR CSP_NO_COLOR; do
     eval "val=\${$v:-}"
     [ -n "$val" ] && env_prefix="$env_prefix $v=$(csp_shell_quote "$val")"
   done
 
-  # Create the holding session (DETACHED first) with the picker in window 0,
-  # named "picker"; configure it so switching is obvious; then attach. Creating
-  # detached lets us set options before the client sees the session.
-  tmux new-session -d -s "$CSP_TMUX_SESSION" -n picker \
+  if csp_tmux has-session -t "=$CSP_TMUX_SESSION" 2>/dev/null; then
+    csp_tmux_configure_home
+    # Ensure there's a live menu to land on: if window 0 isn't named "menu",
+    # (re)create it so quitting the menu earlier can't strand you.
+    if [ "$(csp_tmux display-message -p -t "=$CSP_TMUX_SESSION:0" '#{window_name}' 2>/dev/null)" != "menu" ]; then
+      csp_tmux new-window -t "=$CSP_TMUX_SESSION" -n menu "$env_prefix $(csp_shell_quote "$self")" 2>/dev/null
+      csp_tmux move-window -s "=$CSP_TMUX_SESSION:\$" -t "=$CSP_TMUX_SESSION:0" 2>/dev/null
+    fi
+    exec csp_tmux attach-session -t "=$CSP_TMUX_SESSION"
+  fi
+
+  # Fresh: create the holding session with the picker in window 0 (named
+  # "menu"), configure it, then attach. Detached-first so options apply before
+  # the client draws.
+  csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu \
     "$env_prefix $(csp_shell_quote "$self")" 2>/dev/null || return 1
   csp_tmux_configure_home
-  exec tmux attach-session -t "=$CSP_TMUX_SESSION"
+  exec csp_tmux attach-session -t "=$CSP_TMUX_SESSION"
 }
 
 # csp_tmux_open ID PROJECT LABEL
@@ -216,12 +223,13 @@ csp_tmux_open() {
     cmd="${cmd}claude --resume $(csp_shell_quote "$id")"
   fi
 
-  # Open the session in a new window (in the current session = the holding one)
+  # Open the session in a new window on our socket (target the holding session
+  # explicitly so it lands there even if the caller's notion of "current" drifts)
   # and select it. -P -F prints the new window id so we select exactly it. The
   # picker's own loop keeps running in window 0 the whole time.
-  win=$(tmux new-window -P -F '#{window_id}' -n "$label" "$cmd" 2>/dev/null) \
+  win=$(csp_tmux new-window -t "=$CSP_TMUX_SESSION" -P -F '#{window_id}' -n "$label" "$cmd" 2>/dev/null) \
     || return 1
-  tmux select-window -t "$win" 2>/dev/null || return 1
+  csp_tmux select-window -t "$win" 2>/dev/null || return 1
   return 0
 }
 

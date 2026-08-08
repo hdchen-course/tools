@@ -43,3 +43,6 @@ printf '\n== backend-preference tests (the t toggle persistence) ==\n'
 
 printf '\n== hook tests (●/✳ state recording) ==\n'
 "$BATS" "$HERE/hook.bats"
+
+printf '\n== tmux backend tests (real tmux on a throwaway socket) ==\n'
+"$BATS" "$HERE/tmux.bats"
