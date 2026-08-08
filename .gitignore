@@ -1,0 +1,6 @@
+# This repo tracks only tools (currently claude-session-picker/).
+# Ignore stray files at the repo root so a `git add -A` never sweeps in
+# unrelated scratch files again.
+/*.html
+/*.log
+.DS_Store
