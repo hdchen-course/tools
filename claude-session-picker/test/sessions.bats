@@ -46,6 +46,39 @@ EOF
   [ "$ok" = "1" ]
 }
 
+@test "list-with-mtime: each line is '<mtime> <path>', newest first" {
+  touch -t 202601010000 "$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-alpha.jsonl"
+  touch -t 202606010000 "$CSP_CLAUDE_DIR/projects/-Volumes-demo-beta/id-beta.jsonl"
+  run csp_list_session_files_with_mtime
+  [ "$status" -eq 0 ]
+  first=$(printf '%s\n' "$output" | head -1)
+  # Leading field is all digits (the mtime), and the newest (beta) is first.
+  mt="${first%% *}"
+  case "$mt" in ''|*[!0-9]*) ok=0 ;; *) ok=1 ;; esac
+  [ "$ok" = "1" ]
+  case "$first" in *id-beta.jsonl) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
+  # The plain listing is the same paths with the mtime column stripped.
+  run csp_list_session_files
+  case "$(printf '%s\n' "$output" | head -1)" in *id-beta.jsonl) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
+}
+
+@test "meta: reads only the file HEAD (title/cwd near the top), ignores later junk" {
+  # A well-formed head with cwd+aiTitle, then far past the head-window a line
+  # with a DIFFERENT cwd that must NOT override the real one.
+  big="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-head.jsonl"
+  {
+    printf '%s\n' '{"type":"user","cwd":"/Volumes/demo/real"}'
+    printf '%s\n' '{"type":"ai-title","aiTitle":"head title"}'
+    n=0; while [ "$n" -lt 200 ]; do printf '%s\n' '{"type":"assistant","content":"x"}'; n=$((n+1)); done
+    printf '%s\n' '{"type":"user","cwd":"/Volumes/demo/WRONG"}'
+  } > "$big"
+  run csp_session_meta "$big"
+  [ "$(csp_field "$output" 1)" = "head title" ]
+  [ "$(csp_field "$output" 2)" = "/Volumes/demo/real" ]
+}
+
 @test "id: derived from the file name" {
   run csp_session_id_from_path "/a/b/id-alpha.jsonl"
   [ "$output" = "id-alpha" ]

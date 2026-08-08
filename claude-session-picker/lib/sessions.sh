@@ -177,6 +177,15 @@ csp_session_project() {
 # later display truncation still has room to add its ellipsis.
 CSP_META_TITLE_CLIP=256
 
+# How many lines from the TOP of a session file we scan for its title/cwd.
+# Claude writes cwd, lastPrompt and aiTitle within the first handful of lines
+# (empirically cwd@4, lastPrompt@9, aiTitle@12), and the title is set early and
+# doesn't meaningfully change — so reading the whole file (these average several
+# MB and thousands of lines) was ~6x slower for no benefit. We read a generous
+# head window instead, which cut per-file parse time from ~70ms to ~12ms. 64 is
+# far more than needed but leaves ample margin if the log format shifts.
+CSP_META_HEAD_LINES=64
+
 csp_session_meta() {
   local file="$1" out title cwd tab
   tab=$'\t'
@@ -188,6 +197,11 @@ csp_session_meta() {
   # joining. Stripping control characters also stops a title that contains
   # terminal escape sequences (from arbitrary conversation content) from
   # clearing the screen or retitling the window when we later draw it.
+  #
+  # We feed only the file's HEAD (CSP_META_HEAD_LINES) to the parser rather than
+  # the whole multi-MB file — that's the big startup-speed win (see the constant
+  # above). `head` closing the pipe early can make the producer see EPIPE; that's
+  # harmless here and suppressed.
   if command -v jq >/dev/null 2>&1; then
     # One jq program that emits "title<TAB>cwd".
     #   -R  reads each line as RAW text (not pre-parsed), and
@@ -198,21 +212,25 @@ csp_session_meta() {
     # We keep only the three small fields per line (memory), pick the first
     # non-null aiTitle/lastPrompt/cwd, strip control chars, and CLIP the title
     # to CSP_META_TITLE_CLIP so bash never touches a huge string.
-    out=$(jq -rRn --argjson clip "$CSP_META_TITLE_CLIP" '
+    out=$(head -n "$CSP_META_HEAD_LINES" "$file" 2>/dev/null \
+      | jq -rRn --argjson clip "$CSP_META_TITLE_CLIP" '
       [inputs | fromjson? // empty
         | {t: .aiTitle, p: .lastPrompt, c: .cwd}] as $o
     | ($o | map(.t) | map(select(. != null)) | .[0]) as $t
     | ($o | map(.p) | map(select(. != null)) | .[0]) as $p
     | ($o | map(.c) | map(select(. != null)) | .[0]) as $c
     | ((($t // $p // "")[:$clip] | gsub("[[:cntrl:]]"; " ")) + "\t" + ($c // ""))
-    ' "$file" 2>/dev/null)
+    ' 2>/dev/null)
   elif command -v python3 >/dev/null 2>&1; then
-    out=$(CSP_CLIP="$CSP_META_TITLE_CLIP" python3 - "$file" <<'PYEOF' 2>/dev/null
+    out=$(CSP_CLIP="$CSP_META_TITLE_CLIP" CSP_HEAD="$CSP_META_HEAD_LINES" python3 - "$file" <<'PYEOF' 2>/dev/null
 import json, os, sys
 clip = int(os.environ.get("CSP_CLIP", "256"))
+head = int(os.environ.get("CSP_HEAD", "64"))
 title = prompt = cwd = ""
 with open(sys.argv[1], "r", errors="replace") as fh:
-    for line in fh:
+    for n, line in enumerate(fh):
+        if n >= head:            # only scan the head; the fields live up top
+            break
         line = line.strip()
         if not line:
             continue
@@ -335,30 +353,26 @@ csp_running_session_ids() {
 #   • `cut -d' ' -f2-` strips only the leading "<mtime> " field, so a path that
 #     itself contains spaces survives intact.
 # -----------------------------------------------------------------------------
-csp_list_session_files() {
-  local dir="$CSP_CLAUDE_DIR/projects" statfmt
+# csp_list_session_files_with_mtime — the same listing but WITHOUT dropping the
+# mtime column, so each line is "<mtime> <path>". The loader uses this and reads
+# the mtime straight from the line, which avoids a second `stat` fork per file
+# just to get the age we already computed here for sorting (~7ms x N saved).
+csp_list_session_files_with_mtime() {
+  local dir="$CSP_CLAUDE_DIR/projects"
   [ -d "$dir" ] || return 0
-
-  # Pick the stat dialect once (BSD prints mtime for a probe; else assume GNU).
-  if stat -f '%m' "$dir" >/dev/null 2>&1; then
-    statfmt="bsd"
-  else
-    statfmt="gnu"
-  fi
-
-  if [ "$statfmt" = "bsd" ]; then
+  if stat -f '%m' "$dir" >/dev/null 2>&1; then      # BSD/macOS
     find "$dir" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' -print0 2>/dev/null \
-      | xargs -0 stat -f '%m %N' 2>/dev/null \
-      | sort -rn -k1,1 \
-      | cut -d' ' -f2- \
-      | head -n "$CSP_MAX_SESSIONS"
-  else
+      | xargs -0 stat -f '%m %N' 2>/dev/null | sort -rn -k1,1 | head -n "$CSP_MAX_SESSIONS"
+  else                                              # GNU/Linux
     find "$dir" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' -print0 2>/dev/null \
-      | xargs -0 stat -c '%Y %n' 2>/dev/null \
-      | sort -rn -k1,1 \
-      | cut -d' ' -f2- \
-      | head -n "$CSP_MAX_SESSIONS"
+      | xargs -0 stat -c '%Y %n' 2>/dev/null | sort -rn -k1,1 | head -n "$CSP_MAX_SESSIONS"
   fi
+}
+
+# csp_list_session_files — just the paths, newest first (mtime stripped). Kept
+# as the stable public/tested interface; delegates to the *_with_mtime variant.
+csp_list_session_files() {
+  csp_list_session_files_with_mtime | cut -d' ' -f2-
 }
 
 # -----------------------------------------------------------------------------

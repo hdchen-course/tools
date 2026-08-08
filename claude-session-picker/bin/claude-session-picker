@@ -330,23 +330,35 @@ csp_precompute_lines() {
 # csp_load_sessions — build the model from Claude's session store. Enforces the
 # CSP_MAX_SESSIONS cap (via csp_list_session_files) so memory stays bounded.
 csp_load_sessions() {
-  local file id meta title fullcwd project mtime now running is_live marker row
+  local line file id meta title fullcwd project mtime now running is_live marker row
+  local tab=$'\t'
   csp_ids=(); csp_titles=(); csp_projects=(); csp_fullprojects=()
   csp_ages=(); csp_lives=(); csp_files=(); csp_states=(); csp_rows=()
   csp_line_normal=(); csp_line_selected=()
   csp_count=0
   now=$(csp_now_epoch)
   running=$(csp_running_session_ids)
+  # If the hooks have never recorded anything, the state dir won't exist — skip
+  # the per-session state lookups entirely in that (common) case.
+  local have_state=0
+  [ -d "$CSP_STATE_DIR" ] && have_state=1
 
-  while IFS= read -r file; do
-    [ -z "$file" ] && continue
-    id=$(csp_session_id_from_path "$file")
-    # One read per file for both title and cwd (see csp_session_meta).
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    # Each line is "<mtime> <path>" (see csp_list_session_files_with_mtime): we
+    # already have the mtime from the sort step, so we don't stat the file again.
+    mtime="${line%% *}"
+    file="${line#* }"
+    case "$mtime" in ''|*[!0-9]*) mtime=0 ;; esac    # guard non-numeric
+    # Derive the id inline (basename minus .jsonl) — avoids a fork per file.
+    id="${file##*/}"; id="${id%.jsonl}"
+    # One read per file for both title and cwd (see csp_session_meta), returned
+    # as "title<TAB>cwd". Split on that tab inline (using a $'\t' variable so the
+    # separator is visible in the source) rather than via two csp_field forks.
     meta=$(csp_session_meta "$file")
-    title=$(csp_truncate "$(csp_field "$meta" 1)" "$CSP_MAX_TITLE_LEN")
-    fullcwd=$(csp_field "$meta" 2)
+    fullcwd="${meta#*"$tab"}"; [ "$fullcwd" = "$meta" ] && fullcwd=""
+    title=$(csp_truncate "${meta%%"$tab"*}" "$CSP_MAX_TITLE_LEN")
     project=$(csp_short_path "$fullcwd")
-    mtime=$(csp_file_mtime "$file")
     is_live=0
     csp_is_live "$id" "$running" && is_live=1
 
@@ -357,7 +369,12 @@ csp_load_sessions() {
     csp_lives[$csp_count]="$is_live"
     # Per-session hook state (working/waiting) for the ●/✳ marker; empty if the
     # hooks aren't installed, in which case the marker falls back to live/blank.
-    csp_states[$csp_count]="$(csp_read_state "$id")"
+    # Skip the lookup entirely when no state dir exists (hooks never ran).
+    if [ "$have_state" = "1" ]; then
+      csp_states[$csp_count]="$(csp_read_state "$id")"
+    else
+      csp_states[$csp_count]=""
+    fi
     # Remember the full project path alongside the id, for the resume `cd`.
     csp_fullprojects[$csp_count]="$fullcwd"
     # Remember the on-disk file so we can delete the session if asked.
@@ -379,7 +396,7 @@ csp_load_sessions() {
 
     csp_count=$((csp_count + 1))
   done <<EOF
-$(csp_list_session_files)
+$(csp_list_session_files_with_mtime)
 EOF
 }
 
