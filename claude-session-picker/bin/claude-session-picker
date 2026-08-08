@@ -47,7 +47,7 @@ set -u  # Treat use of an unset variable as an error — catches typos early.
 # changes and add a matching CHANGELOG.md entry; because the install is a
 # symlink updated in place by `git pull`, this is how a user (or a bug report)
 # knows exactly which build they're on.
-CSP_VERSION="1.1.0"
+CSP_VERSION="1.1.1"
 
 # --- Locate our own library files, following symlinks -----------------------
 # The installer symlinks this script into a bin dir, so we resolve the real

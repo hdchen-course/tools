@@ -112,23 +112,31 @@ EOF
   [ "$output" = "64" ]
 }
 
-@test "meta: CSP_META_HEAD_LINES=0 and huge values are normalised, not honoured literally" {
-  # 0 would make head read nothing (everything untitled); huge values could be
-  # read differently by BSD head vs Python. Both normalise to a sane number.
+@test "meta: CSP_META_HEAD_LINES is normalised before shell arithmetic" {
+  # 0 would make head read nothing. Oversized values are capped lexically before
+  # arithmetic so they cannot overflow and wrap back to a small positive limit.
   run env CSP_META_HEAD_LINES=0 bash -c '
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
+    printf "%s" "$CSP_META_HEAD_LINES"'
+  [ "$output" = "64" ]
+  run env CSP_META_HEAD_LINES=00064 bash -c '
     . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
     printf "%s" "$CSP_META_HEAD_LINES"'
   [ "$output" = "64" ]
   run env CSP_META_HEAD_LINES=999999999 bash -c '
     . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
     printf "%s" "$CSP_META_HEAD_LINES"'
-  [ "$output" -le 100000 ]
-  [ "$output" -gt 0 ]
+  [ "$output" = "100000" ]
+  # This value wrapped to 1 when converted before the upper-bound check.
+  run env CSP_META_HEAD_LINES=18446744073709551617 bash -c '
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
+    printf "%s" "$CSP_META_HEAD_LINES"'
+  [ "$output" = "100000" ]
 }
 
 @test "meta: the built-in (no jq/python) reader ALSO honours CSP_META_HEAD_LINES" {
-  # Regression: the grep fallback used to scan the whole file, ignoring the
-  # limit. Force the fallback by shadowing jq/python detection.
+  # Regression: the dependency-light fallback used to scan the whole file,
+  # ignoring the limit. Force that path by shadowing jq/python detection.
   deep="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-deepfb.jsonl"
   {
     printf '%s\n' '{"type":"user","cwd":"/Volumes/demo/real"}'
@@ -139,14 +147,41 @@ EOF
   run env CSP_META_HEAD_LINES=5 CSP_CLAUDE_DIR="$CSP_CLAUDE_DIR" bash -c '
     command() { if [ "$1" = "-v" ] && { [ "$2" = jq ] || [ "$2" = python3 ]; }; then return 1; fi; builtin command "$@"; }
     . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
-    m=$(csp_session_meta "'"$deep"'"); csp_field "$m" 1'
-  [ "$output" = "(untitled)" ]
-  # limit=64 via the fallback: now it IS found.
+    csp_session_meta "'"$deep"'"'
+  [ "$(csp_field "$output" 1)" = "(untitled)" ]
+  [ "$(csp_field "$output" 2)" = "/Volumes/demo/real" ]
+  # limit=64 via the fallback: now the title and project are both found.
   run env CSP_META_HEAD_LINES=64 CSP_CLAUDE_DIR="$CSP_CLAUDE_DIR" bash -c '
     command() { if [ "$1" = "-v" ] && { [ "$2" = jq ] || [ "$2" = python3 ]; }; then return 1; fi; builtin command "$@"; }
     . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
-    m=$(csp_session_meta "'"$deep"'"); csp_field "$m" 1'
-  [ "$output" = "fallback deep title" ]
+    csp_session_meta "'"$deep"'"'
+  [ "$(csp_field "$output" 1)" = "fallback deep title" ]
+  [ "$(csp_field "$output" 2)" = "/Volumes/demo/real" ]
+}
+
+@test "meta: fallback stops reading at CSP_META_HEAD_LINES" {
+  # A FIFO makes read-ahead observable: line 2 is deliberately delayed. With a
+  # limit of 1, the parser must return after line 1 instead of waiting for line 2.
+  fifo="$BATS_TEST_TMPDIR/meta-head.fifo"
+  mkfifo "$fifo"
+  {
+    printf '%s\n' '{"type":"ai-title","aiTitle":"first","cwd":"/Volumes/demo/first"}'
+    sleep 3
+    printf '%s\n' '{"type":"ai-title","aiTitle":"outside limit"}'
+  } > "$fifo" &
+  writer=$!
+  started=$SECONDS
+  run env CSP_META_HEAD_LINES=1 bash -c '
+    command() { if [ "$1" = "-v" ] && { [ "$2" = jq ] || [ "$2" = python3 ]; }; then return 1; fi; builtin command "$@"; }
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
+    csp_session_meta "'"$fifo"'"'
+  elapsed=$((SECONDS - started))
+  kill "$writer" 2>/dev/null || true
+  wait "$writer" 2>/dev/null || true
+  [ "$status" -eq 0 ]
+  [ "$elapsed" -lt 2 ]
+  [ "$(csp_field "$output" 1)" = "first" ]
+  [ "$(csp_field "$output" 2)" = "/Volumes/demo/first" ]
 }
 
 @test "id: derived from the file name" {

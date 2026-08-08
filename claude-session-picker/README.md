@@ -212,7 +212,7 @@ terminal are drawn, the highlighted row is always kept in view, and a
 | `CSP_CLAUDE_DIR` | `~/.claude` | where to look for Claude's data (used by the tests) |
 | `CSP_PREF_FILE` | `~/.config/claude-session-picker/backend` | where the `t` toggle saves your mode choice |
 | `CSP_STATE_DIR` | `~/.local/state/claude-session-picker/state` | where the hooks record each session's ●/✳ state |
-| `CSP_META_HEAD_LINES` | `64` | how many lines from the top of each session file are scanned for its title/project (raise it if a future Claude format hides the title lower down) |
+| `CSP_META_HEAD_LINES` | `64` | how many lines from the top of each session file are scanned for its title/project (positive decimal, capped at 100000; raise it if a future Claude format hides the title lower down) |
 
 tmux mode runs on its own tmux socket named `claude-sessions` (via `tmux -L`), so
 it never touches your normal tmux server or `~/.tmux.conf`. In the unlikely event

@@ -209,9 +209,20 @@ CSP_META_HEAD_MAX=100000
 CSP_META_HEAD_LINES="${CSP_META_HEAD_LINES:-64}"
 case "$CSP_META_HEAD_LINES" in
   ''|*[!0-9]*) CSP_META_HEAD_LINES=64 ;;                       # non-numeric
-  *) CSP_META_HEAD_LINES=$(( 10#$CSP_META_HEAD_LINES ))        # strip leading zeros
-     [ "$CSP_META_HEAD_LINES" -le 0 ] && CSP_META_HEAD_LINES=64
-     [ "$CSP_META_HEAD_LINES" -gt "$CSP_META_HEAD_MAX" ] && CSP_META_HEAD_LINES="$CSP_META_HEAD_MAX" ;;
+  *)
+    # Remove leading zeroes before checking length. Values longer than the
+    # decimal representation of CSP_META_HEAD_MAX are capped BEFORE arithmetic,
+    # so Bash integer overflow can never wrap a huge input back to a small value.
+    csp_meta_head_zeroes="${CSP_META_HEAD_LINES%%[!0]*}"
+    CSP_META_HEAD_LINES="${CSP_META_HEAD_LINES#"$csp_meta_head_zeroes"}"
+    unset csp_meta_head_zeroes
+    case "$CSP_META_HEAD_LINES" in
+      '') CSP_META_HEAD_LINES=64 ;;                            # all zeroes
+      ???????*) CSP_META_HEAD_LINES="$CSP_META_HEAD_MAX" ;;    # > 6 digits
+      *) CSP_META_HEAD_LINES=$(( 10#$CSP_META_HEAD_LINES ))
+         [ "$CSP_META_HEAD_LINES" -gt "$CSP_META_HEAD_MAX" ] && CSP_META_HEAD_LINES="$CSP_META_HEAD_MAX" ;;
+    esac
+    ;;
 esac
 
 csp_session_meta() {
@@ -282,21 +293,36 @@ print(chosen + "\t" + cwd)
 PYEOF
 )
   else
-    # No JSON parser available: grep the fields out of just the HEAD of the file,
-    # so this path honours CSP_META_HEAD_LINES exactly like the jq/python paths
-    # (the granular csp_session_* helpers scan the whole file, which would
-    # violate the documented limit and restore expensive full-file scans). This
-    # regex doesn't handle escaped quotes inside a value — acceptable for a title
-    # preview, same limitation the granular reader documents.
-    local head t p c
-    head=$(head -n "$CSP_META_HEAD_LINES" "$file" 2>/dev/null)
-    t=$(printf '%s\n' "$head" | grep -m1 -o '"aiTitle":"[^"]*"'    | sed 's/^"aiTitle":"//; s/"$//')
-    p=$(printf '%s\n' "$head" | grep -m1 -o '"lastPrompt":"[^"]*"' | sed 's/^"lastPrompt":"//; s/"$//')
-    c=$(printf '%s\n' "$head" | grep -m1 -o '"cwd":"[^"]*"'        | sed 's/^"cwd":"//; s/"$//')
-    [ -z "$t" ] && t="$p"
-    # Clip and strip control chars so this path matches the others' guarantees.
-    title=$(printf '%s' "${t:0:$CSP_META_TITLE_CLIP}" | tr -d '\000-\037\177')
-    out="$title$tab$c"
+    # No JSON parser available: stream at most CSP_META_HEAD_LINES through awk,
+    # extracting and clipping before anything reaches a Bash variable. This
+    # preserves the bounded-input guarantee even when one JSONL line contains a
+    # multi-megabyte prompt. Escaped quotes inside values remain unsupported,
+    # matching the documented limitation of the granular fallback reader.
+    out=$(awk -v max_lines="$CSP_META_HEAD_LINES" -v clip="$CSP_META_TITLE_CLIP" '
+      function json_string(key, marker, start, rest, stop) {
+        marker = "\"" key "\":\""
+        start = index($0, marker)
+        if (!start) return ""
+        rest = substr($0, start + length(marker))
+        stop = index(rest, "\"")
+        if (!stop) return ""
+        return substr(rest, 1, stop - 1)
+      }
+      {
+        if (title == "")  { value = json_string("aiTitle");    if (value != "") title = value }
+        if (prompt == "") { value = json_string("lastPrompt"); if (value != "") prompt = value }
+        if (cwd == "")    { value = json_string("cwd");        if (value != "") cwd = value }
+        # Stop after processing the final allowed record. A leading
+        # `NR > max_lines` rule would already have read record max_lines + 1.
+        if (NR >= max_lines) exit
+      }
+      END {
+        chosen = (title != "" ? title : prompt)
+        chosen = substr(chosen, 1, clip)
+        gsub(/[[:cntrl:]]/, "", chosen)
+        printf "%s\t%s", chosen, cwd
+      }
+    ' "$file" 2>/dev/null)
   fi
 
   # Defence in depth: even if an extractor misbehaved, make sure bash never

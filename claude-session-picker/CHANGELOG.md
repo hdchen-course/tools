@@ -7,6 +7,15 @@ command is a symlink updated in place by `git pull`, so this file (and the
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/);
 this project uses simple `MAJOR.MINOR.PATCH` version numbers.
 
+## 1.1.1
+
+### Fixed
+- Validate `CSP_META_HEAD_LINES` by decimal format and significant-digit length
+  before shell arithmetic, preventing oversized values from wrapping to a small
+  limit on Bash 3.2.
+- Stream the no-jq/no-python metadata fallback through a bounded parser instead
+  of copying the complete file head into a Bash variable.
+
 ## 1.1.0
 
 ### Added
