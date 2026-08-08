@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# =============================================================================
+# claude-session-picker — a menu for resuming your Claude Code sessions.
+#
+# WHAT IT DOES (plain language):
+#   Claude Code saves every conversation you have. Over time you build up dozens
+#   of them across different projects, and the only way back into one is to
+#   remember its id. This tool shows all your sessions in a simple keyboard menu
+#   — newest first, with a title, which project it belongs to, and how long ago
+#   it was active — and lets you jump straight back into any one. A "●" marks
+#   sessions that have a live Claude running right now.
+#
+#   It replaces the habit of keeping a dozen terminal tabs open "so you don't
+#   lose" a session: everything is one keypress away from one window.
+#
+# WHY IT NEEDS NOTHING INSTALLED:
+#   It reads Claude's own files under ~/.claude and resumes with the `claude`
+#   command you already have. No tmux, no fzf, no Homebrew. It runs on a bare
+#   remote Cloud Desktop exactly as it does on a Mac.
+#
+# HOW IT STAYS SAFE:
+#   - All decision logic lives in lib/core.sh as pure, unit-tested functions.
+#   - All disk/process access lives in lib/sessions.sh.
+#   - This file only wires input → logic → drawing. It sets strict shell flags,
+#     bounds every loop, and restores the terminal on ANY exit path so a crash
+#     can never leave your terminal in a broken state.
+# =============================================================================
+
+set -u  # Treat use of an unset variable as an error — catches typos early.
+
+# --- Locate our own library files, following symlinks -----------------------
+# The installer symlinks this script into a bin dir, so we resolve the real
+# location to find lib/ next to it.
+csp_self="$0"
+while [ -L "$csp_self" ]; do
+  csp_link_target=$(readlink "$csp_self")
+  case "$csp_link_target" in
+    /*) csp_self="$csp_link_target" ;;                        # absolute link
+    *)  csp_self="$(dirname "$csp_self")/$csp_link_target" ;; # relative link
+  esac
+done
+CSP_ROOT="$(cd "$(dirname "$csp_self")/.." && pwd)"
+
+# shellcheck source=../lib/core.sh
+. "$CSP_ROOT/lib/core.sh"
+# shellcheck source=../lib/sessions.sh
+. "$CSP_ROOT/lib/sessions.sh"
+# shellcheck source=../lib/backend.sh
+. "$CSP_ROOT/lib/backend.sh"
+
+# Which backend runs sessions (see csp_choose_backend / lib/backend.sh). The
+# CSP_BACKEND environment variable forces "hub" or "tmux"; empty means auto.
+CSP_ACTIVE_BACKEND=$(csp_choose_backend \
+  "$(csp_tmux_available && echo 1 || echo 0)" \
+  "$(csp_inside_tmux && echo 1 || echo 0)" \
+  "${CSP_BACKEND:-}")
+
+# --- Terminal handling -------------------------------------------------------
+# We switch the terminal into "raw-ish" mode to read single keypresses, and we
+# ALWAYS put it back. The trap guarantees restoration even if we crash or are
+# killed — this is the core of "never leave the terminal broken". The trap is
+# installed BEFORE we ever change terminal modes, so there is no window in which
+# a failure could skip the cleanup.
+csp_saved_stty=""
+csp_restore_terminal() {
+  printf '\033[?25h'                 # make the cursor visible again
+  [ -n "$csp_saved_stty" ] && stty "$csp_saved_stty" 2>/dev/null
+}
+trap 'csp_restore_terminal' EXIT INT TERM
+
+csp_enter_raw_mode() {
+  csp_saved_stty=$(stty -g 2>/dev/null) || csp_saved_stty=""
+  stty -echo -icanon min 1 time 0 2>/dev/null
+  printf '\033[?25l'                 # hide the cursor while the menu is drawn
+}
+
+# csp_read_key — read one keypress, decoding arrow-key escape sequences into
+# simple letters (k for up, j for down) so the rest of the code handles one
+# vocabulary. Returns the key on stdout.
+csp_read_key() {
+  local k rest
+  IFS= read -r -n 1 k 2>/dev/null || { printf 'q'; return; }
+  if [ "$k" = $'\033' ]; then          # an escape sequence (likely an arrow)
+    IFS= read -r -n 2 -t 1 rest 2>/dev/null
+    case "$rest" in
+      '[A') printf 'k' ;;              # up arrow  → up
+      '[B') printf 'j' ;;              # down arrow → down
+      *)    printf 'q' ;;              # bare Esc  → quit
+    esac
+    return
+  fi
+  printf '%s' "$k"
+}
+
+# --- In-memory session model -------------------------------------------------
+# We keep parallel indexed arrays (bash 3.2 has no associative arrays). Every
+# access is guarded by csp_clamp_index so an out-of-range read is impossible.
+csp_ids=()
+csp_titles=()
+csp_projects=()
+csp_fullprojects=()   # full cwd path, kept for the resume `cd`
+csp_ages=()
+csp_lives=()
+csp_count=0
+
+# csp_load_sessions — build the model from Claude's session store. Enforces the
+# CSP_MAX_SESSIONS cap (via csp_list_session_files) so memory stays bounded.
+csp_load_sessions() {
+  local file id meta title fullcwd project mtime now running is_live
+  csp_ids=(); csp_titles=(); csp_projects=(); csp_fullprojects=()
+  csp_ages=(); csp_lives=()
+  csp_count=0
+  now=$(csp_now_epoch)
+  running=$(csp_running_session_ids)
+
+  while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    id=$(csp_session_id_from_path "$file")
+    # One read per file for both title and cwd (see csp_session_meta).
+    meta=$(csp_session_meta "$file")
+    title=$(csp_truncate "$(csp_field "$meta" 1)" "$CSP_MAX_TITLE_LEN")
+    fullcwd=$(csp_field "$meta" 2)
+    project=$(csp_short_path "$fullcwd")
+    mtime=$(csp_file_mtime "$file")
+    is_live=0
+    csp_is_live "$id" "$running" && is_live=1
+
+    csp_ids[$csp_count]="$id"
+    csp_titles[$csp_count]="$title"
+    csp_projects[$csp_count]="$project"
+    csp_ages[$csp_count]="$(csp_humanize_age "$((now - mtime))")"
+    csp_lives[$csp_count]="$is_live"
+    # Remember the full project path alongside the id, for the resume `cd`.
+    csp_fullprojects[$csp_count]="$fullcwd"
+    csp_count=$((csp_count + 1))
+  done <<EOF
+$(csp_list_session_files)
+EOF
+}
+
+# csp_visible_rows — how many session rows fit on the current terminal, leaving
+# room for the two header lines and a footer.
+#
+# We read the height from `stty size` FIRST, because it reports the real
+# current size of the terminal device. `tput lines` is only a fallback: it can
+# return a stale terminfo default (e.g. 24) inside a resized window, which would
+# make us draw more rows than fit and push the header off-screen. If neither
+# works (e.g. output isn't a terminal at all), we assume a conservative 24.
+csp_visible_rows() {
+  local rows=""
+  # `stty size` prints "ROWS COLS"; take the first number.
+  rows=$(stty size 2>/dev/null | { read -r r _ 2>/dev/null; printf '%s' "$r"; })
+  case "$rows" in ''|*[!0-9]*) rows=$(tput lines 2>/dev/null) ;; esac
+  case "$rows" in ''|*[!0-9]*) rows=24 ;; esac
+  rows=$((rows - 4))                 # reserve header (2) + spacing/footer (2)
+  [ "$rows" -lt 1 ] && rows=1
+  printf '%d' "$rows"
+}
+
+# csp_draw SELECTED — render the menu for the given cursor position, showing
+# only the rows that fit and keeping the selection in view (see
+# csp_window_start). This is what lets a list of hundreds of sessions display
+# correctly on a short terminal without garbling the screen.
+csp_draw() {
+  local selected="$1" i marker line visible start last mode_hint
+  printf '\033[2J\033[H'   # clear screen, move cursor home
+  # The header names the active mode so you always know whether switching leaves
+  # other sessions running (tmux) or returns you here between sessions (hub).
+  if [ "$CSP_ACTIVE_BACKEND" = "tmux" ]; then
+    mode_hint="mode: tmux (others keep running)"
+  else
+    mode_hint="mode: hub (one at a time)"
+  fi
+  printf 'Claude Session Picker   ● = running    %s\n' "$mode_hint"
+  printf '%s\n' '(j/k move   Enter open   n new session   R reload   q quit)'
+
+  if [ "$csp_count" -eq 0 ]; then
+    printf '  (no Claude sessions found under %s/projects)\n' "$CSP_CLAUDE_DIR"
+    return
+  fi
+
+  visible=$(csp_visible_rows)
+  start=$(csp_window_start "$selected" "$csp_count" "$visible")
+  last=$((start + visible))
+  [ "$last" -gt "$csp_count" ] && last="$csp_count"
+
+  i="$start"
+  while [ "$i" -lt "$last" ]; do
+    marker=$(csp_marker_for_session "${csp_lives[$i]}")
+    line=$(csp_format_line "$marker" "${csp_titles[$i]}" "${csp_projects[$i]}" \
+      "${csp_ages[$i]}" "$([ "$i" -eq "$selected" ] && echo 1 || echo 0)")
+    printf '%s\n' "$line"
+    i=$((i + 1))
+  done
+
+  # Show a position hint when the list is scrolled.
+  if [ "$csp_count" -gt "$visible" ]; then
+    printf '%s\n' "-- $((selected + 1))/$csp_count --"
+  fi
+}
+
+# csp_open ID PROJECT LABEL — open a session through the active backend.
+#
+# The two backends need opposite terminal handling, and getting this wrong is
+# what would wedge the terminal, so it is centralised here:
+#
+#   • hub  — we must give the terminal back to Claude, run it, and then take the
+#     terminal BACK when Claude exits so the menu can redraw. So: restore the
+#     terminal, run the session (which blocks until it exits), then re-enter raw
+#     mode and reload the list. Control naturally returns to the main loop.
+#
+#   • tmux — we hand off to tmux (attach/switch) and then exit the picker: tmux
+#     owns the screen from here, and the other sessions keep running in their
+#     own windows. We restore the terminal first so tmux starts from a clean
+#     state.
+csp_open() {
+  local id="$1" project="$2" label="$3"
+  if [ "$CSP_ACTIVE_BACKEND" = "tmux" ]; then
+    csp_restore_terminal
+    csp_tmux_open "$id" "$project" "$label"
+    exit 0
+  fi
+  # hub mode
+  csp_restore_terminal
+  csp_hub_open "$id" "$project"
+  csp_enter_raw_mode
+  csp_load_sessions
+}
+
+# --- Main loop ---------------------------------------------------------------
+csp_main() {
+  if ! command -v claude >/dev/null 2>&1; then
+    printf 'The `claude` command was not found on your PATH.\n' >&2
+    printf 'Install Claude Code first: https://claude.com/claude-code\n' >&2
+    exit 1
+  fi
+
+  csp_enter_raw_mode
+  local selected=0 key label
+
+  csp_load_sessions
+  while :; do
+    selected=$(csp_clamp_index "$selected" "$csp_count")
+    csp_draw "$selected"
+    key=$(csp_read_key)
+    case "$key" in
+      j) selected=$(csp_clamp_index "$((selected + 1))" "$csp_count") ;;
+      k) selected=$(csp_clamp_index "$((selected - 1))" "$csp_count") ;;
+      g) selected=0 ;;
+      G) selected=$(csp_clamp_index "$((csp_count - 1))" "$csp_count") ;;
+      $'\n'|$'\r'|'')
+         if [ "$csp_count" -gt 0 ]; then
+           # A tmux window name can't contain much; use the short project path.
+           label="${csp_projects[$selected]}"
+           csp_open "${csp_ids[$selected]}" "${csp_fullprojects[$selected]}" "$label"
+         fi ;;
+      n) # Start a brand-new session (in the current directory).
+         csp_open "new" "$PWD" "new" ;;
+      R|l) csp_load_sessions ;;
+      q) break ;;
+    esac
+  done
+}
+
+csp_main "$@"

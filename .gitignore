@@ -1,0 +1,9 @@
+# Runtime cache the reconciler writes (per-session pane fingerprints).
+.cache/
+*.hash
+
+# macOS noise
+.DS_Store
+
+# Local test artifacts
+*.log
