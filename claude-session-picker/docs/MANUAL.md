@@ -63,11 +63,14 @@ Claude Session Picker   ● = running    mode: hub (one at a time)
 **Line 1 — the header, including the mode.** This is the most useful line on the
 screen, because it tells you what `Enter` is about to do:
 
-- `mode: hub (one at a time)` — the session opens **in this terminal**. Other
-  sessions are stopped (safely saved on disk). When you quit Claude you come back
-  to this menu.
-- `mode: tmux (others keep running)` — the session opens in its **own tmux
-  window**, and any sessions you already opened keep running in the background.
+- `mode: hub · one session at a time, quit to return here` — the session opens
+  **in this terminal**. Other sessions are stopped (safely saved on disk). When
+  you quit Claude you come back to this menu.
+- `mode: tmux · Enter opens a session in its own window · switch with Ctrl-b n/p,
+  menu = Ctrl-b 0` — the session opens in its **own tmux window** and any sessions
+  you already opened keep running in the background. This menu stays open in
+  window 0; `Ctrl-b` then `0` brings you back to it. See
+  [the tmux walk-through](#walk-through-the-same-three-sessions-in-tmux-mode).
 
 **Line 2** is a reminder of the main keys.
 
@@ -110,8 +113,8 @@ itself and always keeps the cursor visible.
 
 Two small things worth knowing:
 
-- Only ↑ and ↓ are understood as arrows. **← and → quit the picker.** If you
-  reach for them out of habit, use `j` and `k` instead.
+- Only ↑ and ↓ are understood as arrows. ← and → do **nothing** — a stray press
+  won't quit. Use `j` and `k` to move.
 - `n` always starts the new session in the directory you were in when you
   launched the picker — not the directory of the highlighted row. If you want a
   new session in a specific project, `cd` there first, then run the picker.
@@ -156,31 +159,72 @@ sudo apt install tmux        # Debian/Ubuntu
 sudo yum install tmux        # RHEL / CentOS / Fedora
 ```
 
-You don't configure anything. The next time you run `claude-session-picker` the
-header will read `mode: tmux (others keep running)`.
+You don't configure anything. Press `t` in the menu to turn tmux mode on (or
+start with `CSP_BACKEND=tmux claude-session-picker`).
 
-1. **Open the picker.** Move to *Refactor the parser*, press `Enter`.
-   The picker creates a tmux session called `claude-sessions`, opens a **window**
-   inside it running your resumed conversation, and puts you in it. The picker
-   itself exits — from here on, tmux owns the screen.
-2. **Give Claude a long task** and let it work.
-3. **Leave that window without stopping it.** Press `Ctrl-B` then `d` to detach
-   from tmux entirely (Claude keeps running), or `Ctrl-B` then `n` / `p` to move
-   between windows you've already opened.
-4. **Open the second session.** Run `claude-session-picker` again. Pick
-   *Investigate flaky integration test*, `Enter`. That gets its own window. The
-   refactor is **still running** in its window.
-5. **Same for the doc review.** Now you have three windows in `claude-sessions`,
-   all alive.
-6. **Move between them.** `Ctrl-B` then `w` shows a picker of tmux windows;
-   `Ctrl-B` then a number (`0`, `1`, `2`…) jumps straight to one.
-7. **Come back tomorrow.** `tmux attach -t claude-sessions` puts you back with
-   everything as you left it — or just run `claude-session-picker` again and open
-   anything; it reattaches to the same tmux session rather than making a new one.
+**The one idea to understand: the menu stays open.** In tmux mode the picker
+moves itself *inside* a tmux session named `claude-sessions` and sits there as
+window 0 — your home base. Sessions you open become windows 1, 2, 3… and keep
+running when you look away. The menu is always one `Ctrl-b 0` away.
 
-The tmux keys above (`Ctrl-B` then something) are tmux's own, not this tool's.
-`Ctrl-B d` (detach), `Ctrl-B w` (window list) and `Ctrl-B n`/`p` (next/previous)
-are all you really need.
+1. **Turn on tmux mode.** Press `t`. The screen redraws and a **status bar
+   appears along the bottom** — that's how you know you're now inside tmux. The
+   menu itself looks the same, but its mode line now mentions `mode: tmux`.
+2. **Work on the refactor.** Move to *Refactor the parser*, press `Enter`. It
+   opens in a new window and you're in Claude. Give it a long task.
+3. **Go back to the menu — press `Ctrl-b` then `0`.** The refactor keeps running;
+   you're looking at the menu again. (Window 0 is the menu — that's what the `0`
+   means, and the status bar reminds you.)
+4. **Open the second session.** Pick *Investigate flaky integration test*,
+   `Enter`. Its own window. The refactor is **still running**.
+5. **Same for the doc review.** Three sessions alive, plus the menu. The status
+   bar at the bottom lists them all, with the one you're in highlighted, and
+   spells out the keys on the right:
+
+   ```
+    Claude sessions   0 picker   1 tools   2 service   3 docs    Ctrl-b then: n/p=switch  0=menu  w=list  d=detach
+   ```
+
+6. **Move between them.** `Ctrl-b` then `n` (next) or `p` (previous) steps
+   through the windows; `Ctrl-b w` shows a list you can pick from; `Ctrl-b` then
+   a number jumps straight to that window — the numbers are the ones in the
+   status bar.
+7. **Finish a session for good.** `/exit` inside it. That window closes and tmux
+   drops you on a neighbouring one. Press `Ctrl-b 0` to get back to the menu.
+8. **Stop for the day, but leave everything running.** `Ctrl-b` then `d`
+   (detach). You get your shell back; every Claude keeps working.
+9. **Come back.** Run `claude-session-picker` again — it reattaches to the same
+   `claude-sessions` with everything as you left it. (`tmux attach -t
+   claude-sessions` does the same thing.)
+
+**About `Ctrl-b`: it is a prefix, and that's why it seems to "do nothing".**
+Press and release `Ctrl-b`, then press the second key. In between, the screen
+looks exactly the same whether or not tmux heard you — there is no flash, no
+message. That's normal tmux behaviour, not a fault. The always-visible reminder
+on the right of the status bar is there so you never have to guess what the
+second key should be.
+
+The picker sets up that status bar on *its own tmux session only* — your
+`~/.tmux.conf` is never modified. It deliberately adds **no** prefix-free
+shortcuts (like plain `F1`): in tmux those are server-global, so they would steal
+that key from Claude Code and any editor running inside every window.
+
+**These keys are tmux's own, not this tool's**, so they work the same in any tmux
+you ever use: `Ctrl-b 0` (window 0 = the menu), `Ctrl-b n` / `p`
+(next/previous), `Ctrl-b w` (window list), `Ctrl-b d` (detach).
+
+### Quitting everything
+
+| I want to… | Do this |
+|---|---|
+| leave the menu but keep sessions running | `Ctrl-b n`, or `Ctrl-b` then a number — just switch away |
+| get my shell back, everything still running | `Ctrl-b` then `d` |
+| close one session | `/exit` inside it |
+| shut down absolutely everything | `tmux kill-session -t claude-sessions` |
+
+Pressing `q` in the menu closes **only the menu window**. Any sessions you opened
+stay alive and you land on one of them — which can be confusing the first time.
+If you want the menu back after that, run `claude-session-picker` again.
 
 ---
 
@@ -196,10 +240,13 @@ your choice is **saved**, so the next time you start the picker it opens in the
 same mode. If `tmux` isn't installed, pressing `t` tells you so and stays in hub
 rather than switching to a mode it can't run.
 
-Once you've toggled tmux **on**, opening a session puts it in its own tmux
-window; the ones you've already opened keep running in the background, and you
-move between them with tmux's own keys — `Ctrl-b n` (next), `Ctrl-b p`
-(previous), `Ctrl-b w` (list and pick). Toggle back to hub with `t` any time.
+Turning tmux **on** does something visible: the picker immediately re-launches
+itself inside the `claude-sessions` tmux session, so the screen redraws and a
+status bar appears at the bottom. That's expected — it's what lets the menu stay
+open in window 0 while your sessions run in windows 1, 2, 3…. From then on
+`Ctrl-b 0` returns to the menu and `Ctrl-b n`/`p` move between sessions. Toggle
+back to hub with `t` any time (that leaves the tmux session running; detach or
+kill it yourself).
 
 **The manual way — `CSP_BACKEND`.** You can also force a mode for a single run,
 which overrides the remembered choice:
@@ -276,9 +323,36 @@ you *don't* get is a task continuing to run while you're away — for that you n
 tmux.
 
 **How do I get real concurrency?**
-Install `tmux`, then start the picker with `CSP_BACKEND=tmux claude-session-picker`
-(installing tmux alone doesn't change the default — you opt in with that variable).
-Each session then gets its own tmux window and they all keep running at once.
+Install `tmux`, then press `t` in the menu (or start with
+`CSP_BACKEND=tmux claude-session-picker`). Installing tmux alone doesn't change
+the default — you opt in. Each session then gets its own tmux window and they all
+keep running at once.
+
+**In tmux mode, how do I switch to another session?**
+Two ways. Press `Ctrl-b` then `0` to get back to the menu, then `Enter` on the one
+you want. Or step straight between already-open sessions with `Ctrl-b n` (next)
+and `Ctrl-b p` (previous) — the status bar at the bottom of the screen lists them
+all so you can see where you're going. `Ctrl-b w` gives you a pick-from-a-list
+view.
+
+**I pressed `Ctrl-b` and nothing happened.**
+That's how `Ctrl-b` works, and it's the single most confusing thing about tmux:
+it's a *prefix*, not a command. tmux is now waiting for a second key and gives no
+visible sign of it — the screen looks identical whether it heard you or not. Press
+the second key and it acts: `0` for the menu, `n`/`p` for next/previous session,
+`w` for a list, `d` to detach. The reminder on the right of the status bar
+(`Ctrl-b then: n/p=switch  0=menu  w=list  d=detach`) is there precisely so you
+don't have to remember which second key to press.
+
+**How do I get back to the menu?**
+`Ctrl-b` then `0`. The menu never closed — it's running in window 0 the whole
+time, which is what the `0` refers to.
+
+**I `/exit`ed a session and now I'm somewhere unexpected.**
+When a session's window closes, tmux moves you to a neighbouring window, which
+might be another session or the menu. Press `Ctrl-b 0` to go to the menu
+deliberately. If you `/exit` your *last* session and the menu is gone too, tmux
+ends and you're back at your shell.
 
 **Is any of my data sent anywhere?**
 No. The tool makes no network calls whatsoever. It reads files that already exist
@@ -290,7 +364,8 @@ No. It only ever *reads* `~/.claude`. Uninstalling removes one symlink and leave
 every session intact.
 
 **How do I switch modes?**
-`CSP_BACKEND=hub` or `CSP_BACKEND=tmux` in front of the command. See
+Press `t` in the menu — it's remembered next time. Or put `CSP_BACKEND=hub` /
+`CSP_BACKEND=tmux` in front of the command for one run. See
 [Switching modes](#switching-modes).
 
 **Why does a session I know is open have no `●`?**
@@ -358,6 +433,24 @@ says tmux isn't available, check it's really on your `PATH` with
 `command -v tmux`. You can also force it with `CSP_BACKEND=tmux`; forcing tmux
 without the command installed falls back to hub.
 
+**`Ctrl-b 0` says "can't find window: 0" and doesn't reach the menu**
+You almost certainly have `set -g base-index 1` in your `~/.tmux.conf` (it's a
+very common setting). That makes tmux number windows from 1, so the menu is
+window **1**, not 0 — but the status bar still says `0=menu`. Use `Ctrl-b 1`
+instead, or `Ctrl-b w` and pick `picker` from the list. Whatever the status bar
+lists next to `picker` is the right number.
+
+**`Ctrl-b` then a number took me to the wrong session**
+Window numbers aren't positions in the menu, and they aren't reused when a session
+closes — so after you `/exit` something the numbering can have gaps, and a number
+you remember may now point elsewhere. Read the number off the status bar each time
+rather than memorising it, or use `Ctrl-b w` to pick by name.
+
+**I have a lot of sessions open and can't keep track**
+`Ctrl-b w` gives a scrollable list of every window with names, which works no
+matter how many you have. `Ctrl-b 0` (the menu) then `Enter` is always available
+too.
+
 **tmux mode opened a window but Claude isn't there**
 The window runs `claude --resume <id>` in the session's project folder. If that
 command fails, the window closes. Try running it by hand in a normal terminal to
@@ -375,8 +468,9 @@ on every exit path, including `Ctrl-C` and being killed. If some other program
 left things odd, `reset` (or `stty sane` then `printf '\033[?25h'`) puts a
 terminal back in order.
 
-**The arrow keys quit the picker**
-← and → aren't bound and are treated as quit. Use `j` / `k`, or ↑ / ↓, to move.
+**The left/right arrow keys don't do anything**
+Only ↑ and ↓ move the cursor; ← and → are deliberately ignored so a stray press
+can't do anything surprising. Use `j` / `k` or ↑ / ↓.
 
 **Titles with Chinese or other non-Latin characters look misaligned**
 Titles are cut by character count, never mid-character, so nothing is corrupted —

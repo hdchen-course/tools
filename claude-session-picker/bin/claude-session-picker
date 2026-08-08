@@ -596,9 +596,9 @@ csp_draw() {
   csp_buf_line "$CSP_CHROME_TOP"   # cached top rule (with title)
 
   if [ "$CSP_ACTIVE_BACKEND" = "tmux" ]; then
-    # Note it hands off + exits, so "switch with Ctrl-b" isn't mistaken for
-    # something the menu does.
-    mode_line="mode: tmux ON · opens each session in a tmux window (picker exits); switch with Ctrl-b n/p/w  (t: off)"
+    # The picker is resident in window 0; sessions open as new windows and keep
+    # running. The bottom status bar lists them and spells out the switch keys.
+    mode_line="mode: tmux · Enter opens a session in its own window · switch with Ctrl-b n/p, menu = Ctrl-b 0  (t: off)"
   else
     mode_line="mode: hub · one session at a time, quit to return here"
     if csp_tmux_available; then
@@ -676,20 +676,22 @@ csp_draw() {
 #     terminal, run the session (which blocks until it exits), then re-enter raw
 #     mode and reload the list. Control naturally returns to the main loop.
 #
-#   • tmux — we hand off to tmux (attach/switch) and then exit the picker: tmux
-#     owns the screen from here, and the other sessions keep running in their
-#     own windows. We restore the terminal first so tmux starts from a clean
-#     state. If tmux FAILS (server won't start, window couldn't be created), we
-#     do NOT silently vanish — we fall back to hub for this one launch so the
-#     user still gets their session, then return to the menu.
+#   • tmux — the picker is resident in window 0 of the holding session. Opening
+#     a session creates a NEW window running it and switches there; the picker
+#     KEEPS RUNNING in window 0 (we do NOT exit). You come back with Ctrl-b 0 and
+#     switch between sessions with Ctrl-b n/p/w — all stay alive in the
+#     background. We briefly leave/re-enter raw mode around the tmux calls so the
+#     terminal is clean. If tmux FAILS, we fall back to hub for this one launch.
 csp_open() {
   local id="$1" project="$2" label="$3"
   if [ "$CSP_ACTIVE_BACKEND" = "tmux" ]; then
-    csp_restore_terminal
     if csp_tmux_open "$id" "$project" "$label"; then
-      exit 0
+      # Success: tmux switched us to the new window; the picker stays in window
+      # 0. When you Ctrl-b 0 back, the loop is still running and will redraw.
+      return 0
     fi
     # tmux launch failed — tell the user and fall back to running it here.
+    csp_restore_terminal
     printf 'tmux could not open the session; running it here instead.\n' >&2
     csp_hub_open "$id" "$project"
     csp_enter_raw_mode
@@ -770,6 +772,15 @@ csp_toggle_backend() {
       return 0
     fi
     CSP_ACTIVE_BACKEND="tmux"
+    csp_save_backend_pref "$CSP_ACTIVE_BACKEND"
+    # If we're not already inside tmux, relaunch into the holding session now so
+    # the picker becomes window 0 (same as starting in tmux mode). This execs
+    # and does not return; the re-launched copy runs inside tmux.
+    if ! csp_inside_tmux; then
+      csp_restore_terminal
+      csp_tmux_enter "$CSP_ROOT/bin/claude-session-picker"
+    fi
+    return 0
   fi
   csp_save_backend_pref "$CSP_ACTIVE_BACKEND"
 }
@@ -780,6 +791,16 @@ csp_main() {
     printf 'The `claude` command was not found on your PATH.\n' >&2
     printf 'Install Claude Code first: https://claude.com/claude-code\n' >&2
     exit 1
+  fi
+
+  # tmux mode, and we're not yet inside tmux → relaunch ourselves INSIDE the
+  # holding tmux session as window 0 (see csp_tmux_enter). This is what makes
+  # the picker resident: every session you open becomes another window and the
+  # picker stays put in window 0 (Ctrl-b 0 to come back). csp_tmux_enter execs
+  # tmux and does not return; the re-launched copy comes back here already
+  # inside tmux and just runs the menu loop below.
+  if [ "$CSP_ACTIVE_BACKEND" = "tmux" ] && ! csp_inside_tmux; then
+    csp_tmux_enter "$CSP_ROOT/bin/claude-session-picker"
   fi
 
   local selected=0 key label

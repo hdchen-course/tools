@@ -32,27 +32,25 @@ once. The header line always tells you which mode you're in.
 | | **hub** (default) | **tmux** (opt-in) |
 |---|---|---|
 | Needs installed | nothing | the `tmux` command |
-| When it is used | **always, unless you ask for tmux** | only when you set `CSP_BACKEND=tmux` |
+| When it is used | **always, unless you ask for tmux** | only when you ask for it (`t` key or `CSP_BACKEND=tmux`) |
 | Where a session opens | in your current terminal | in its own tmux *window* |
+| Where the menu lives | this terminal; it's hidden while a session runs | **window 0, always running** |
 | While you use session A | B, C… are **stopped** (saved on disk) | B, C… keep **running** in the background |
-| Quitting the session | **returns you to the picker menu** | leaves you in tmux; other windows still live |
-| Switching | quit the session → pick the next from the menu | tmux keys: `Ctrl-b n` / `Ctrl-b p` / `Ctrl-b <number>` |
+| Quitting the session | **returns you to the picker menu** | the window closes; you land on another window |
+| Switching | quit the session → pick the next from the menu | `Ctrl-b 0` back to the menu, `Ctrl-b n`/`p` between sessions |
 | Good for | the common case: browse and resume, one at a time | several agents making progress in parallel |
 
 **Why hub is the default even if you have tmux.** Auto-picking tmux just because
-it happens to be installed is surprising: pressing `Enter` drops you into a
-full-screen tmux client, and if that's the only window, quitting it drops you
-back to the shell — not the menu — and the picker can't bring you back. Hub
-gives the same predictable "quit a session → back to the menu → pick the next"
-flow on every machine, needs nothing installed, and can't leave your terminal in
-a strange state. Nothing is lost when you switch: Claude saves every session to
-disk as you go, so reopening picks up exactly where you left off.
+it happens to be installed is surprising: it moves your shell into a tmux client
+you didn't ask for, and every tmux keybinding it needs is one more thing to know.
+Hub gives the same predictable "quit a session → back to the menu → pick the
+next" flow on every machine, needs nothing installed, and can't leave your
+terminal in a strange state. Nothing is lost when you switch: Claude saves every
+session to disk as you go, so reopening picks up exactly where you left off.
 
-**Want true concurrency?** Install `tmux` and opt in with `CSP_BACKEND=tmux`.
-Then each session opens in its own tmux window and the others keep running in
-the background; you switch between them with tmux's own keys (`Ctrl-b n` for the
-next window, `Ctrl-b p` for the previous, `Ctrl-b` then a number to jump, and
-`Ctrl-b d` to detach). See [Optional: tmux](#optional-tmux).
+**Want true concurrency?** Install `tmux` and opt in — press `t` in the menu, or
+start with `CSP_BACKEND=tmux`. See [tmux mode in detail](#tmux-mode-in-detail)
+for what changes on screen.
 
 The easiest way to switch is the **`t` key inside the menu** — it flips between
 hub and tmux and remembers your choice for next time. You can also force a mode
@@ -120,8 +118,52 @@ sudo yum install tmux        # RHEL / CentOS / Fedora
 
 Installing tmux does **not** change the picker's default — it stays in hub mode
 so nothing about your normal flow changes. To actually use concurrent windows,
-opt in per run with `CSP_BACKEND=tmux claude-session-picker` (or export
-`CSP_BACKEND=tmux` in your shell rc to make it your personal default).
+press `t` in the menu (remembered next time), or opt in per run with
+`CSP_BACKEND=tmux claude-session-picker`.
+
+### tmux mode in detail
+
+The important thing to know: in tmux mode **the menu never goes away.** The
+picker moves itself inside a tmux session called `claude-sessions` and lives
+there as window 0, your home base. Each session you open becomes another window
+(1, 2, 3…) and keeps running when you leave it.
+
+```
+ Claude sessions   0 picker   1 tools   2 service   Ctrl-b then: n/p=switch  0=menu  w=list  d=detach
+ ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ you're in tmux    every open session, current one  the keys that move you around —
+                   highlighted                      always on screen, nothing to memorise
+```
+
+That bar along the bottom of the screen is tmux's, not the picker's — it is your
+map of what's open **and** your reminder of the keys.
+
+| To do this | Press |
+|---|---|
+| go back to the menu (window 0) | `Ctrl-b` then `0` |
+| next / previous session | `Ctrl-b` then `n` / `p` |
+| pick from a list of windows | `Ctrl-b` then `w` |
+| jump to a specific window | `Ctrl-b` then its number from the status bar |
+| leave everything running and get your shell back | `Ctrl-b` then `d` (detach) |
+| come back later | `claude-session-picker` again, or `tmux attach -t claude-sessions` |
+
+**How `Ctrl-b` works.** It's a *prefix*, not a command: press and release
+`Ctrl-b`, then press the second key. Nothing visible happens in between — that's
+normal, and it's why the status bar spells out the second key for you.
+
+The picker sets up that status bar on its own tmux session only; your
+`~/.tmux.conf` is never modified. It deliberately adds **no** prefix-free key
+bindings, because those are server-global in tmux and would steal the key from
+Claude Code (and any editor) running inside every window.
+
+The first time you start in tmux mode the screen will flash and you'll notice the
+new status bar at the bottom: that's the picker re-launching itself inside tmux.
+This is expected and happens once per session.
+
+**Quitting.** `q` in the menu closes the menu window only — any sessions you
+opened stay alive, and you land on one of them. To shut everything down, quit
+each Claude, or `tmux kill-session -t claude-sessions` from any shell. To keep
+everything running and just get your shell back, detach with `Ctrl-b d`.
 
 ## Usage
 
@@ -136,7 +178,7 @@ claude-session-picker
 | `Enter` | open the selected session |
 | `n` | start a **new** session in the directory you launched the picker from |
 | `d` or `x` | **delete** the selected session's history (asks you to confirm first) |
-| `t` | **toggle** between hub and tmux mode (see below); the choice is remembered |
+| `t` | **toggle** between hub and tmux mode (see below); the choice is remembered. Turning tmux **on** re-launches the picker inside tmux |
 | `R` or `l` | reload the list |
 | `q` or `Esc` | quit |
 
@@ -146,12 +188,15 @@ quit). Just `q` or `Esc` quits.
 Press `t` to switch modes right from the menu — no need to remember an
 environment variable. If tmux isn't installed it tells you so instead of
 switching. Your choice is saved, so next time the picker starts in the same
-mode.
+mode. Note that switching tmux **on** immediately re-launches the picker inside
+the `claude-sessions` tmux session (the screen redraws with a status bar along
+the bottom); see [tmux mode in detail](#tmux-mode-in-detail).
 
 Opening a session `cd`s into that session's original project directory first (if
 it still exists) and runs `claude --resume <id>`, so you land where you left off.
 What happens next depends on the mode: hub returns you to the menu when you quit
-Claude; tmux hands the screen over to tmux and the picker exits.
+Claude; tmux opens the session in a new window and switches you to it, while the
+menu keeps running in window 0 — press `Ctrl-b` then `0` to come back to it.
 
 The list scrolls. However many sessions you have, only the rows that fit on your
 terminal are drawn, the highlighted row is always kept in view, and a
