@@ -328,6 +328,12 @@ Nothing in the suite launches the real `claude` or touches your real `~/.claude`
 - **No shell injection.** Paths and ids handed to tmux are single-quoted with
   embedded quotes escaped, which is covered by a test.
 
+## Version & changes
+
+Check your installed build with `claude-session-picker --version`. Because the
+install is a symlink updated in place by `git pull`, that number (and
+[CHANGELOG.md](CHANGELOG.md)) is how you tell what you're running.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). This is an unofficial community tool and is **not

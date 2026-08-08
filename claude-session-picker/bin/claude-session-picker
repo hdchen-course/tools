@@ -33,6 +33,12 @@ set -u  # Treat use of an unset variable as an error — catches typos early.
 # those and could leave the terminal half-restored. We handle errors explicitly
 # instead. Please don't add `set -e`.
 
+# Version, reported by --version. Bump this in the same commit as user-visible
+# changes and add a matching CHANGELOG.md entry; because the install is a
+# symlink updated in place by `git pull`, this is how a user (or a bug report)
+# knows exactly which build they're on.
+CSP_VERSION="1.0.0"
+
 # --- Locate our own library files, following symlinks -----------------------
 # The installer symlinks this script into a bin dir, so we resolve the real
 # location to find lib/ next to it. We start from ${BASH_SOURCE[0]} rather than
@@ -156,6 +162,7 @@ CSP_BX_H="─";  CSP_BX_V="│";  CSP_BX_ML="├"; CSP_BX_MR="┤"
 # always put the terminal back the way the user's shell handed it to us.
 csp_saved_stty=""
 csp_stty_captured=0
+csp_raw_active=0        # 1 once we've put the terminal into raw mode
 
 # The terminal device we talk to for interactive prompts (delete confirmation,
 # "press Enter to continue"). It defaults to the real controlling terminal, but
@@ -178,7 +185,9 @@ csp_tty_readline() {
   if [ -r "$CSP_TTY" ] || [ "$CSP_TTY" != "/dev/tty" ]; then
     IFS= read -r __line < "$CSP_TTY" 2>/dev/null || __line=""
   fi
-  eval "$__var=\$__line"
+  # Assign to the caller's variable via printf -v (bash 3.1+, which we target)
+  # rather than eval — no chance of the value being re-interpreted as code.
+  printf -v "$__var" '%s' "$__line"
 }
 
 csp_capture_pristine_stty() {
@@ -199,6 +208,11 @@ csp_capture_pristine_stty() {
 #     failed), fall back to `stty sane`, a known-good cooked mode, so the user
 #     is never left with no echo / no Ctrl-C.
 csp_restore_terminal() {
+  # Nothing to undo if we never touched the terminal (e.g. exiting from
+  # --version/--help, or a load-time error). Staying silent here keeps that
+  # output clean when piped or grepped — no stray escape sequences.
+  [ "$csp_raw_active" = "1" ] || return 0
+  csp_raw_active=0
   printf '\033[?25h\033[?1049l\033[?1000l\033[?1006l' 2>/dev/null
   if [ -n "$csp_saved_stty" ]; then
     stty "$csp_saved_stty" 2>/dev/null || stty sane 2>/dev/null
@@ -223,6 +237,7 @@ fi
 
 csp_enter_raw_mode() {
   csp_capture_pristine_stty           # captures once; safe to call repeatedly
+  csp_raw_active=1                     # from here, restore has real work to do
   stty -echo -icanon min 1 time 0 2>/dev/null
   # Hide the cursor and clear the screen ONCE. From here on csp_draw repaints by
   # homing the cursor (not clearing), so there's no flicker; this initial clear
@@ -794,6 +809,21 @@ csp_toggle_backend() {
 
 # --- Main loop ---------------------------------------------------------------
 csp_main() {
+  # Handle informational flags before anything else (no terminal setup, no tmux
+  # re-exec) so `--version`/`--help` are cheap and safe to pipe/grep.
+  case "${1:-}" in
+    -V|--version)
+      printf 'claude-session-picker %s\n' "$CSP_VERSION"
+      exit 0 ;;
+    -h|--help)
+      printf 'claude-session-picker %s — a menu to list and resume Claude Code sessions.\n\n' "$CSP_VERSION"
+      printf 'Usage: claude-session-picker [-V|--version] [-h|--help]\n\n'
+      printf 'Run with no arguments to open the menu. Keys: j/k move, Enter open,\n'
+      printf 'n new, d delete, t toggle hub/tmux, R reload, q quit.\n'
+      printf 'Env: CSP_BACKEND=hub|tmux. Full docs: README.md and docs/MANUAL.md.\n'
+      exit 0 ;;
+  esac
+
   if ! command -v claude >/dev/null 2>&1; then
     printf 'The `claude` command was not found on your PATH.\n' >&2
     printf 'Install Claude Code first: https://claude.com/claude-code\n' >&2

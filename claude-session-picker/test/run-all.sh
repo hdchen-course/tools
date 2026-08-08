@@ -46,3 +46,6 @@ printf '\n== hook tests (●/✳ state recording) ==\n'
 
 printf '\n== tmux backend tests (real tmux on a throwaway socket) ==\n'
 "$BATS" "$HERE/tmux.bats"
+
+printf '\n== CLI flag tests (--version / --help) ==\n'
+"$BATS" "$HERE/cli.bats"
