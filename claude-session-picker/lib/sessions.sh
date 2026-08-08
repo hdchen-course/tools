@@ -319,7 +319,11 @@ PYEOF
       END {
         chosen = (title != "" ? title : prompt)
         chosen = substr(chosen, 1, clip)
-        gsub(/[[:cntrl:]]/, "", chosen)
+        # Replace control chars with a space (NOT delete) so this path renders
+        # an embedded newline/tab as "line1 line2", identical to the jq and
+        # python extractors above. Deleting them would collapse to "line1line2"
+        # and make the same session show a different title per available tool.
+        gsub(/[[:cntrl:]]/, " ", chosen)
         printf "%s\t%s", chosen, cwd
       }
     ' "$file" 2>/dev/null)

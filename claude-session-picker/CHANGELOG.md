@@ -15,6 +15,11 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   limit on Bash 3.2.
 - Stream the no-jq/no-python metadata fallback through a bounded parser instead
   of copying the complete file head into a Bash variable.
+- The awk fallback now **replaces** control characters in a title with a space
+  instead of deleting them, matching the jq and python readers. Previously a
+  title with an embedded tab/newline rendered as `line1line2` through the
+  fallback but `line1 line2` through the primary parsers, so the same session
+  could show a different title depending on which tools were installed.
 
 ## 1.1.0
 

@@ -274,6 +274,28 @@ EOF
   [ "$(csp_field "$output" 2)" = "/Volumes/demo/alpha" ]
 }
 
+@test "meta: the awk fallback REPLACES control chars with a space, matching jq/python" {
+  # Regression: the awk fallback used to DELETE control chars (gsub(..., "")),
+  # so an embedded newline rendered "line1line2" — while jq/python replace with
+  # a space, giving "line1 line2". The same session then showed a different
+  # title depending on which extractor was installed. All paths must agree:
+  # control chars become a single space.
+  # Use a real tab byte (0x09) via %b: a control char that stays on ONE physical
+  # line (unlike a literal newline, which would split the JSON record and is a
+  # separate line-oriented limitation of the awk reader). Deletion would yield
+  # "line1line2"; replacement yields "line1 line2".
+  nl="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-nl.jsonl"
+  printf '{"type":"ai-title","aiTitle":"%b"}\n' 'line1\tline2' > "$nl"
+  printf '{"type":"user","cwd":"/Volumes/demo/alpha"}\n' >> "$nl"
+  # Force the awk fallback by shadowing jq/python3 detection.
+  run env CSP_CLAUDE_DIR="$CSP_CLAUDE_DIR" bash -c '
+    command() { if [ "$1" = "-v" ] && { [ "$2" = jq ] || [ "$2" = python3 ]; }; then return 1; fi; builtin command "$@"; }
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
+    csp_session_meta "'"$nl"'"'
+  [ "$(csp_field "$output" 1)" = "line1 line2" ]
+  [ "$(csp_field "$output" 2)" = "/Volumes/demo/alpha" ]
+}
+
 @test "meta: a huge tab-less title is handled quickly (no quadratic freeze)" {
   # Regression test for the quadratic bash-3.2 string split. A ~256KB single
   # title must be clipped by the extractor, so this returns effectively instantly
