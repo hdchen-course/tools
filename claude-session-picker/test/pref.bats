@@ -56,3 +56,59 @@ setup() {
   run csp_choose_backend 0 0 "$(csp_load_backend_pref)"
   [ "$output" = "hub" ]
 }
+
+@test "pref: saving twice OVERWRITES (not appends) so load isn't stale" {
+  csp_save_backend_pref "tmux"
+  csp_save_backend_pref "hub"
+  run csp_load_backend_pref
+  [ "$output" = "hub" ]
+  # The file must contain exactly one line, not two.
+  run wc -l < "$CSP_PREF_FILE"
+  [ "$(printf '%s' "$output" | tr -d ' ')" = "1" ]
+}
+
+@test "pref: a CRLF (hand-edited on Windows) value still loads" {
+  mkdir -p "$(dirname "$CSP_PREF_FILE")"
+  printf 'tmux\r\n' > "$CSP_PREF_FILE"
+  run csp_load_backend_pref
+  [ "$output" = "tmux" ]
+}
+
+@test "pref: a trailing space is tolerated" {
+  mkdir -p "$(dirname "$CSP_PREF_FILE")"
+  printf 'tmux \n' > "$CSP_PREF_FILE"
+  run csp_load_backend_pref
+  [ "$output" = "tmux" ]
+}
+
+@test "pref: an unreadable pref file prints nothing to stderr and yields empty" {
+  mkdir -p "$(dirname "$CSP_PREF_FILE")"
+  printf 'tmux\n' > "$CSP_PREF_FILE"
+  chmod 000 "$CSP_PREF_FILE"
+  # Capture stderr: it must be silent (the redirection-failure leak bug).
+  run bash -c "CSP_PREF_FILE='$CSP_PREF_FILE' CSP_SOURCED_FOR_TEST=1 . '$BATS_TEST_DIRNAME/../bin/claude-session-picker'; csp_load_backend_pref 2>&1 1>/dev/null"
+  chmod 644 "$CSP_PREF_FILE"
+  [ -z "$output" ]        # no 'Permission denied' leaked
+}
+
+@test "precedence: CSP_BACKEND=hub overrides a saved tmux preference" {
+  csp_save_backend_pref "tmux"
+  # Re-source with the env var set; the startup block should pick hub.
+  run bash -c "CSP_BACKEND=hub CSP_PREF_FILE='$CSP_PREF_FILE' CSP_SOURCED_FOR_TEST=1 bash -c '. \"$BATS_TEST_DIRNAME/../bin/claude-session-picker\"; printf %s \"\$CSP_BACKEND_CHOICE\"'"
+  [ "$output" = "hub" ]
+}
+
+@test "toggle: refusing tmux (not available) must NOT persist a tmux preference" {
+  # Simulate a box without tmux by overriding csp_tmux_available to false, and
+  # feed the confirmation prompt's read from /dev/null so it doesn't block.
+  rm -f "$CSP_PREF_FILE"
+  CSP_ACTIVE_BACKEND="hub"
+  csp_tmux_available() { return 1; }
+  # csp_toggle_backend reads from /dev/tty on the refusal path; redirect it.
+  csp_restore_terminal() { :; }   # stub out terminal ops for the test
+  csp_enter_raw_mode() { :; }
+  csp_toggle_backend < /dev/null > /dev/null 2>&1 || true
+  [ "$CSP_ACTIVE_BACKEND" = "hub" ]          # stayed hub
+  [ ! -f "$CSP_PREF_FILE" ] || {             # and did not write tmux
+    run csp_load_backend_pref; [ "$output" != "tmux" ]; }
+}

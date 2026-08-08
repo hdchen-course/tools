@@ -63,9 +63,20 @@ CSP_PREF_FILE="${CSP_PREF_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-session
 # print nothing if there isn't a valid one. Always returns 0: "no preference"
 # is a normal outcome, not an error, so this stays safe to use in a command
 # substitution even under `set -e`.
+#
+# The `read` is wrapped in a { …; } group with the 2>/dev/null on the GROUP, not
+# on the redirection: a failed input redirection (e.g. an unreadable pref file)
+# is reported by the shell itself before the command runs, so a redirect on the
+# command alone wouldn't catch it — grouping does. We also cap the read at a few
+# bytes (bounded input) and strip a trailing CR so a hand-edited CRLF file still
+# loads, since the docs invite editing this path.
 csp_load_backend_pref() {
   local v=""
-  [ -f "$CSP_PREF_FILE" ] && IFS= read -r v < "$CSP_PREF_FILE" 2>/dev/null
+  if [ -f "$CSP_PREF_FILE" ]; then
+    { IFS= read -r -n 16 v < "$CSP_PREF_FILE"; } 2>/dev/null || v=""
+  fi
+  v="${v%$'\r'}"          # tolerate CRLF from a hand-edited file
+  v="${v%% *}"            # tolerate a trailing space/comment
   if csp_backend_is_valid "$v" && [ -n "$v" ]; then
     printf '%s' "$v"
   fi
@@ -74,22 +85,26 @@ csp_load_backend_pref() {
 
 # csp_save_backend_pref VALUE — persist the chosen backend so it sticks next
 # time. Best-effort: if the directory can't be made or written, we just skip it
-# (the choice still applies for this run).
+# (the choice still applies for this run). The write is grouped so a redirection
+# failure to an unwritable path is suppressed too (same reason as the read).
 csp_save_backend_pref() {
   local v="$1" dir
   dir=$(dirname "$CSP_PREF_FILE")
   mkdir -p "$dir" 2>/dev/null || return 0
-  printf '%s\n' "$v" > "$CSP_PREF_FILE" 2>/dev/null || true
+  { printf '%s\n' "$v" > "$CSP_PREF_FILE"; } 2>/dev/null || true
 }
 
 # Decide the starting backend. Precedence:
 #   1. CSP_BACKEND env var, if set and valid (an explicit per-run override)
 #   2. the saved preference from the 't' toggle
 #   3. the default (hub)
-# The env var never gets a warning-then-ignored surprise: validate it first.
+# A bogus CSP_BACKEND is not silently ignored: we stash a note in
+# CSP_STARTUP_NOTICE and show it on the first frame's mode line, because a
+# message printed to stderr here would be wiped by the screen-clear when we
+# enter raw mode.
+CSP_STARTUP_NOTICE=""
 if [ -n "${CSP_BACKEND:-}" ] && ! csp_backend_is_valid "${CSP_BACKEND}"; then
-  printf 'Warning: CSP_BACKEND="%s" is not recognised (use "hub" or "tmux"); ignoring it.\n' \
-    "${CSP_BACKEND}" >&2
+  CSP_STARTUP_NOTICE="CSP_BACKEND=\"${CSP_BACKEND}\" not recognised (use hub/tmux) — ignored"
 fi
 if [ -n "${CSP_BACKEND:-}" ] && csp_backend_is_valid "${CSP_BACKEND}"; then
   CSP_BACKEND_CHOICE="${CSP_BACKEND}"
@@ -411,10 +426,23 @@ csp_draw() {
   csp_rule top "Claude Session Picker"
 
   if [ "$CSP_ACTIVE_BACKEND" = "tmux" ]; then
-    mode_line="mode: tmux ON · sessions run concurrently — switch with Ctrl-b n/p/w  (t: turn off)"
+    # Note it hands off + exits, so "switch with Ctrl-b" isn't mistaken for
+    # something the menu does.
+    mode_line="mode: tmux ON · opens each session in a tmux window (picker exits); switch with Ctrl-b n/p/w  (t: off)"
   else
     mode_line="mode: hub · one session at a time, quit to return here"
-    csp_tmux_available && mode_line="$mode_line  (press t: enable tmux for concurrency)"
+    if csp_tmux_available; then
+      mode_line="$mode_line  (press t: enable tmux for concurrency)"
+    elif [ "$CSP_BACKEND_CHOICE" = "tmux" ]; then
+      # A remembered/forced tmux choice couldn't be honoured on this box.
+      mode_line="$mode_line  — tmux not installed here, using hub"
+    fi
+  fi
+  # A one-shot startup notice (e.g. a bogus CSP_BACKEND) rides the mode line for
+  # the first frame, then clears so it doesn't nag.
+  if [ -n "$CSP_STARTUP_NOTICE" ]; then
+    mode_line="$mode_line   [$CSP_STARTUP_NOTICE]"
+    CSP_STARTUP_NOTICE=""
   fi
   csp_buf_row "$mode_line" 0 "$CSP_C_DIM"
   csp_rule mid
