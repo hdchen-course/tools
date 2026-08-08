@@ -70,13 +70,42 @@ setup() {
 
 # --- csp_marker_for_session --------------------------------------------------
 
-@test "marker: a live session shows the running dot" {
+@test "marker: a live session with no state shows the working dot" {
   run csp_marker_for_session 1
-  [ "$output" = "$CSP_MARKER_LIVE" ]
+  [ "$output" = "$CSP_MARKER_WORKING" ]
 }
 
-@test "marker: a non-live session shows nothing" {
+@test "marker: a non-live session with no state shows nothing" {
   run csp_marker_for_session 0
+  [ "$output" = "$CSP_MARKER_NONE" ]
+}
+
+@test "marker: live + state 'working' shows the working dot" {
+  run csp_marker_for_session 1 working
+  [ "$output" = "$CSP_MARKER_WORKING" ]
+}
+
+@test "marker: live + state 'waiting' shows the attention star" {
+  run csp_marker_for_session 1 waiting
+  [ "$output" = "$CSP_MARKER_ATTENTION" ]
+}
+
+@test "marker: RECONCILER — not live but state 'working' becomes attention" {
+  # The hook said working but the process is gone (crash/kill mid-turn): we must
+  # surface it as needs-attention, not leave a stuck working dot or blank.
+  run csp_marker_for_session 0 working
+  [ "$output" = "$CSP_MARKER_ATTENTION" ]
+}
+
+@test "marker: not live + state 'waiting' shows nothing (idle & seen)" {
+  run csp_marker_for_session 0 waiting
+  [ "$output" = "$CSP_MARKER_NONE" ]
+}
+
+@test "marker: an unknown state falls back to the live/blank rule" {
+  run csp_marker_for_session 1 bogus
+  [ "$output" = "$CSP_MARKER_WORKING" ]
+  run csp_marker_for_session 0 bogus
   [ "$output" = "$CSP_MARKER_NONE" ]
 }
 

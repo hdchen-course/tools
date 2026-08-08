@@ -75,12 +75,17 @@ screen, because it tells you what `Enter` is about to do:
 
 | Part | Meaning |
 |---|---|
-| `>` at the start | the cursor — this is the row `Enter` will open |
-| `●` | a Claude process is running this session **right now** |
-| a blank where `●` would be | nothing is running it; it's a saved session you can resume |
+| `›` at the start | the cursor — this is the row `Enter` will open |
+| `●` (green) | Claude is **working** in this session right now |
+| `✳` (yellow) | Claude **stopped and wants your input**, and you haven't opened it yet |
+| a blank where a marker would be | idle and already seen, or nothing is running it — a saved session you can resume |
 | the title | Claude's own summary of the conversation, or your last prompt if it hasn't made one yet |
 | the project | the last two folders of the directory the session belongs to |
 | the age | how long since that session last did anything (`just now`, `25m ago`, `2h ago`, `3d ago`) |
+
+The `✳` marker only appears if you set up the optional hooks (see
+[Status markers](#status-markers) below); without them you just get `●` for a
+running session. Opening a session clears its `✳`.
 
 **The last line**, `-- 1/42 --`, appears only when you have more sessions than
 fit on screen. It means "the cursor is on session 1 of 42". The list scrolls by
@@ -213,6 +218,46 @@ export CSP_BACKEND=tmux      # in ~/.zshrc or ~/.bashrc
 Asking for `tmux` on a machine that doesn't have `tmux` installed quietly gives
 you `hub` instead — the tool never claims a mode it can't actually deliver, so
 check the header line if you're unsure which one you got.
+
+---
+
+## Status markers
+
+Each session shows one marker:
+
+- **`●` green** — Claude is working there.
+- **`✳` yellow** — Claude stopped and is waiting for you, and you haven't opened
+  it since. Opening it clears the `✳`.
+- **blank** — idle and already seen, or nothing running it.
+
+**Out of the box**, you get `●` for any running session and no `✳`. To unlock
+the full "who's waiting for me?" view, add three little hooks to Claude Code's
+`settings.json` (usually `~/.claude/settings.json`) — the installer prints this
+snippet with the real paths filled in:
+
+```json
+"hooks": {
+  "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": ".../hooks/csp-hook.sh working" } ] } ],
+  "Stop":             [ { "hooks": [ { "type": "command", "command": ".../hooks/csp-hook.sh waiting" } ] } ],
+  "Notification":     [ { "hooks": [ { "type": "command", "command": ".../hooks/csp-hook.sh waiting" } ] } ]
+}
+```
+
+- **`UserPromptSubmit`** fires when you send a prompt → the session is marked
+  working (`●`).
+- **`Stop`** / **`Notification`** fire when Claude finishes or pings you → the
+  session is marked waiting (`✳`).
+
+These hooks only write a tiny file on your machine (under `CSP_STATE_DIR`);
+nothing is sent anywhere.
+
+**The reconciler (why the markers survive crashes).** Hooks don't always fire —
+if Claude crashes or is killed, the "Stop" hook never runs, so a naive marker
+would be stuck on `●` forever. The picker guards against this: when it sees a
+session last marked "working" but no Claude process is actually running it any
+more, it shows `✳` (needs attention) instead. So a died-mid-task session shows
+up as "come look at me", which is exactly what you want on a machine where the
+CLI sometimes crashes.
 
 ---
 

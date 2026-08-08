@@ -48,4 +48,13 @@ fi
 
 say ""
 say "Your Claude sessions under ~/.claude were never modified and remain intact."
+say ""
+say "This tool also kept two small config/state areas of its own. Remove them if"
+say "you like (they hold only your mode choice and the ●/✳ markers, no session"
+say "data):"
+say "  rm -rf \"\${XDG_CONFIG_HOME:-\$HOME/.config}/claude-session-picker\""
+say "  rm -rf \"\${XDG_STATE_HOME:-\$HOME/.local/state}/claude-session-picker\""
+say ""
+say "If you added the picker hooks to ~/.claude/settings.json, remove them by hand"
+say "(this tool never edited that file)."
 say "Uninstalled."

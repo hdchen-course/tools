@@ -16,6 +16,7 @@ setup() {
   . "$BATS_TEST_DIRNAME/../lib/sessions.sh"
 
   export CSP_CLAUDE_DIR="$BATS_TEST_TMPDIR/claude"
+  export CSP_STATE_DIR="$BATS_TEST_TMPDIR/state"
   mkdir -p "$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha"
   mkdir -p "$CSP_CLAUDE_DIR/projects/-Volumes-demo-beta"
 
@@ -285,6 +286,46 @@ EOF
   run csp_delete_session_file "$d"
   [ "$status" -ne 0 ]
   [ -d "$d" ]
+}
+
+@test "state: write then read round-trips working/waiting" {
+  csp_write_state "sess-1" "working"
+  run csp_read_state "sess-1"
+  [ "$output" = "working" ]
+  csp_write_state "sess-1" "waiting"
+  run csp_read_state "sess-1"
+  [ "$output" = "waiting" ]
+}
+
+@test "state: reading an unknown session yields nothing (not an error)" {
+  run csp_read_state "never-seen"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "state: an invalid stored value is ignored" {
+  mkdir -p "$CSP_STATE_DIR"
+  printf 'bogus\n' > "$(csp_state_file "sess-x")"
+  run csp_read_state "sess-x"
+  [ -z "$output" ]
+}
+
+@test "state: clear removes the recorded state" {
+  csp_write_state "sess-2" "waiting"
+  [ -n "$(csp_read_state "sess-2")" ]
+  csp_clear_state "sess-2"
+  run csp_read_state "sess-2"
+  [ -z "$output" ]
+}
+
+@test "state: a session id with odd characters can't escape the state dir" {
+  # The id is sanitised, so a path-traversal-looking id stays inside the dir.
+  csp_write_state "../../etc/evil" "working"
+  # Nothing was created outside the state dir.
+  [ ! -e "$BATS_TEST_TMPDIR/etc/evil" ]
+  # And it reads back correctly from within the state dir.
+  run csp_read_state "../../etc/evil"
+  [ "$output" = "working" ]
 }
 
 @test "missing projects dir is handled without error" {

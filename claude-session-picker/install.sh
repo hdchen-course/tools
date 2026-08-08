@@ -124,3 +124,23 @@ say "Done. Run:  claude-session-picker"
 say ""
 say "Tip: bind it to a shell key for instant access. For zsh, add to ~/.zshrc:"
 say "        bindkey -s '^S' 'claude-session-picker\\n'   # Ctrl-S opens the picker"
+
+# --- Optional: live ●/✳ markers via Claude Code hooks ------------------------
+# We do NOT edit your Claude settings.json (so we can't corrupt it) — we just
+# print the snippet to paste. With the hooks in place, the picker shows ● while
+# Claude is working and ✳ when it has stopped and wants you; without them it
+# falls back to a simple ● for any running session.
+say ""
+say "Optional — live status markers (● working / ✳ needs you):"
+say "Add these hooks to your Claude Code settings.json (usually ~/.claude/settings.json):"
+say ""
+say '  "hooks": {'
+say '    "UserPromptSubmit": [ { "hooks": [ { "type": "command",'
+say "        \"command\": \"$ROOT/hooks/csp-hook.sh working\" } ] } ],"
+say '    "Stop": [ { "hooks": [ { "type": "command",'
+say "        \"command\": \"$ROOT/hooks/csp-hook.sh waiting\" } ] } ],"
+say '    "Notification": [ { "hooks": [ { "type": "command",'
+say "        \"command\": \"$ROOT/hooks/csp-hook.sh waiting\" } ] } ]"
+say '  }'
+say ""
+say "These only write a tiny local state file; nothing is sent anywhere."

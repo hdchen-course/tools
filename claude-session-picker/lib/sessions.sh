@@ -21,10 +21,57 @@
 # Where Claude Code keeps its data. Overridable for tests.
 CSP_CLAUDE_DIR="${CSP_CLAUDE_DIR:-$HOME/.claude}"
 
+# Where we keep per-session state ("working"/"waiting") written by the Claude
+# Code hooks. One tiny file per session id, so sessions never interfere and a
+# deleted session leaves no residue. Overridable for tests.
+CSP_STATE_DIR="${CSP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-session-picker/state}"
+
 # csp_now_epoch — current time in whole seconds. Wrapped in a function so tests
 # can override "now" and get deterministic ages.
 csp_now_epoch() {
   date +%s
+}
+
+# --- Per-session state (for the ●/✳ markers) ---------------------------------
+# csp_state_file ID — the state file path for a session id. The id comes from a
+# real filename (hex + dashes), but we sanitise defensively so a weird value can
+# never write outside the state directory.
+csp_state_file() {
+  local id="$1" safe
+  safe=$(printf '%s' "$id" | tr -c 'A-Za-z0-9._-' '_')
+  printf '%s/%s' "$CSP_STATE_DIR" "$safe"
+}
+
+# csp_read_state ID — print the recorded state ("working"/"waiting") for a
+# session, or nothing if none. Always returns 0 (absence is normal), and reads
+# a bounded amount so a bogus file can't hurt us. Grouped redirect so an
+# unreadable file can't leak an error to the terminal.
+csp_read_state() {
+  local f v=""
+  f=$(csp_state_file "$1")
+  if [ -f "$f" ]; then
+    { IFS= read -r -n 16 v < "$f"; } 2>/dev/null || v=""
+  fi
+  v="${v%$'\r'}"
+  case "$v" in working|waiting) printf '%s' "$v" ;; esac
+  return 0
+}
+
+# csp_write_state ID VALUE — record a session's state (best-effort; if the dir
+# can't be created or written we just skip it, so this never fails a caller).
+csp_write_state() {
+  local id="$1" v="$2" f
+  f=$(csp_state_file "$id")
+  mkdir -p "$CSP_STATE_DIR" 2>/dev/null || return 0
+  { printf '%s\n' "$v" > "$f"; } 2>/dev/null || true
+}
+
+# csp_clear_state ID — forget a session's state (e.g. once you've opened it, so
+# its ✳ "needs attention" marker goes away). Best-effort.
+csp_clear_state() {
+  local f
+  f=$(csp_state_file "$1")
+  rm -f -- "$f" 2>/dev/null || true
 }
 
 # --- JSON value extraction ---------------------------------------------------
@@ -266,16 +313,19 @@ csp_running_session_ids() {
 #     giant argument list (which could blow past the OS ARG_MAX limit with very
 #     many sessions) and paths with spaces stay intact. `-mindepth/-maxdepth 2`
 #     matches the projects/<dir>/<file>.jsonl layout exactly.
-#   • `xargs -0 -r stat` prints "<mtime> <path>" for each file. We must sort by
+#   • `xargs -0 stat` prints "<mtime> <path>" for each file. We must sort by
 #     mtime OURSELVES with a single global `sort -rn`, NOT rely on `ls -t`:
 #     `ls -t` sorts only within each xargs batch, so once the file count exceeds
 #     the xargs batch size the batches would each be sorted but the combined
 #     stream would NOT be globally newest-first, and the cap below would then
 #     drop the wrong files. Sorting centrally fixes that.
-#   • `-r` (skip the command on empty input) stops `stat`/`ls` from running with
-#     no arguments — which on GNU would otherwise list the current directory and
-#     inject bogus paths — so an existing-but-empty store yields nothing. `-r`
-#     is the GNU fix and is also accepted by modern BSD/macOS xargs.
+#   • Empty store: with no matching files, `find` emits nothing. BSD/macOS xargs
+#     then skips the command entirely; GNU xargs runs `stat` once with no args,
+#     which just errors to stderr (suppressed) and prints nothing to stdout — so
+#     either way an empty store yields no rows. (We deliberately do NOT pass
+#     `xargs -r`: it's a GNU-ism that older macOS xargs rejects outright, and
+#     because we use `stat` rather than `ls` there's no current-directory leak
+#     to guard against in the first place.)
 #   • `stat` differs across platforms, so we try BSD (`-f '%m %N'`) then GNU
 #     (`-c '%Y %n'`); the winner is chosen once per call.
 #   • `cut -d' ' -f2-` strips only the leading "<mtime> " field, so a path that
@@ -294,13 +344,13 @@ csp_list_session_files() {
 
   if [ "$statfmt" = "bsd" ]; then
     find "$dir" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' -print0 2>/dev/null \
-      | xargs -0 -r stat -f '%m %N' 2>/dev/null \
+      | xargs -0 stat -f '%m %N' 2>/dev/null \
       | sort -rn -k1,1 \
       | cut -d' ' -f2- \
       | head -n "$CSP_MAX_SESSIONS"
   else
     find "$dir" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' -print0 2>/dev/null \
-      | xargs -0 -r stat -c '%Y %n' 2>/dev/null \
+      | xargs -0 stat -c '%Y %n' 2>/dev/null \
       | sort -rn -k1,1 \
       | cut -d' ' -f2- \
       | head -n "$CSP_MAX_SESSIONS"

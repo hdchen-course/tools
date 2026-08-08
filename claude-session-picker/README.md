@@ -8,7 +8,8 @@ dozens of them across different projects, and the usual way to "not lose" one is
 to keep its terminal tab open forever. This tool reads Claude's own session
 files and shows them all in one menu — newest first, with a title, the project
 it belongs to, and how long ago it was active — so any session is one keypress
-away. A `●` marks the sessions that have a live Claude running right now.
+away. A `●` marks a session Claude is working in; a `✳` marks one that has
+stopped and wants your input (see [Status markers](#status-markers)).
 
 ```
 Claude Session Picker   ● = running    mode: hub (one at a time)
@@ -164,6 +165,39 @@ terminal are drawn, the highlighted row is always kept in view, and a
 | `CSP_TMUX_SESSION` | `claude-sessions` | name of the tmux session that holds the windows |
 | `CSP_CLAUDE_DIR` | `~/.claude` | where to look for Claude's data (used by the tests) |
 | `CSP_PREF_FILE` | `~/.config/claude-session-picker/backend` | where the `t` toggle saves your mode choice |
+| `CSP_STATE_DIR` | `~/.local/state/claude-session-picker/state` | where the hooks record each session's ●/✳ state |
+
+## Status markers
+
+Next to each session:
+
+| Marker | Meaning |
+|:------:|---------|
+| `●` (green) | Claude is **working** in this session |
+| `✳` (yellow) | Claude has **stopped and wants your input** — and you haven't opened it yet |
+| *(blank)* | idle and already seen, or no live Claude |
+
+Opening a session clears its `✳` (you've now looked at it).
+
+**Without any setup**, `●` simply means "a Claude process is running this
+session" and there's no `✳` — it still works, just with less detail. To get the
+full ●/✳ distinction, register two tiny **hooks** in your Claude Code
+`settings.json` (the installer prints the exact snippet with your paths):
+
+```json
+"hooks": {
+  "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": ".../hooks/csp-hook.sh working" } ] } ],
+  "Stop":             [ { "hooks": [ { "type": "command", "command": ".../hooks/csp-hook.sh waiting" } ] } ],
+  "Notification":     [ { "hooks": [ { "type": "command", "command": ".../hooks/csp-hook.sh waiting" } ] } ]
+}
+```
+
+The hooks write a tiny local state file per session — **nothing is sent
+anywhere**. And because hooks don't always fire (a crashed or killed Claude
+never sends "Stop"), the picker includes a **reconciler**: if a session was last
+marked "working" but no Claude process is running it any more, it's shown as `✳`
+(needs attention) instead of a stuck `●`. That's what keeps the markers honest
+even when Claude dies unexpectedly.
 
 ## Uninstall
 

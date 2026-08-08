@@ -25,11 +25,13 @@
 #      when a session's title or prompt is enormous.
 # =============================================================================
 
-# A live session (a `claude` process is running for it right now) is marked so
-# you can tell at a glance what is still active. No color is used on purpose, so
-# it looks the same in every terminal theme.
-CSP_MARKER_LIVE="●"    # A claude process is running this session right now.
-CSP_MARKER_NONE=" "    # No live process; this is a resumable past session.
+# Markers shown next to each session so you can tell its state at a glance.
+# (Colour is added by the drawing layer, not baked in here.)
+CSP_MARKER_WORKING="●"    # Claude is actively working in this session.
+CSP_MARKER_ATTENTION="✳"  # Claude finished / wants your input — you haven't looked.
+CSP_MARKER_NONE=" "       # Idle-and-seen, or no live Claude here.
+# Back-compat alias: some code/tests still refer to the old "live" name.
+CSP_MARKER_LIVE="$CSP_MARKER_WORKING"
 
 # Hard upper bounds. These exist so a broken or hostile input can never make the
 # tool loop forever or build an unbounded string.
@@ -100,19 +102,44 @@ csp_backend_is_valid() {
 }
 
 # -----------------------------------------------------------------------------
-# csp_marker_for_session IS_LIVE
+# csp_marker_for_session IS_LIVE [STATE]
 #
-# Decide which marker a session row should show.
+# Decide which marker a session row should show. Pure, so the rule is
+# unit-tested and obvious to a reader.
+#
 #   IS_LIVE  "1" if a claude process is currently running this session, else "0"
+#   STATE    optional per-session state from the Claude Code hooks:
+#              "working"  → Claude is generating / running a tool
+#              "waiting"  → Claude stopped and wants your input (unseen)
+#              ""/other   → unknown (no hooks installed, or nothing recorded)
 #
-# Kept trivial and pure so the rule is unit-tested and obvious to a reader.
+# The rule, with the reconciler baked in (this is the crash-resilient part):
+#   • A live process + state "waiting"  → ✳  (finished, wants you)
+#   • A live process + state "working"/unknown → ●  (busy)
+#   • NOT live but state says "working" → ✳  (the reconciler: the hook said
+#       "working" but the process is gone, so Claude was killed/crashed
+#       mid-turn; surface it as "needs attention" rather than a stuck ●)
+#   • NOT live, anything else           → blank (idle & seen, or no Claude)
+#
+# Falling back to IS_LIVE alone when STATE is empty means a user who hasn't set
+# up the hooks still gets the original ●/blank behaviour with no surprises.
 # -----------------------------------------------------------------------------
 csp_marker_for_session() {
-  local is_live="$1"
+  local is_live="$1" state="${2:-}"
   if [ "$is_live" = "1" ]; then
-    printf '%s' "$CSP_MARKER_LIVE"
+    if [ "$state" = "waiting" ]; then
+      printf '%s' "$CSP_MARKER_ATTENTION"
+    else
+      printf '%s' "$CSP_MARKER_WORKING"
+    fi
   else
-    printf '%s' "$CSP_MARKER_NONE"
+    # Not live. If the hook last said "working", the process vanished without a
+    # clean stop — treat that as needs-attention (reconciler).
+    if [ "$state" = "working" ]; then
+      printf '%s' "$CSP_MARKER_ATTENTION"
+    else
+      printf '%s' "$CSP_MARKER_NONE"
+    fi
   fi
 }
 

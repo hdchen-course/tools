@@ -128,12 +128,13 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ -z "${CSP_NO_COLOR:-}" ]; then
   CSP_C_TITLE=$'\033[1;38;5;39m'  # bold blue for the app title
   CSP_C_HEADER=$'\033[38;5;250m'  # column headings
   CSP_C_SEL=$'\033[7m'            # reverse video for the selected row
-  CSP_C_LIVE=$'\033[38;5;42m'     # green for the ● running marker
+  CSP_C_LIVE=$'\033[38;5;42m'     # green for the ● working marker
+  CSP_C_ATTN=$'\033[1;38;5;220m'  # bold yellow for the ✳ needs-attention marker
   CSP_C_DIM=$'\033[38;5;244m'     # dim for ages / hints
   CSP_C_KEY=$'\033[1;38;5;250m'   # bold for key names in the status bar
 else
   CSP_C_RESET=""; CSP_C_FRAME=""; CSP_C_TITLE=""; CSP_C_HEADER=""
-  CSP_C_SEL=""; CSP_C_LIVE=""; CSP_C_DIM=""; CSP_C_KEY=""
+  CSP_C_SEL=""; CSP_C_LIVE=""; CSP_C_ATTN=""; CSP_C_DIM=""; CSP_C_KEY=""
 fi
 
 # Box-drawing characters (Unicode). These render the frame.
@@ -270,6 +271,7 @@ csp_fullprojects=()   # full cwd path, kept for the resume `cd`
 csp_files=()          # on-disk .jsonl path, kept for delete
 csp_ages=()
 csp_lives=()
+csp_states=()         # per-session hook state: working/waiting/"" (for ●/✳)
 csp_count=0
 
 # csp_load_sessions — build the model from Claude's session store. Enforces the
@@ -277,7 +279,7 @@ csp_count=0
 csp_load_sessions() {
   local file id meta title fullcwd project mtime now running is_live
   csp_ids=(); csp_titles=(); csp_projects=(); csp_fullprojects=()
-  csp_ages=(); csp_lives=(); csp_files=()
+  csp_ages=(); csp_lives=(); csp_files=(); csp_states=()
   csp_count=0
   now=$(csp_now_epoch)
   running=$(csp_running_session_ids)
@@ -299,6 +301,9 @@ csp_load_sessions() {
     csp_projects[$csp_count]="$project"
     csp_ages[$csp_count]="$(csp_humanize_age "$((now - mtime))")"
     csp_lives[$csp_count]="$is_live"
+    # Per-session hook state (working/waiting) for the ●/✳ marker; empty if the
+    # hooks aren't installed, in which case the marker falls back to live/blank.
+    csp_states[$csp_count]="$(csp_read_state "$id")"
     # Remember the full project path alongside the id, for the resume `cd`.
     csp_fullprojects[$csp_count]="$fullcwd"
     # Remember the on-disk file so we can delete the session if asked.
@@ -402,7 +407,13 @@ csp_buf_row() {
     csp_buf_line "${style} $(csp_truncate_display "$content" "$CSP_INNER")${CSP_C_RESET}"
   else
     content=$(csp_truncate_display "$content" "$CSP_INNER")
-    [ -n "$CSP_C_LIVE" ] && content="${content/$CSP_MARKER_LIVE/${CSP_C_LIVE}${CSP_MARKER_LIVE}${CSP_C_RESET}}"
+    # Tint the markers after truncation (width already fixed, so recolouring a
+    # single glyph is layout-safe): ✳ yellow for "needs attention", ● green for
+    # "working". Only the first matching marker on the row is coloured.
+    if [ -n "$CSP_C_ATTN" ]; then
+      content="${content/$CSP_MARKER_ATTENTION/${CSP_C_ATTN}${CSP_MARKER_ATTENTION}${CSP_C_RESET}}"
+    fi
+    [ -n "$CSP_C_LIVE" ] && content="${content/$CSP_MARKER_WORKING/${CSP_C_LIVE}${CSP_MARKER_WORKING}${CSP_C_RESET}}"
     csp_buf_line " ${content}"
   fi
 }
@@ -466,7 +477,7 @@ csp_draw() {
 
   i="$start"
   while [ "$i" -lt "$last" ]; do
-    marker=$(csp_marker_for_session "${csp_lives[$i]}")
+    marker=$(csp_marker_for_session "${csp_lives[$i]}" "${csp_states[$i]}")
     row=$(csp_format_line "$marker" "${csp_titles[$i]}" "${csp_projects[$i]}" \
       "${csp_ages[$i]}" "$([ "$i" -eq "$selected" ] && echo 1 || echo 0)")
     is_sel=0; [ "$i" -eq "$selected" ] && is_sel=1
@@ -628,6 +639,9 @@ csp_main() {
          if [ "$csp_count" -gt 0 ]; then
            # A tmux window name can't contain much; use the short project path.
            label="${csp_projects[$selected]}"
+           # Opening a session means you've now looked at it, so clear any
+           # "needs attention" (✳) state for it before handing off.
+           csp_clear_state "${csp_ids[$selected]}"
            csp_open "${csp_ids[$selected]}" "${csp_fullprojects[$selected]}" "$label"
          fi ;;
       n) # Start a brand-new session (in the current directory).
