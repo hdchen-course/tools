@@ -641,6 +641,33 @@ _delete_guard() {  # $1 = id
   [ "$output" = "SURVIVED" ]
 }
 
+@test "delete-action: a REAL tagged tmux window blocks the unlink (no stubbed guard)" {
+  # Integration counterpart to the stubbed test above: exercise the ACTUAL
+  # csp_delete_would_hit_live wiring (via csp_tmux_window_for_sid) — a real tmux
+  # window tagged @csp_sid=<id> must stop csp_action_delete from unlinking, so a
+  # broken session-id/window wiring would be caught here.
+  command -v tmux >/dev/null 2>&1 || skip "tmux not installed"
+  mkdir -p "$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha"
+  keep="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-live.jsonl"
+  printf '%s\n' '{"type":"ai-title","aiTitle":"live one"}' > "$keep"
+  sock="csp-delwin-$$"; sess="csptest"
+  tmux -L "$sock" new-session -d -s "$sess" -n work "sleep 30"
+  tmux -L "$sock" set-option -w -t "=$sess:work" '@csp_sid' "id-live"
+  run env CSP_SOURCED_FOR_TEST=1 CSP_CLAUDE_DIR="$CSP_CLAUDE_DIR" CSP_STATE_DIR="$CSP_STATE_DIR" \
+       CSP_TMUX_SOCKET="$sock" CSP_TMUX_SESSION="$sess" CSP_TTY=/dev/null bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../bin/claude-session-picker"
+    csp_count=1; csp_ids=(id-live); csp_titles=("live one")
+    csp_files=("'"$keep"'"); csp_view=(0); csp_view_count=1
+    # Confirm yes (so only the REAL liveness guard can stop it); terminal no-ops.
+    csp_confirm() { return 0; }
+    csp_restore_terminal() { :; }; csp_enter_raw_mode() { :; }
+    csp_pause_notice() { :; }; csp_load_sessions() { :; }; csp_tty_print() { :; }; csp_tty_readline() { :; }
+    csp_action_delete 0
+    [ -f "'"$keep"'" ] && echo SURVIVED || echo DELETED'
+  tmux -L "$sock" kill-server 2>/dev/null || true
+  [ "$output" = "SURVIVED" ]
+}
+
 @test "state: an invalid stored value is ignored" {
   mkdir -p "$CSP_STATE_DIR"
   printf 'bogus\n' > "$(csp_state_file "sess-x")"

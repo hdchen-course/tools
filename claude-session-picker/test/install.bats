@@ -142,3 +142,26 @@ _load_hook_helpers() {
   case "$output" in "'/tmp/a"*) ok=1 ;; *) ok=0 ;; esac
   [ "$ok" = "1" ]
 }
+
+@test "install: EVERY control byte 0x01-0x1F escapes to valid, round-tripping JSON" {
+  # Guard the generic \u00XX branch (not just \n/\t): for each control byte, build
+  # {"command":"…"} and confirm python parses it AND the decoded value contains
+  # that exact byte (i.e. we escaped it, didn't drop or mangle it). NUL is skipped
+  # — a shell variable / POSIX path cannot contain it.
+  command -v python3 >/dev/null 2>&1 || skip "python3 not available to validate JSON"
+  _load_hook_helpers
+  local b
+  for b in $(seq 1 31); do
+    # Build ROOT = "/tmp/a<byte>b" with the raw control byte via printf %b octal.
+    local oct; oct=$(printf '%03o' "$b")
+    ROOT="$(printf "/tmp/a\\${oct}b")"
+    out=$(csp_hook_command working)
+    printf '{"command":"%s"}\n' "$out" > "$BATS_TEST_TMPDIR/cb.json"
+    run python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))          # raises if invalid JSON
+want=chr(int(sys.argv[2]))
+sys.exit(0 if want in d["command"] else 1)' "$BATS_TEST_TMPDIR/cb.json" "$b"
+    [ "$status" -eq 0 ] || { echo "byte 0x$(printf '%02x' "$b") failed JSON round-trip"; false; }
+  done
+}

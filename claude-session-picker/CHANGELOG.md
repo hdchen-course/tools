@@ -114,8 +114,13 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   filter matching, a narrow-frame badge+filter overflow guard, and orphaned-menu
   recovery, plus a status-bar right-block boundary (CSP_INNER-exact) case, an
   open-tmux-window delete guard, a delete confirm-race action test, installer
-  control-char JSON validity, and an unrelated-tmux hook-isolation test. Test
-  suite grew to 211.
+  control-char JSON validity, and an unrelated-tmux hook-isolation test.
+- tmux ownership is proven by a server-global `@csp_owner` marker, not just the
+  socket name — so a user's unrelated tmux whose socket happens to share the
+  basename (a different path) is never mistaken for the picker's, and the hook
+  never tags a window in it. Added same-basename-different-path and
+  real-tagged-window regression tests, plus a parameterized 0x01–0x1F JSON
+  round-trip. Test suite grew to 215.
 - New pure, unit-tested helpers in `lib/core.sh`: `csp_filter_indices`,
   `csp_next_attention`, `csp_count_attention`. A shared `csp_prompt_line` now
   backs both the delete confirmation and the filter query (one home for the

@@ -104,9 +104,11 @@ csp_state_count() {
   sock="csp-hooktag-$$"
   sd="$BATS_TEST_TMPDIR/hooktag-state"; mkdir -p "$sd"
   # The window runs an interactive shell (so $TMUX is set) and we export
-  # CSP_TMUX_SOCKET to THIS socket, so csp_inside_tmux sees it as OUR tmux and the
-  # hook tags the window. A flag file marks completion.
+  # CSP_TMUX_SOCKET to THIS socket. We also stamp the @csp_owner marker (as
+  # csp_tmux_configure_home would), so csp_inside_tmux recognises it as OUR tmux
+  # and the hook tags the window. A flag file marks completion.
   tmux -L "$sock" new-session -d -s s -n w
+  tmux -L "$sock" set-option -g @csp_owner "claude-session-picker"
   sleep 0.5
   tmux -L "$sock" send-keys -t "=s:w" \
     "export CSP_TMUX_SOCKET='$sock' CSP_STATE_DIR='$sd'; printf '{\"session_id\":\"tag-me-77\"}' | '$HOOK' working; echo done > '$sd/flag'" Enter
@@ -117,16 +119,20 @@ csp_state_count() {
   [ "$ok" = "1" ]
 }
 
-@test "hook: inside an UNRELATED tmux, does NOT tag the window (no pollution)" {
+@test "hook: inside an UNRELATED tmux (same socket name, NO marker), does NOT tag (no pollution)" {
   command -v tmux >/dev/null 2>&1 || skip "tmux not installed"
-  # The user's own tmux: its socket name is NOT our CSP_TMUX_SOCKET, so
-  # csp_inside_tmux is false and the hook must leave the window's options alone.
+  # The strongest pollution case the review caught: the user's own tmux happens
+  # to use a socket whose NAME equals our CSP_TMUX_SOCKET, but it's a different
+  # server that never got our @csp_owner marker. csp_inside_tmux must still say
+  # "not ours" (marker absent), so the hook leaves the window's options alone.
   sock="csp-foreign-$$"
   sd="$BATS_TEST_TMPDIR/foreign-state"; mkdir -p "$sd"
-  tmux -L "$sock" new-session -d -s s -n w
+  tmux -L "$sock" new-session -d -s s -n w      # NOTE: no @csp_owner set here
   sleep 0.5
+  # Export CSP_TMUX_SOCKET equal to THIS socket's name → name check passes, but
+  # the marker check fails, so it must NOT be treated as ours.
   tmux -L "$sock" send-keys -t "=s:w" \
-    "export CSP_TMUX_SOCKET='claude-sessions' CSP_STATE_DIR='$sd'; printf '{\"session_id\":\"nope-99\"}' | '$HOOK' working; echo done > '$sd/flag'" Enter
+    "export CSP_TMUX_SOCKET='$sock' CSP_STATE_DIR='$sd'; printf '{\"session_id\":\"nope-99\"}' | '$HOOK' working; echo done > '$sd/flag'" Enter
   local i; for i in $(seq 1 40); do [ -f "$sd/flag" ] && break; sleep 0.25; done
   # State IS still recorded (that part is socket-independent) — read from the
   # same dir the hook wrote to.

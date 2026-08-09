@@ -147,23 +147,40 @@ make_home() {
   [ "$output" = "session" ]
 }
 
-@test "inside-tmux detection keys off OUR socket, not any tmux" {
-  # A TMUX pointing at a DIFFERENT socket must NOT count as inside our tmux
-  # (so launching from the user's own tmux still re-execs into ours).
-  TMUX="/private/tmp/someone-elses,123,0" run csp_inside_tmux
-  [ "$status" -ne 0 ]
-  TMUX="/private/tmp/$CSP_TMUX_SOCKET,123,0" run csp_inside_tmux
+@test "inside-tmux: OUR configured server (has the @csp_owner marker) is recognised" {
+  make_home    # creates the holding session AND runs csp_tmux_configure_home (sets @csp_owner)
+  # $TMUX points at our real socket path; the server carries the marker, so
+  # csp_inside_tmux (which queries the ambient server) returns true.
+  sockpath=$(command tmux -L "$CSP_TMUX_SOCKET" display-message -p '#{socket_path}' 2>/dev/null)
+  [ -n "$sockpath" ]
+  TMUX="$sockpath,1,0" run csp_inside_tmux
   [ "$status" -eq 0 ]
 }
 
+@test "inside-tmux: a DIFFERENT socket is not ours (re-exec into our own)" {
+  make_home
+  TMUX="/private/tmp/someone-elses,123,0" run csp_inside_tmux
+  [ "$status" -ne 0 ]
+}
+
+@test "inside-tmux: a same-BASENAME socket at a different path is NOT ours (marker check)" {
+  # The regression the review caught: a user's unrelated tmux whose socket has
+  # the same basename ("claude-sessions") but a different path must NOT be
+  # treated as ours — because it lacks our @csp_owner marker. A basename-only
+  # check would wrongly accept it (and the hook would then tag its window).
+  make_home    # our server exists with the marker, at ITS real path
+  # A fake TMUX with the same basename but a bogus/foreign path: the ambient
+  # server it names either doesn't exist or isn't ours → no marker → not ours.
+  TMUX="/tmp/some-other-place/$CSP_TMUX_SOCKET,1,0" run csp_inside_tmux
+  [ "$status" -ne 0 ]
+}
+
 @test "inside-tmux: a socket whose name merely EXTENDS ours is not a match (bug 6)" {
-  # Exact basename compare: 'claude-sessions' must not match 'claude-sessions-x'
-  # nor a directory that ends in the name.
+  # Exact basename compare still holds: 'claude-sessions' must not match
+  # 'claude-sessions-extra' (fails the name check before the marker check).
   CSP_TMUX_SOCKET="claude-sessions"
   TMUX="/private/tmp/claude-sessions-extra,1,0" run csp_inside_tmux
   [ "$status" -ne 0 ]
-  TMUX="/tmp/evil/claude-sessions,1,0" run csp_inside_tmux
-  [ "$status" -eq 0 ]     # basename IS exactly our socket → correctly inside
 }
 
 @test "label: a project name ending in ';' does not break new-window (bug 3)" {
@@ -248,11 +265,15 @@ make_home() {
     printf "%s" "$CSP_TMUX_SOCKET"' > "$BATS_TEST_TMPDIR/sock"
   run cat "$BATS_TEST_TMPDIR/sock"
   [ "$output" = "abcd" ]
-  # And the sanitized socket now round-trips through inside-tmux detection.
-  CSP_TMUX_SOCKET=abcd TMUX="/private/tmp/tmux-0/abcd,1,0" bash -c '
+  # And csp_inside_tmux parses the sanitized socket basename without breaking
+  # (no crash / no error) — it returns non-zero here because there's no real
+  # server carrying our @csp_owner marker, which is the correct "not ours"
+  # answer for a synthetic $TMUX.
+  run env CSP_TMUX_SOCKET=abcd TMUX="/private/tmp/tmux-0/abcd,1,0" bash -c '
     . '"$BATS_TEST_DIRNAME"'/../lib/core.sh
     . '"$BATS_TEST_DIRNAME"'/../lib/backend.sh
     csp_inside_tmux'
+  [ "$status" -ne 0 ]
 }
 
 @test "socket name: empty after stripping falls back to the default" {

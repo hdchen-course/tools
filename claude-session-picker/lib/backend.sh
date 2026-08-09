@@ -67,20 +67,31 @@ csp_tmux_available() {
   command -v tmux >/dev/null 2>&1
 }
 
-# csp_inside_tmux — returns 0 if we are currently running inside OUR tmux (the
-# dedicated socket). We check that TMUX points at our socket specifically, not
-# just that some tmux is present, so launching the picker from inside the user's
-# UNRELATED tmux still re-execs into our own socket rather than piggy-backing on
-# theirs. TMUX is "<socket-path>,<pid>,<session>"; the socket file's BASENAME is
-# our socket name. We compare that basename EXACTLY (not a substring) so
-# "claude-sessions" doesn't spuriously match "claude-sessions-extra" or a
-# directory that merely ends in the name.
+# A fixed identity token stamped on our tmux server (see csp_tmux_configure_home)
+# and verified by csp_inside_tmux. Any constant works — it just has to be one a
+# user's unrelated tmux would not have set as @csp_owner.
+CSP_TMUX_OWNER_TOKEN="claude-session-picker"
+
+# csp_inside_tmux — returns 0 if we are currently running inside OUR tmux server
+# (the dedicated one the picker created), not just any tmux. Two checks:
+#   1. the $TMUX socket path's BASENAME equals our socket name (cheap, and
+#      compared EXACTLY so "claude-sessions" != "claude-sessions-extra"); AND
+#   2. the current server carries our @csp_owner marker (set on our server only).
+# Check 2 is what distinguishes our server from a user's UNRELATED tmux that
+# happens to use a same-basename socket at a DIFFERENT path
+# (e.g. /other/path/claude-sessions) — the basename matches but the marker is
+# absent, so we correctly report "not ours" and never tag/steal that window.
+# The marker query uses the ambient $TMUX (no -L/-t), so it asks the very server
+# we're inside. If tmux isn't runnable the query fails → treated as not-ours.
 csp_inside_tmux() {
-  local t="${TMUX:-}" path base
+  local t="${TMUX:-}" path base owner
   [ -n "$t" ] || return 1
   path="${t%%,*}"          # the socket path (before the first comma)
   base="${path##*/}"       # its basename
-  [ "$base" = "$CSP_TMUX_SOCKET" ]
+  [ "$base" = "$CSP_TMUX_SOCKET" ] || return 1
+  # show-options -v prints just the value; empty/absent (or tmux error) → not ours.
+  owner=$(command tmux show-options -gv @csp_owner 2>/dev/null) || return 1
+  [ "$owner" = "$CSP_TMUX_OWNER_TOKEN" ]
 }
 
 # =============================================================================
@@ -142,6 +153,15 @@ csp_tmux_sanitize_label() {
 # window-status-format is a per-window option a session-scoped set can't reach —
 # yet they live only on this socket and vanish when it does. All best-effort.
 csp_tmux_configure_home() {
+  # Ownership marker: stamp a server-global @csp_owner option so we can later
+  # prove a tmux server is OURS by more than its socket name. csp_inside_tmux
+  # checks this marker (via the ambient $TMUX) in addition to the basename, so a
+  # user's UNRELATED tmux that merely happens to have a same-basename socket at a
+  # different path (e.g. /other/path/claude-sessions) is NOT mistaken for ours —
+  # and the hook therefore never tags a window in it. Set on our dedicated socket
+  # only, so it can't leak to the user's server.
+  csp_tmux set-option -g @csp_owner "$CSP_TMUX_OWNER_TOKEN" 2>/dev/null
+
   # Window numbering: force base 0 and keep it gapless, so "window 0 = menu" and
   # "Ctrl-b <n> = the nth session" are always true regardless of the user's own
   # base-index, and numbers don't go stale after a session is closed.
