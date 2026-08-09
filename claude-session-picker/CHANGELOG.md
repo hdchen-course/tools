@@ -36,6 +36,11 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   input history. tmux defaults to `mouse off`, which turns the wheel into arrow
   keys sent to the program; the picker now sets `mouse on` on its own dedicated
   socket (your `~/.tmux.conf` is untouched).
+- **Status bar never wraps the frame.** Spacing now uses display width (columns)
+  throughout — a character count under-measured a CJK filter query (1 char = 2
+  columns) and could push the bar past the frame; the shown query is bounded to
+  20 columns; and the key hints degrade to a compact set (or drop out) when the
+  attention badge and position need the room, so the bar fits at any width.
 
 ### Engineering
 - Added a `shellcheck` gate to `test/run-all.sh` (runs if installed, skips
@@ -45,8 +50,8 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   `csp_next_attention`, `csp_count_attention`. A shared `csp_prompt_line` now
   backs both the delete confirmation and the filter query (one home for the
   raw↔cooked terminal transition). New `test/render.bats` gives the draw layer
-  its first coverage (legend fits the frame, filter status bar, no-match hint).
-  Test suite grew to 187.
+  its first coverage (legend fits the frame, status bar never overflows at any
+  width incl. CJK filters, no-match hint). Test suite grew to 189.
 
 ## 1.1.1
 

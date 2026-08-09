@@ -635,8 +635,10 @@ CSP_CHROME_MID=""       # middle rule line
 CSP_CHROME_BOT=""       # bottom rule line
 CSP_CHROME_HEADER=""    # column-heading row (styled), ready for csp_buf_line
 CSP_CHROME_VISIBLE=1    # how many session rows fit
-CSP_CHROME_KEYS=""      # coloured key-hints string for the status bar
-CSP_CHROME_KEYS_W=0     # display width of the PLAIN key-hints text (for spacing)
+CSP_CHROME_KEYS=""      # coloured FULL key-hints string for the status bar
+CSP_CHROME_KEYS_W=0     # display width of the PLAIN full key-hints (for spacing)
+CSP_CHROME_KEYS_C=""    # coloured COMPACT key-hints (used when full won't fit)
+CSP_CHROME_KEYS_C_W=0   # display width of the PLAIN compact key-hints
 CSP_CHROME_LEGEND=""    # coloured, width-fitted marker legend (+ first-run hint)
 CSP_CHROME_HAVE_STATE="" # CSP_HAVE_STATE the legend was built for (cache key)
 
@@ -669,9 +671,17 @@ csp_build_chrome() {
   CSP_CHROME_HEADER="${CSP_C_HEADER} ${h}${CSP_C_RESET}"
 
   # Status-bar key hints (coloured) + the plain text's width for spacing math.
+  # We cache TWO variants — full and compact — and csp_draw picks whichever fits
+  # once the dynamic right-hand info (attention badge + position) is accounted
+  # for. This is what keeps the bar from wrapping the frame on a narrow terminal
+  # or when the badge is present (the full hints alone are ~66 columns).
   keys_plain="j/k move   / filter   Enter open   n new   d del   t tmux   q quit"
   CSP_CHROME_KEYS_W=$(csp_display_width "$keys_plain")
   CSP_CHROME_KEYS="${CSP_C_KEY}j/k${CSP_C_RESET}${CSP_C_DIM} move   ${CSP_C_KEY}/${CSP_C_RESET}${CSP_C_DIM} filter   ${CSP_C_KEY}Enter${CSP_C_RESET}${CSP_C_DIM} open   ${CSP_C_KEY}n${CSP_C_RESET}${CSP_C_DIM} new   ${CSP_C_KEY}d${CSP_C_RESET}${CSP_C_DIM} del   ${CSP_C_KEY}t${CSP_C_RESET}${CSP_C_DIM} tmux   ${CSP_C_KEY}q${CSP_C_RESET}${CSP_C_DIM} quit${CSP_C_RESET}"
+  # Compact fallback: the essentials only (~30 columns).
+  local keys_c_plain="j/k · / filter · Enter · q quit"
+  CSP_CHROME_KEYS_C_W=$(csp_display_width "$keys_c_plain")
+  CSP_CHROME_KEYS_C="${CSP_C_KEY}j/k${CSP_C_RESET}${CSP_C_DIM} · ${CSP_C_KEY}/${CSP_C_RESET}${CSP_C_DIM} filter · ${CSP_C_KEY}Enter${CSP_C_RESET}${CSP_C_DIM} · ${CSP_C_KEY}q${CSP_C_RESET}${CSP_C_DIM} quit${CSP_C_RESET}"
 
   # Marker legend (+ optional first-run hint), width-FITTED here so it can never
   # overflow the frame and wrap — which on a narrow/80-col terminal would push
@@ -795,32 +805,46 @@ csp_draw() {
   done
 
   csp_buf_line "$CSP_CHROME_MID"
-  # Status bar: cached key hints on the left (CSP_CHROME_KEYS, with its cached
-  # left-pad width CSP_CHROME_KEYS_W) + the position indicator on the right.
-  # Only the position changes per keypress, so we compute just its short pad
-  # here (no forks): total inner width - keys width - position width.
-  # Position counts within the VISIBLE view; when a filter is active we show it
-  # and the visible/total split so it's clear the list is narrowed.
-  local pos_plain
+  # Status bar: key hints on the left + a dynamic right-hand block (attention
+  # badge, then the position/filter indicator). The RIGHT block has priority —
+  # it carries the live count and the active filter — so we size it first, then
+  # give the LEFT hints whatever room remains: the full hints if they fit, else
+  # the compact set, else nothing. All spacing uses DISPLAY WIDTH (columns), the
+  # same measure as the cached key widths — a character count (${#}) would
+  # under-measure a CJK filter query (1 char = 2 columns) and wrap the frame.
+  #
+  # Position counts within the VISIBLE view; with a filter active we show the
+  # (column-bounded) query and the visible/total split so the narrowing is clear.
+  local pos_plain pos_col
   if [ -n "$CSP_FILTER" ]; then
-    pos_plain="/$CSP_FILTER  $((selected + 1))/${csp_view_count} of ${csp_count}"
+    local shown_filter
+    shown_filter=$(csp_truncate_display "$CSP_FILTER" 20)   # bound wide/long queries
+    pos_plain="/$shown_filter  $((selected + 1))/${csp_view_count} of ${csp_count}"
   else
     pos_plain="$((selected + 1))/${csp_count}"
   fi
-  # When any sessions need you, prefix the position with a "N✳" urgency badge and
-  # a hint that '*' jumps to them — so a ✳ buried far down the recency-sorted list
-  # is still discoverable. The badge's plain width is measured for the spacing
-  # math (the ✳ glyph is 1 column); the coloured form is built separately.
-  local badge_plain="" badge=""
+  pos_col=$(csp_display_width "$pos_plain")
+  # Attention badge ("N✳ *:jump") — the coloured form is separate from the plain
+  # form used for width. Pure ASCII+one 1-column glyph, so its width is known.
+  local badge="" badge_col=0
   if [ "$CSP_ATTENTION_COUNT" -gt 0 ]; then
-    badge_plain="${CSP_ATTENTION_COUNT}${CSP_MARKER_ATTENTION} *:jump   "
+    badge_col=$(csp_display_width "${CSP_ATTENTION_COUNT}${CSP_MARKER_ATTENTION} *:jump   ")
     badge="${CSP_C_ATTN}${CSP_ATTENTION_COUNT}${CSP_MARKER_ATTENTION}${CSP_C_RESET}${CSP_C_DIM} ${CSP_C_KEY}*${CSP_C_RESET}${CSP_C_DIM}:jump   "
   fi
-  local gap=$(( CSP_INNER - CSP_CHROME_KEYS_W - ${#badge_plain} - ${#pos_plain} ))
+  # Choose the widest key-hints variant that still leaves the right block room
+  # (with at least one space of separation). If neither fits, drop the hints.
+  local right_col=$(( badge_col + pos_col ))
+  local keys="" keys_col=0
+  if [ "$(( CSP_CHROME_KEYS_W + 1 + right_col ))" -le "$CSP_INNER" ]; then
+    keys="$CSP_CHROME_KEYS"; keys_col="$CSP_CHROME_KEYS_W"
+  elif [ "$(( CSP_CHROME_KEYS_C_W + 1 + right_col ))" -le "$CSP_INNER" ]; then
+    keys="$CSP_CHROME_KEYS_C"; keys_col="$CSP_CHROME_KEYS_C_W"
+  fi
+  local gap=$(( CSP_INNER - keys_col - right_col ))
   [ "$gap" -lt 1 ] && gap=1
   local pad="" k=0
   while [ "$k" -lt "$gap" ]; do pad="$pad "; k=$(( k + 1 )); done
-  csp_buf_line " ${CSP_CHROME_KEYS}${pad}${badge}${CSP_C_DIM}${pos_plain}${CSP_C_RESET}"
+  csp_buf_line " ${keys}${pad}${badge}${CSP_C_DIM}${pos_plain}${CSP_C_RESET}"
   csp_buf_line "$CSP_CHROME_BOT"
 
   # Paint the whole frame in one write: home the cursor (no full clear → no
