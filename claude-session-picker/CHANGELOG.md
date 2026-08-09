@@ -32,6 +32,23 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   without the picker taking on a fuzzy-finder dependency.
 
 ### Fixed
+- **Delete never removes a session that's in use, checked twice.** Liveness is
+  re-evaluated at delete time and again after you confirm (closing a stale-
+  snapshot gap), and it now also honours the hook `working` state — so a bare
+  session started with `n` (which has no `claude --resume <id>` to detect) is
+  protected too. The refusal message says whether it's actually running or just
+  marked busy, and how to clear a stale flag.
+- **`n` sessions become dedupable.** With hooks installed, the hook tags its tmux
+  window with the session id, so a later `Enter` on that session switches to the
+  existing window instead of starting a second copy over the same transcript.
+- **The frame never exceeds the terminal width.** The inner width is now
+  `min(cols-2, 96)` (previously floored at 40, which drew a frame wider than a
+  <42-column terminal and made it wrap/scroll); the title rule and the marker
+  legend degrade gracefully on very narrow terminals.
+- **The installer's hook snippet is shell- and JSON-safe.** The hook path is
+  single-quoted and the whole command JSON-escaped, so a repo path containing
+  spaces, quotes, backslashes, or shell metacharacters produces a valid,
+  non-executable command string.
 - **Filter matches the full title and full project path**, not the on-screen
   (truncated title / shortened path) strings — so a query for a parent directory
   or for text past the 60-column title cut now matches, as the docs promise.

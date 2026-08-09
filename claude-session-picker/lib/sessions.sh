@@ -67,10 +67,18 @@ csp_read_state() {
 # The write is ATOMIC: we print to a unique temp file, then `mv` it into place.
 # A rename on the same filesystem is atomic, so a concurrent reader (the picker
 # loading the list) never sees a half-written or truncated file — it sees either
-# the old contents or the new, never a torn value. Two hooks firing at once
-# (e.g. a fast working→waiting) each land whole; last writer wins, which is the
-# correct "most recent event" outcome. The temp name includes $$ so parallel
-# hook processes don't clobber each other's temp file mid-write.
+# the old contents or the new, never a torn value. The temp name includes $$ so
+# parallel hook processes don't clobber each other's temp file mid-write.
+#
+# ORDERING (a known, benign limitation): "last writer wins" is by rename order,
+# not by event time. Claude Code fires a session's hooks in order (prompt →
+# … → stop), so out-of-order only happens if an OLDER hook process is unusually
+# slow and renames after a newer one — briefly showing the wrong marker. It is
+# self-correcting (the next hook, or the picker's reconciler — which downgrades a
+# "working" state with no live process to ✳ — fixes it) and only cosmetic, so we
+# deliberately don't carry a per-event sequence/timestamp here: that complexity
+# isn't worth it for a marker hint. If it ever matters, stamp the state with a
+# monotonic counter and reject a write older than the stored one.
 csp_write_state() {
   local id="$1" v="$2" f tmp
   f=$(csp_state_file "$id")

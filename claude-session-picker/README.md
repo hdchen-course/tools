@@ -185,10 +185,13 @@ The first time you start in tmux mode the screen will flash and you'll notice th
 new status bar at the bottom: that's the picker re-launching itself inside tmux.
 This is expected and happens once per session.
 
-**Quitting.** `q` in the menu closes the menu window only — any sessions you
-opened stay alive, and you land on one of them. To shut everything down, quit
-each Claude, or `tmux kill-session -t claude-sessions` from any shell. To keep
-everything running and just get your shell back, detach with `Ctrl-b d`.
+**Quitting.** `q` in the menu, **while other sessions are still open**, detaches
+the whole tmux client — every session keeps running in the background and you get
+your shell back (the same as `Ctrl-b d`); run `claude-session-picker` again to
+re-attach to the same menu. If the menu is the only window left, `q` just quits.
+(This is decided by whether you're physically inside the tmux session, so it's
+the same even if you've toggled back to hub with `t` without leaving.) To shut
+everything down, quit each Claude, or `tmux kill-session -t claude-sessions`.
 
 ## Usage
 

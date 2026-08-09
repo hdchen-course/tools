@@ -80,4 +80,17 @@ case "$id" in
 esac
 
 csp_write_state "$id" "$state"
+
+# If this Claude is running inside a tmux window (our picker's or any tmux), tag
+# the CURRENT window with its session id. That lets the picker dedup a session
+# started with `n` — which launches a bare `claude` with no `--resume <id>` for
+# the picker to recognise — so a later Enter on it switches to this window
+# instead of opening a second copy over the same transcript. We use the AMBIENT
+# tmux ($TMUX is inherited by this hook process), so no socket/target guessing is
+# needed: the option lands on exactly the window this Claude occupies. Fully
+# best-effort and silent — a failure only means dedup falls back to "might open a
+# duplicate", never a broken hook.
+if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+  tmux set-option -w '@csp_sid' "$id" >/dev/null 2>&1 || true
+fi
 exit 0

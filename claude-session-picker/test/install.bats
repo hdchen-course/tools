@@ -82,3 +82,46 @@ setup() {
   # The unrelated symlink must survive.
   [ -L "$PREFIX/claude-session-picker" ]
 }
+
+# --- Hook-snippet command escaping (shell-quote + JSON-escape) ---------------
+# The printed hooks snippet embeds $ROOT (the repo path) in a JSON "command"
+# string that Claude Code later runs through a shell. A path with spaces or
+# shell metacharacters must stay literal (shell-quoted) AND keep the JSON valid
+# (backslash/quote escaped). We source just the helper functions from install.sh
+# and assert the produced value for hostile paths.
+# Source just the escaping helpers from install.sh into THIS shell, then set
+# ROOT directly (no nested-bash interpolation to fight) and call the helper.
+_load_hook_helpers() {
+  eval "$(sed -n '/^csp_sh_quote()/,/^}/p; /^csp_json_escape()/,/^}/p; /^csp_hook_command()/,/^}/p' "$BATS_TEST_DIRNAME/../install.sh")"
+}
+
+@test "install: hook command single-quotes a path with spaces" {
+  _load_hook_helpers
+  ROOT="/Users/me/my tools"
+  out=$(csp_hook_command working)
+  [ "$out" = "'/Users/me/my tools/hooks/csp-hook.sh' working" ]
+}
+
+@test "install: hook command neutralises shell metacharacters (\$(), quotes)" {
+  _load_hook_helpers
+  ROOT="/tmp/a\$(touch PWNED)b'c"      # literal: a, $(touch PWNED), b, ', c
+  out=$(csp_hook_command working)
+  # The $(...) text is present but INERT — it sits inside the single-quoted path,
+  # and the embedded single quote is escaped as '\'' then JSON-escaped.
+  case "$out" in *'$(touch PWNED)'*) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
+  case "$out" in "'"*) starts_quoted=1 ;; *) starts_quoted=0 ;; esac
+  [ "$starts_quoted" = "1" ]
+  # And running the command value through a shell must NOT create PWNED.
+  rm -f "$BATS_TEST_TMPDIR/PWNED"
+  ( cd "$BATS_TEST_TMPDIR" && sh -c ": $out" 2>/dev/null || true )
+  [ ! -e "$BATS_TEST_TMPDIR/PWNED" ]
+}
+
+@test "install: hook command keeps JSON valid for a backslash path" {
+  _load_hook_helpers
+  ROOT='/tmp/a\b'
+  out=$(csp_hook_command working)
+  case "$out" in *'a\\b'*) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
+}

@@ -98,3 +98,20 @@ csp_state_count() {
   run csp_read_state "front-id"
   [ "$output" = "working" ]
 }
+
+@test "hook: inside tmux, tags the current window with @csp_sid (for dedup of bare sessions)" {
+  command -v tmux >/dev/null 2>&1 || skip "tmux not installed"
+  sock="csp-hooktag-$$"
+  sd="$BATS_TEST_TMPDIR/hooktag-state"; mkdir -p "$sd"
+  # A detached session running an INTERACTIVE SHELL (no command), so $TMUX is set
+  # in the shell we send the hook into. A flag file marks completion.
+  tmux -L "$sock" new-session -d -s s -n w
+  sleep 0.5
+  tmux -L "$sock" send-keys -t "=s:w" \
+    "printf '{\"session_id\":\"tag-me-77\"}' | CSP_STATE_DIR='$sd' '$HOOK' working; echo done > '$sd/flag'" Enter
+  local i; for i in $(seq 1 40); do [ -f "$sd/flag" ] && break; sleep 0.25; done
+  run tmux -L "$sock" show-options -w -t "=s:w" @csp_sid
+  tmux -L "$sock" kill-server 2>/dev/null || true
+  case "$output" in *tag-me-77*) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
+}

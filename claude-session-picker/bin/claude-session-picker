@@ -586,7 +586,17 @@ csp_rule() {
     mid) left="$CSP_BX_ML"; right="$CSP_BX_MR" ;;
     *)   left="$CSP_BX_BL"; right="$CSP_BX_BR" ;;
   esac
-  if [ -n "$title" ]; then
+  # Only embed the title when there's room for "─ " + at least one title column
+  # + " " within CSP_INNER (i.e. CSP_INNER >= 4). On an absurdly narrow frame
+  # (a few-column tmux micro-pane) we drop the title entirely and emit a plain
+  # rule, so the top border is never wider than the mid/bottom ones.
+  if [ -n "$title" ] && [ "$CSP_INNER" -ge 4 ]; then
+    # The embedded title takes "─ " + title + " " = title width + 3 columns of the
+    # CSP_INNER budget. On a narrow frame we truncate the title to what's left so
+    # the rule can't exceed the width. Normal widths are unaffected.
+    local tmax=$(( CSP_INNER - 3 ))
+    [ "$tmax" -lt 1 ] && tmax=1
+    title=$(csp_truncate_display "$title" "$tmax")
     tw=$(csp_display_width "$title")
     fill=$(( CSP_INNER - tw - 3 ))       # "─ " + title + " " then dashes
     [ "$fill" -lt 0 ] && fill=0
@@ -661,9 +671,16 @@ csp_build_chrome() {
   CSP_CHROME_ROWS="$rows"
   CSP_CHROME_HAVE_STATE="$CSP_HAVE_STATE"   # legend's first-run hint depends on this
 
+  # Inner content width = terminal minus the two corner columns, capped at 96 for
+  # readability. It must NEVER exceed cols-2, or the frame's rules (CSP_INNER+2
+  # wide) would be wider than the terminal and wrap/scroll on every repaint —
+  # which is exactly what the old `floor to 40` did on a <42-column terminal. On
+  # a genuinely tiny terminal CSP_INNER is just cols-2 and the content truncates
+  # to fit; the frame always fits the screen. Floor at 1 so the math stays sane
+  # even at absurd sizes.
   CSP_INNER=$(( cols - 2 ))
   [ "$CSP_INNER" -gt 96 ] && CSP_INNER=96
-  [ "$CSP_INNER" -lt 40 ] && CSP_INNER=40
+  [ "$CSP_INNER" -lt 1 ] && CSP_INNER=1
   CSP_CHROME_VISIBLE="$rows"
 
   # Rules (top carries the title). csp_rule appends to CSP_BUF, so capture via a
@@ -699,24 +716,38 @@ csp_build_chrome() {
   # jitter on every repaint. We build the plain text, append the "live status
   # off" hint ONLY if it still fits CSP_INNER, then colour just the two marker
   # glyphs at their known positions (never a content-wide search). The base
-  # legend "● working   ✳ needs you" is 24 columns and always fits (CSP_INNER>=40).
+  # legend "● working   ✳ needs you" is 24 columns; on a normal frame it always
+  # fits, but a very narrow terminal (CSP_INNER < 24) can't hold it — there we
+  # fall back to a width-FITTED plain legend (no fixed-offset glyph colouring,
+  # since truncation would move the glyphs) so it still never overflows.
   local base_plain hint_plain leg_plain leg
   base_plain="${CSP_MARKER_WORKING} working   ${CSP_MARKER_ATTENTION} needs you"
   hint_plain="   ·  live status off — run --doctor"
-  leg_plain="$base_plain"
-  if [ "$CSP_HAVE_STATE" != "1" ] \
-     && [ "$(csp_display_width "$base_plain$hint_plain")" -le "$CSP_INNER" ]; then
-    leg_plain="$base_plain$hint_plain"
+  if [ "$(csp_display_width "$base_plain")" -gt "$CSP_INNER" ]; then
+    # Too narrow for the coloured base legend: fit the plain text and stop.
+    csp_fit_field "$base_plain" "$CSP_INNER"
+    local s="$__csp_fit"; while [ "${s% }" != "$s" ]; do s="${s% }"; done
+    CSP_CHROME_LEGEND="${CSP_C_DIM} ${s}${CSP_C_RESET}"
+  else
+    leg_plain="$base_plain"
+    if [ "$CSP_HAVE_STATE" != "1" ] \
+       && [ "$(csp_display_width "$base_plain$hint_plain")" -le "$CSP_INNER" ]; then
+      leg_plain="$base_plain$hint_plain"
+    fi
+    # Colour the ● (position 0) and the ✳ (position after "● working   " = 12).
+    leg="${CSP_C_LIVE}${CSP_MARKER_WORKING}${CSP_C_RESET}${CSP_C_DIM}${leg_plain:1:11}${CSP_C_ATTN}${CSP_MARKER_ATTENTION}${CSP_C_RESET}${CSP_C_DIM}${leg_plain:13}${CSP_C_RESET}"
+    CSP_CHROME_LEGEND=" ${leg}"
   fi
-  # Colour the ● (position 0) and the ✳ (position after "● working   " = 12).
-  leg="${CSP_C_LIVE}${CSP_MARKER_WORKING}${CSP_C_RESET}${CSP_C_DIM}${leg_plain:1:11}${CSP_C_ATTN}${CSP_MARKER_ATTENTION}${CSP_C_RESET}${CSP_C_DIM}${leg_plain:13}${CSP_C_RESET}"
-  CSP_CHROME_LEGEND=" ${leg}"
 
   # The selected-row line is padded to CSP_INNER, so rebuild every row's cached
-  # display lines whenever the width (and thus CSP_INNER) changed.
-  local j=0
-  while [ "$j" -lt "$csp_count" ]; do
-    csp_precompute_lines "$j" "${csp_rows[$j]}"
+  # display lines whenever the width (and thus CSP_INNER) changed. Bound the loop
+  # by the number of rows actually present (${#csp_rows[@]}), not csp_count: they
+  # are normally equal, but decoupling them keeps this from reading unset entries
+  # under `set -u` should the two ever diverge. The `:-` on the row is a further
+  # belt-and-suspenders.
+  local j=0 nrows="${#csp_rows[@]}"
+  while [ "$j" -lt "$nrows" ]; do
+    csp_precompute_lines "$j" "${csp_rows[$j]:-}"
     j=$(( j + 1 ))
   done
 }
@@ -991,6 +1022,44 @@ csp_filter_prompt() {
   csp_retally_attention   # the visible set changed → refresh the urgency count
 }
 
+# csp_delete_would_hit_live ID — return 0 (true) if deleting session ID right now
+# would clobber a session that is actively in use. Two signals so a bare session
+# started with `n` (no `claude --resume <id>` to match) is still caught:
+#   • a live `claude --resume <id>` process (csp_running_session_ids); and
+#   • a hook state of "working" — a Claude is generating/running a tool in this
+#     session right now, including a bare `n` session the process scan can't see.
+# We deliberately DO NOT block on "waiting": that means Claude stopped and wants
+# input, and — crucially — the reconciler also shows a CRASHED session as its
+# marker, so a "waiting"/stale session may have no live process at all; blocking
+# it would make a dead session undeletable. "working" without a live process is
+# the reconciler's crash case for the process side, but for a bare session it is
+# the only signal we have, so we honour it (worst case: you quit that Claude, or
+# it truly crashed and you retry — a conservative, recoverable over-guard).
+# Evaluated at call time (fresh scan + fresh state read). With no hooks the state
+# is empty and we fall back to the process scan alone, unchanged from before.
+csp_delete_would_hit_live() {
+  local id="$1" state
+  csp_is_live "$id" "$(csp_running_session_ids)" && return 0
+  state=$(csp_read_state "$id")
+  [ "$state" = "working" ] && return 0
+  return 1
+}
+
+# csp_delete_busy_notice ID TITLE — the message shown when a delete is refused
+# because the session looks busy. It words itself by WHICH signal fired, so it's
+# never misleading: a real live `claude --resume` process says "running right
+# now"; a hook-"working" state with no live process (a bare `n` session, or a
+# crash the reconciler shows as ✳) says "marked busy" instead and points at the
+# recovery — open it once (Enter clears the stale flag) or quit that Claude.
+csp_delete_busy_notice() {
+  local id="$1" title="$2"
+  if csp_is_live "$id" "$(csp_running_session_ids)"; then
+    printf '\n"%s" is running right now — quit that Claude first, then delete.\nPress Enter to continue…' "$title"
+  else
+    printf '\n"%s" is still marked busy (a Claude has it open, or a crashed one left the flag set).\nQuit that Claude, or open it once (Enter) to clear a stale flag, then delete.\nPress Enter to continue…' "$title"
+  fi
+}
+
 # csp_action_delete INDEX — confirm, then permanently delete the selected
 # session's transcript file, then reload the list. Deleting throws away that
 # conversation's history, so we always confirm first and we never touch a live
@@ -1007,13 +1076,27 @@ csp_action_delete() {
   # from the last load: a session could have been resumed (by us in tmux, or by
   # another terminal) since then, and deleting a live session's transcript
   # mid-run is exactly what we promise not to do. Re-scan the running ids here so
-  # the guard reflects the current moment, not a stale snapshot.
-  if csp_is_live "$id" "$(csp_running_session_ids)"; then
-    csp_pause_notice "$(printf '\n"%s" is running right now — quit that Claude first, then delete.\nPress Enter to continue…' "$title")"
+  # the guard reflects the current moment, not a stale snapshot. We consult BOTH
+  # signals: a `claude --resume <id>` process, and the hook state — a session
+  # started bare (via `n`) has no `--resume` to match but its hook marks it
+  # "working"/"waiting", so honouring the hook state closes the bare-session gap.
+  if csp_delete_would_hit_live "$id"; then
+    csp_pause_notice "$(csp_delete_busy_notice "$id" "$title")"
     return 0
   fi
 
   if csp_confirm "Delete session \"$title\"? This erases its history. [y/N] "; then
+    # Re-check liveness AFTER the confirmation prompt, immediately before we
+    # unlink: the user may have taken seconds to answer, and the session could
+    # have been resumed in another terminal in that window. This is the tight
+    # check-then-act pair; a resume that races between this check and the unlink
+    # itself is a residual we accept (fully closing it needs a per-session lock
+    # shared with resume — noted as a follow-up). Abort with a notice if now live.
+    if csp_delete_would_hit_live "$id"; then
+      csp_pause_notice "$(printf '\n"%s" was just resumed — not deleting a running session.\nQuit that Claude first, then delete. Press Enter to continue…' "$title")"
+      csp_load_sessions
+      return 0
+    fi
     if csp_delete_session_file "$file"; then
       # Forget any recorded ●/✳ state for the now-deleted session (no residue).
       csp_clear_state "$(csp_session_id_from_path "$file")"

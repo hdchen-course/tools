@@ -25,6 +25,27 @@ setup() {
 # Strip SGR colour codes so width assertions measure only visible text.
 strip_sgr() { printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g'; }
 
+@test "render: the frame never exceeds the actual terminal width (incl. <42 cols)" {
+  # Regression: CSP_INNER used to be floored at 40, so on a 30- or 40-column
+  # terminal the frame rules (CSP_INNER+2 wide) were WIDER than the screen and
+  # wrapped/scrolled. Now CSP_INNER = min(cols-2, 96), so the frame's character
+  # count (each box glyph is one terminal column) never exceeds cols. We count
+  # CHARACTERS, not csp_display_width (which intentionally treats CJK as 2 cols
+  # and would miscount the box-drawing glyphs).
+  local c chars plain
+  # Include sub-6-column micro-pane widths: the title rule has fixed chrome
+  # ("┌─ … ┐") and must drop the title entirely rather than overflow.
+  for c in 3 4 5 6 10 20 30 40 42 60 80 200; do
+    csp_build_chrome "$c" 5
+    plain="$(strip_sgr "$CSP_CHROME_TOP")"
+    chars=${#plain}
+    [ "$chars" -le "$c" ] || { echo "cols=$c frame_chars=$chars CSP_INNER=$CSP_INNER"; false; }
+    # Bottom rule too (same width contract).
+    plain="$(strip_sgr "$CSP_CHROME_BOT")"; chars=${#plain}
+    [ "$chars" -le "$c" ] || { echo "cols=$c BOT chars=$chars"; false; }
+  done
+}
+
 @test "render: the marker legend never exceeds the inner width (no-hooks, 80 cols)" {
   # The exact first-run case the blocker hit: hooks not wired, 80-column frame.
   CSP_HAVE_STATE=0
@@ -173,63 +194,57 @@ _setup_cjk_model() {
   [ "$csp_view_count" -eq 0 ]
 }
 
+# Build a TINY (2-row) visible model but set the status-bar drivers directly to
+# the large values a big, all-attention, filtered list would produce. The status
+# bar's width math reads only CSP_ATTENTION_COUNT, csp_count, csp_view_count,
+# selected and CSP_FILTER — so we set those rather than formatting hundreds of
+# rows (which was fork-heavy enough to time the suite out). Two real rows keep
+# the draw loop honest without the cost.
+_setup_wide_statusbar() {
+  local badge_count="$1" total="$2" filter="$3"
+  # csp_count/csp_view_count are set to the (large) total for the "X/Y of Z"
+  # width, but only TWO rows are ever drawn: selected=0 with visible=2 keeps the
+  # draw window at indices 0..1, so csp_view/csp_rows need only two entries and
+  # no out-of-range read occurs. This exercises the status-bar width math at
+  # scale without formatting a large model.
+  csp_count="$total"
+  csp_ids=(a b); csp_titles=(t t); csp_titles_full=(t t)
+  csp_projects=(p p); csp_fullprojects=(/t /t); csp_files=(a.jsonl b.jsonl)
+  csp_ages=("1m ago" "1m ago"); csp_lives=(0 0); csp_states=("" ""); csp_markers=("✳" "✳")
+  local k r
+  for k in 0 1; do r=$(csp_format_line "✳" t p "1m ago" 0); csp_rows[$k]="$r"; done
+  CSP_HAVE_STATE=1
+  csp_view=(0 1); csp_view_count="$total"
+  CSP_ATTENTION_COUNT="$badge_count"
+  CSP_FILTER="$filter"
+}
+
 @test "render: badge + active filter together never overflow a narrow (40 col) frame" {
   # Edge case: at 40 cols the RIGHT block alone (N✳ badge + a 20-col-bounded
-  # filter position) can exceed CSP_INNER, which the earlier (short-filter, tiny
-  # count) fixture never actually triggered. To genuinely drive the shrink block
-  # we build MANY ✳ rows that all match the filter — so the badge count is large
-  # (3 digits) AND a filter is active — with a long query (bounded to 20 cols)
-  # and 3-digit totals. That makes badge_col + pos_col > 40, forcing the code to
-  # drop the badge / truncate the position; the emitted bar must still fit.
-  csp_count=150
-  local k
-  csp_ids=(); csp_titles=(); csp_titles_full=(); csp_projects=(); csp_fullprojects=()
-  csp_files=(); csp_ages=(); csp_lives=(); csp_states=(); csp_markers=(); csp_rows=()
-  # Full title is long enough that a ~12-column CJK query is a real substring.
-  for k in $(seq 0 149); do
-    csp_ids[$k]="id-$k"
-    csp_titles[$k]="解析工作階段"
-    csp_titles_full[$k]="解析工作階段重構清理維護測試 $k"
-    csp_projects[$k]="p/$k"; csp_fullprojects[$k]="/t/$k"
-    csp_files[$k]="$k.jsonl"; csp_ages[$k]="1m ago"; csp_lives[$k]=0
-    csp_states[$k]=""; csp_markers[$k]="✳"       # every row needs attention
-    csp_rows[$k]=$(csp_format_line "✳" "解析工作階段" "p/$k" "1m ago" 0)
-  done
-  CSP_HAVE_STATE=1
-  csp_visible_rows() { printf '10'; }
+  # filter position) can exceed CSP_INNER — the earlier short-filter/tiny-count
+  # fixture never triggered the shrink block. Drive it with a 3-digit badge count
+  # and a long (bounded to 20 cols) filter so badge_col + pos_col > 40.
+  _setup_wide_statusbar 150 150 "解析工作階段重構清理維護"
+  csp_visible_rows() { printf '2'; }
   eval "csp_term_cols() { printf '40'; }"
   CSP_CHROME_COLS=""
-  # A long CJK query (a genuine substring of the full titles) so the shown filter
-  # fills its ~20-column budget and the right block exceeds the 40-col frame.
-  CSP_FILTER="解析工作階段重構清理維護"; csp_rebuild_view; csp_retally_attention
   [ "$CSP_ATTENTION_COUNT" -gt 0 ]        # badge is genuinely present
   _measure_status_bar
   [ "$CSP_TEST_SB_W" -le "$CSP_INNER" ] \
     || { echo "INNER=$CSP_INNER width=$CSP_TEST_SB_W : [$CSP_TEST_SB]"; false; }
 }
 
-@test "render: right block filling CSP_INNER exactly does not overflow via the gap floor" {
-  # Adversarial boundary: when the right block (badge dropped, position kept) is
-  # exactly CSP_INNER wide and NO key hints fit, the gap-floor-to-1 used to add a
-  # separator space that isn't needed (no hints to separate from), pushing the
-  # line to CSP_INNER+1. With 1000 matching ✳ rows the counts are "1/1000 of
-  # 1000" and a 20-col filter, so the position alone approaches the 40-col frame.
-  csp_count=1000
-  local k
-  csp_ids=(); csp_titles=(); csp_titles_full=(); csp_projects=(); csp_fullprojects=()
-  csp_files=(); csp_ages=(); csp_lives=(); csp_states=(); csp_markers=(); csp_rows=()
-  for k in $(seq 0 999); do
-    csp_ids[$k]="id-$k"; csp_titles[$k]="t"
-    csp_titles_full[$k]="解析工作階段重構清理維護測試除錯 $k"
-    csp_projects[$k]="p"; csp_fullprojects[$k]="/t/$k"; csp_files[$k]="$k.jsonl"
-    csp_ages[$k]="1m ago"; csp_lives[$k]=0; csp_states[$k]=""; csp_markers[$k]="✳"
-    csp_rows[$k]=$(csp_format_line "✳" "t" "p" "1m ago" 0)
-  done
-  CSP_HAVE_STATE=1
-  csp_visible_rows() { printf '5'; }
+@test "render: an oversized right block (badge + wide filter + big counts) is truncated to fit" {
+  # Hard case at a 40-col frame: a large ✳ badge, a 20-col-bounded filter, AND
+  # 6-digit "X/Y of Z" counts push the right block well past the frame. The code
+  # drops the badge and then hard-truncates the position to CSP_INNER-1, so the
+  # emitted bar (leading pad + position) still fits exactly. This is the belt of
+  # the two-layer guard (drop badge → truncate); the gap-floor tweak is the
+  # suspenders behind it.
+  _setup_wide_statusbar 1000 100000 "解析工作階段重構清理維護"
+  csp_visible_rows() { printf '2'; }
   eval "csp_term_cols() { printf '42'; }"     # CSP_INNER = 40
   CSP_CHROME_COLS=""
-  CSP_FILTER="解析工作階段重構清理維護"; csp_rebuild_view; csp_retally_attention
   _measure_status_bar
   [ "$CSP_TEST_SB_W" -le "$CSP_INNER" ] \
     || { echo "INNER=$CSP_INNER width=$CSP_TEST_SB_W : [$CSP_TEST_SB]"; false; }

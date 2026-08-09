@@ -43,6 +43,35 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 say()  { printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 
+# csp_sh_quote STRING — single-quote STRING for safe use as a shell word (any
+# embedded single quote becomes '\''). Used to wrap the hook's executable path
+# so a repo path containing spaces or shell metacharacters ($(), backticks, ;,
+# quotes) is treated literally when Claude Code runs the hook command.
+# (Mirrors lib/backend.sh:csp_shell_quote — kept as a separate copy so the
+# installer stays standalone; if you change one, change the other.)
+csp_sh_quote() {
+  local s="$1"
+  s=$(printf '%s' "$s" | sed "s/'/'\\\\''/g")
+  printf "'%s'" "$s"
+}
+
+# csp_json_escape STRING — escape STRING for embedding inside a JSON double-quoted
+# value: backslash and double-quote are escaped (control chars don't occur in a
+# filesystem path we build here). Applied to the WHOLE shell command so the
+# printed snippet is always valid JSON even if the path contains " or \.
+csp_json_escape() {
+  local s="$1"
+  s=${s//\\/\\\\}      # \  -> \\   (first, so we don't double-escape the next)
+  s=${s//\"/\\\"}      # "  -> \"
+  printf '%s' "$s"
+}
+
+# csp_hook_command STATE — the fully-safe JSON string for a hook's "command"
+# value: the shell-quoted hook path + STATE, then JSON-escaped as a whole.
+csp_hook_command() {
+  csp_json_escape "$(csp_sh_quote "$ROOT/hooks/csp-hook.sh") $1"
+}
+
 # --- Sanity check: is the `claude` command present? -------------------------
 # Not fatal — you might install the picker before Claude Code — but worth
 # telling the user, since the picker can't resume anything without it.
@@ -136,11 +165,11 @@ say "Add these hooks to your Claude Code settings.json (usually ~/.claude/settin
 say ""
 say '  "hooks": {'
 say '    "UserPromptSubmit": [ { "hooks": [ { "type": "command",'
-say "        \"command\": \"$ROOT/hooks/csp-hook.sh working\" } ] } ],"
+say "        \"command\": \"$(csp_hook_command working)\" } ] } ],"
 say '    "Stop": [ { "hooks": [ { "type": "command",'
-say "        \"command\": \"$ROOT/hooks/csp-hook.sh waiting\" } ] } ],"
+say "        \"command\": \"$(csp_hook_command waiting)\" } ] } ],"
 say '    "Notification": [ { "hooks": [ { "type": "command",'
-say "        \"command\": \"$ROOT/hooks/csp-hook.sh waiting\" } ] } ]"
+say "        \"command\": \"$(csp_hook_command waiting)\" } ] } ]"
 say '  }'
 say ""
 say "These only write a tiny local state file; nothing is sent anywhere."

@@ -115,9 +115,13 @@ Two small things worth knowing:
 
 - Only ↑ and ↓ are understood as arrows. ← and → do **nothing** — a stray press
   won't quit. Use `j` and `k` to move.
-- `n` always starts the new session in the directory you were in when you
-  launched the picker — not the directory of the highlighted row. If you want a
-  new session in a specific project, `cd` there first, then run the picker.
+- `n` starts the new session in the directory you were in when you launched the
+  picker — not the directory of the highlighted row. If you want a new session in
+  a specific project, `cd` there first, then run the picker. (In tmux mode, where
+  the picker stays resident, `n` uses the directory of whichever terminal you
+  most recently re-attached from.)
+- In tmux mode, pressing `Enter` on a session that's **already open** in a window
+  switches you to that window instead of starting a second copy.
 
 ---
 
@@ -222,9 +226,13 @@ you ever use: `Ctrl-b 0` (window 0 = the menu), `Ctrl-b n` / `p`
 | close one session | `/exit` inside it |
 | shut down absolutely everything | `tmux kill-session -t claude-sessions` |
 
-Pressing `q` in the menu closes **only the menu window**. Any sessions you opened
-stay alive and you land on one of them — which can be confusing the first time.
-If you want the menu back after that, run `claude-session-picker` again.
+Pressing `q` in the menu, **while other sessions are still open**, detaches the
+whole tmux client instead of closing the menu — everything keeps running in the
+background and you get your shell back (the same as `Ctrl-b d`). Run
+`claude-session-picker` again to re-attach to the same menu. If the menu is the
+*only* window left, `q` just quits normally. (This is decided by whether you're
+physically inside the tmux session, so it behaves the same even if you've toggled
+back to hub mode with `t` without leaving.)
 
 ---
 

@@ -572,6 +572,29 @@ EOF
   [ -z "$output" ]
 }
 
+# csp_delete_would_hit_live lives in bin/ (wiring), so source that with the
+# main loop suppressed. It must block deletion of a session the hook marks
+# "working" (covers a bare `n` session the --resume scan can't see), but NOT a
+# "waiting"/idle one (which may be a crashed session that must stay deletable).
+_delete_guard() {  # $1 = id
+  CSP_SOURCED_FOR_TEST=1 CSP_STATE_DIR="$CSP_STATE_DIR" bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../bin/claude-session-picker"
+    csp_delete_would_hit_live "'"$1"'" && echo LIVE || echo NOTLIVE'
+}
+
+@test "delete-guard: a session the hook marks 'working' is treated as live" {
+  mkdir -p "$CSP_STATE_DIR"
+  csp_write_state "sess-working" "working"
+  [ "$(_delete_guard sess-working)" = "LIVE" ]
+}
+
+@test "delete-guard: a 'waiting' or idle session is NOT blocked (crashed must stay deletable)" {
+  mkdir -p "$CSP_STATE_DIR"
+  csp_write_state "sess-waiting" "waiting"
+  [ "$(_delete_guard sess-waiting)" = "NOTLIVE" ]
+  [ "$(_delete_guard sess-never-seen)" = "NOTLIVE" ]
+}
+
 @test "state: an invalid stored value is ignored" {
   mkdir -p "$CSP_STATE_DIR"
   printf 'bogus\n' > "$(csp_state_file "sess-x")"
