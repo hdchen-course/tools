@@ -215,6 +215,79 @@ make_home() {
   csp_tmux has-session -t "=$CSP_TMUX_SESSION" 2>/dev/null
 }
 
+@test "ownership: server_is_ours accepts our marked server" {
+  make_home    # sets @csp_owner
+  run csp_tmux_server_is_ours
+  [ "$status" -eq 0 ]
+}
+
+@test "ownership: server_is_ours accepts a LEGACY markerless server (upgrade path)" {
+  # Simulate a server created by an OLDER build: our holding session with a menu
+  # window, but NO @csp_owner (never set). It must still be recognised as ours so
+  # the hook keeps tagging and the delete guard's window signal keeps working
+  # across an in-place upgrade.
+  csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu "sleep 60"   # no configure_home
+  [ -z "$(csp_tmux show-options -gv @csp_owner 2>/dev/null)" ]        # confirm markerless
+  run csp_tmux_server_is_ours                                        # still ours by structure
+  [ "$status" -eq 0 ]
+}
+
+@test "ownership: server_is_ours REJECTS a foreign server on the same socket" {
+  # A user's unrelated tmux on the exact same -L socket name: no marker, and its
+  # session is NOT our holding session (no menu window). Must be judged NOT ours,
+  # so csp_tmux_enter refuses to configure/claim it.
+  csp_tmux new-session -d -s "someone-elses" -n work "sleep 60"
+  run csp_tmux_server_is_ours
+  [ "$status" -ne 0 ]
+}
+
+@test "enter: does NOT mutate a foreign server on an exact socket collision" {
+  # The Medium finding: csp_tmux_enter's existing-session path used to configure
+  # (mutate global mouse/status/@csp_owner) any server on our socket name. Now it
+  # must refuse a foreign one. Build a foreign server that ALSO happens to have a
+  # session named like ours but WITHOUT a menu window (so it's structurally not
+  # ours), capture its global options, run enter, and confirm nothing changed.
+  csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n work "sleep 60"   # no menu window
+  # `show-options -gv @csp_owner` exits non-zero when the option is unset; append
+  # `|| true` so a bats assignment isn't treated as a failing command.
+  before_mouse=$(csp_tmux show-options -g mouse 2>/dev/null || true)
+  before_owner=$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)
+  self="$BATS_TEST_DIRNAME/../bin/claude-session-picker"
+  run bash -c "CSP_TMUX_SOCKET='$CSP_TMUX_SOCKET' CSP_TMUX_SESSION='$CSP_TMUX_SESSION' \
+    bash -c '. \"$BATS_TEST_DIRNAME/../lib/core.sh\"; . \"$BATS_TEST_DIRNAME/../lib/backend.sh\"; \
+    csp_tmux_enter \"$self\"' </dev/null 2>&1"
+  # The foreign server's global options are untouched, and it was NOT claimed.
+  after_mouse=$(csp_tmux show-options -g mouse 2>/dev/null || true)
+  after_owner=$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)
+  [ "$after_mouse" = "$before_mouse" ]
+  [ "$after_owner" = "$before_owner" ]
+  [ -z "$after_owner" ]   # still no marker → we never claimed it
+}
+
+@test "enter: does NOT mutate a foreign server whose session is NOT named ours (fresh-path collision)" {
+  # The more likely real collision (and the fresh-path gap): the user's own tmux
+  # on the exact -L socket name, but with a session named something else (e.g.
+  # "work"). has-session -t=ours is false, so enter falls to the FRESH path —
+  # which must detect a live foreign server and refuse, NOT create a session on
+  # it and stamp global options + @csp_owner.
+  csp_tmux new-session -d -s "work" -n w "sleep 60"      # foreign session name
+  before_mouse=$(csp_tmux show-options -g mouse 2>/dev/null || true)
+  before_owner=$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)
+  before_sessions=$(csp_tmux list-sessions -F '#{session_name}' 2>/dev/null | sort | tr '\n' ',')
+  self="$BATS_TEST_DIRNAME/../bin/claude-session-picker"
+  run bash -c "CSP_TMUX_SOCKET='$CSP_TMUX_SOCKET' CSP_TMUX_SESSION='$CSP_TMUX_SESSION' \
+    bash -c '. \"$BATS_TEST_DIRNAME/../lib/core.sh\"; . \"$BATS_TEST_DIRNAME/../lib/backend.sh\"; \
+    csp_tmux_enter \"$self\"' </dev/null 2>&1"
+  # Globals untouched, no marker stamped, and NO new (ours) session was added.
+  [ "$(csp_tmux show-options -g mouse 2>/dev/null || true)" = "$before_mouse" ]
+  [ "$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)" = "$before_owner" ]
+  [ -z "$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)" ]
+  [ "$(csp_tmux list-sessions -F '#{session_name}' 2>/dev/null | sort | tr '\n' ',')" = "$before_sessions" ]
+  # And our holding session was NOT created on their server.
+  run csp_tmux has-session -t "=$CSP_TMUX_SESSION"
+  [ "$status" -ne 0 ]
+}
+
 @test "recovery: a menu window orphaned at a NON-zero index is swapped back to 0" {
   # Edge case: an earlier partial recovery can leave a 'menu' window at a
   # non-zero index. The old guard ("does ANY window named menu exist?") would see

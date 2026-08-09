@@ -72,26 +72,37 @@ csp_tmux_available() {
 # user's unrelated tmux would not have set as @csp_owner.
 CSP_TMUX_OWNER_TOKEN="claude-session-picker"
 
-# csp_inside_tmux — returns 0 if we are currently running inside OUR tmux server
-# (the dedicated one the picker created), not just any tmux. Two checks:
-#   1. the $TMUX socket path's BASENAME equals our socket name (cheap, and
-#      compared EXACTLY so "claude-sessions" != "claude-sessions-extra"); AND
-#   2. the current server carries our @csp_owner marker (set on our server only).
-# Check 2 is what distinguishes our server from a user's UNRELATED tmux that
-# happens to use a same-basename socket at a DIFFERENT path
-# (e.g. /other/path/claude-sessions) — the basename matches but the marker is
-# absent, so we correctly report "not ours" and never tag/steal that window.
-# The marker query uses the ambient $TMUX (no -L/-t), so it asks the very server
-# we're inside. If tmux isn't runnable the query fails → treated as not-ours.
+# csp_inside_tmux — returns 0 if we are currently running inside OUR OWN picker
+# tmux (the dedicated server, in our holding session), not just any tmux. All of:
+#   1. the $TMUX socket path's BASENAME equals our socket name (cheap; compared
+#      EXACTLY so "claude-sessions" != "claude-sessions-extra"); AND
+#   2. the CURRENT session is our holding session ($CSP_TMUX_SESSION) — so an
+#      environment pointing at a different session/instance on a same-named
+#      socket isn't accepted while our csp_tmux ops would target another; AND
+#   3. the ambient server is ours, by EITHER our @csp_owner marker OR — for a
+#      server created by an OLDER build that predates the marker — structurally:
+#      it has a window named "menu" in our session. This legacy path is what
+#      keeps an upgrade-in-place (symlinked install, so the hook runs new code
+#      against an old markerless server) from wrongly deciding "not ours" and
+#      then failing to tag windows / letting a live bare session be deleted.
+# All queries use the ambient $TMUX (no -L), so they ask the very server we're
+# inside. Any tmux error → treated as not-ours (fail closed for a FOREIGN server;
+# the legacy structural check still recognises a real old picker server).
 csp_inside_tmux() {
-  local t="${TMUX:-}" path base owner
+  local t="${TMUX:-}" path base owner cur
   [ -n "$t" ] || return 1
   path="${t%%,*}"          # the socket path (before the first comma)
   base="${path##*/}"       # its basename
   [ "$base" = "$CSP_TMUX_SOCKET" ] || return 1
-  # show-options -v prints just the value; empty/absent (or tmux error) → not ours.
-  owner=$(command tmux show-options -gv @csp_owner 2>/dev/null) || return 1
-  [ "$owner" = "$CSP_TMUX_OWNER_TOKEN" ]
+  # Must be inside our holding session (per-instance identity, not just socket).
+  cur=$(command tmux display-message -p '#{session_name}' 2>/dev/null) || return 1
+  [ "$cur" = "$CSP_TMUX_SESSION" ] || return 1
+  # Ours by marker...
+  owner=$(command tmux show-options -gv @csp_owner 2>/dev/null)
+  [ "$owner" = "$CSP_TMUX_OWNER_TOKEN" ] && return 0
+  # ...or ours by structure (legacy, markerless): our session has a menu window.
+  command tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_name}' 2>/dev/null \
+    | grep -qx menu
 }
 
 # =============================================================================
@@ -144,6 +155,32 @@ csp_tmux_sanitize_label() {
   clean="${clean%[ ]}"                  # cap may re-expose a trailing space
   [ -z "$clean" ] && clean="session"
   printf '%s' "$clean"
+}
+
+# csp_tmux_server_is_ours — return 0 if the tmux server on OUR -L socket is one
+# the picker owns, and is therefore safe to (re)configure and attach to. We must
+# NOT decide this on the socket name alone: a user could have their own unrelated
+# tmux on the exact same -L socket name, and mutating its global options or
+# claiming it would break the "we never touch your tmux" promise. Two ways to be
+# ours, checked against the server the -L socket points at (NOT the ambient
+# $TMUX):
+#   1. it carries our @csp_owner marker (servers we created on a current build); OR
+#   2. STRUCTURALLY ours — it has our holding session ($CSP_TMUX_SESSION) with a
+#      window named "menu". This is the legacy/upgrade path: a server created by
+#      an OLDER build has no marker (the resident menu never re-ran configure),
+#      yet it is unmistakably ours by its session+menu-window shape, so we adopt
+#      it (and backfill the marker in configure_home). A foreign server on the
+#      same socket name has neither our marker nor our session → not ours.
+csp_tmux_server_is_ours() {
+  csp_tmux_available || return 1
+  # Marker check (server-global option on our socket).
+  local owner
+  owner=$(csp_tmux show-options -gv @csp_owner 2>/dev/null)
+  [ "$owner" = "$CSP_TMUX_OWNER_TOKEN" ] && return 0
+  # Structural check: our holding session exists AND has a window named "menu".
+  csp_tmux has-session -t "=$CSP_TMUX_SESSION" 2>/dev/null || return 1
+  csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_name}' 2>/dev/null \
+    | grep -qx menu
 }
 
 # csp_tmux_configure_home — configure our dedicated-socket tmux server so the
@@ -234,6 +271,13 @@ csp_tmux_enter() {
   cmd="$cmd $(csp_shell_quote "$self")"
 
   if csp_tmux has-session -t "=$CSP_TMUX_SESSION" 2>/dev/null; then
+    # Before touching ANY global option on this server, make sure it's really
+    # ours — a user could have an unrelated tmux on the exact same -L socket
+    # name. If it isn't ours we must NOT claim or mutate it (that would break the
+    # "we never touch your tmux" promise); return non-zero so the caller falls
+    # back to hub. (csp_tmux_server_is_ours accepts a legacy markerless server
+    # that structurally has our session + a menu window.)
+    csp_tmux_server_is_ours || return 1
     csp_tmux_configure_home
     # Guarantee window 0 IS a menu before we attach — otherwise the client lands
     # on an arbitrary Claude window with no resident picker while the status bar
@@ -268,13 +312,48 @@ csp_tmux_enter() {
     return 1
   fi
 
-  # Fresh: create the holding session with the picker in window 0 (named
-  # "menu"), configure it, then attach. Detached-first so options apply before
-  # the client draws. If the attach can't happen (exec fails), don't leave the
-  # freshly-created detached session orphaned — tear it down and return so the
-  # caller falls back to hub cleanly.
-  csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu "$cmd" 2>/dev/null || return 1
+  # We reach here because our holding session does NOT exist on this socket. That
+  # has two very different causes, and we must tell them apart before creating
+  # anything: (1) there is NO tmux server on this -L socket at all → safe to
+  # create ours; (2) a server IS already alive here but it's the user's own
+  # (a session not named ours) → we must NOT create a session on it, because the
+  # very next step (csp_tmux_configure_home) would set GLOBAL options and stamp
+  # our marker on THEIR server. `csp_tmux_server_is_ours` can't distinguish these
+  # (a truly-empty socket also isn't "ours"), so we check liveness first: if a
+  # server responds AND it isn't ours, refuse and fall back to hub.
+  if csp_tmux list-sessions >/dev/null 2>&1 && ! csp_tmux_server_is_ours; then
+    return 1
+  fi
+
+  # Fresh: create the holding session with the picker in window 0 (named "menu"),
+  # configure it, then attach. Detached-first so options apply before the client
+  # draws.
+  #
+  # ORDERING MATTERS: we must NOT start the picker child before @csp_owner is set,
+  # or that child can run csp_inside_tmux before the marker exists, decide it is
+  # "not inside our tmux", and re-enter csp_tmux_enter (a confusing tmux-inside-
+  # tmux attempt that then falls back to hub). So we create window 0 running a
+  # tiny BOOTSTRAP placeholder (a shell that just waits), configure the server
+  # (which sets+—see below—the marker), and only THEN respawn window 0 with the
+  # real picker command. By the time the picker runs, the marker is already set,
+  # so its csp_inside_tmux returns true immediately. The placeholder shell is
+  # POSIX (`sh -c` + a plain `sleep`) so it works under any default shell; the
+  # 2147483647 is INT_MAX seconds (~68y) — a portable "sleep effectively forever"
+  # that avoids the non-POSIX `sleep infinity` (unsupported by macOS/BSD sleep).
+  csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu \
+    'sh -c "while :; do sleep 2147483647; done"' 2>/dev/null || return 1
   csp_tmux_configure_home
+  # Confirm the marker actually landed before launching the picker; if it didn't
+  # (a wedged server), tear down and fall back to hub rather than racing.
+  [ "$(csp_tmux show-options -gv @csp_owner 2>/dev/null)" = "$CSP_TMUX_OWNER_TOKEN" ] || {
+    csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null
+    return 1
+  }
+  # Now replace the placeholder with the real picker in the same window 0.
+  csp_tmux respawn-window -k -t "=$CSP_TMUX_SESSION:menu" "$cmd" 2>/dev/null || {
+    csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null
+    return 1
+  }
   csp_tmux_record_launch_pwd    # seed the launch dir for `n` (see helper)
   exec command tmux -L "$CSP_TMUX_SOCKET" attach-session -t "=$CSP_TMUX_SESSION"
   csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null   # only if exec failed

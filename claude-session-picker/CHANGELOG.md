@@ -62,6 +62,16 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
 - **tmux: no duplicate concurrent resume.** Opening a session that already has a
   window switches to it instead of launching a second `claude --resume` over the
   same transcript. Each session window is tagged with its id (`@csp_sid`).
+- **tmux ownership is verified before we touch a server, and survives an
+  upgrade.** A server is treated as the picker's only if it carries our
+  `@csp_owner` marker OR is structurally ours (our holding session with a `menu`
+  window). This (a) recognises a server created by an *older* build that predates
+  the marker — so an in-place upgrade keeps tagging windows and guarding deletes;
+  (b) refuses to configure/claim a *foreign* tmux that merely shares the socket
+  name — we never mutate a user's server; and (c) on a fresh server sets the
+  marker on a bootstrap window *before* launching the picker, closing a startup
+  race where the picker could see itself as "not inside our tmux". `csp_inside_tmux`
+  also now requires the ambient session to be ours, not just the socket name.
 - **tmux: quitting is consistent after toggling to hub.** `q` now decides
   detach-vs-exit from whether you're physically inside the tmux menu, not the
   logical backend — so toggling to hub (`t`) while still in the menu no longer
@@ -120,7 +130,9 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   basename (a different path) is never mistaken for the picker's, and the hook
   never tags a window in it. Added same-basename-different-path and
   real-tagged-window regression tests, plus a parameterized 0x01–0x1F JSON
-  round-trip. Test suite grew to 215.
+  round-trip, plus tmux ownership tests (marked server, legacy markerless server,
+  foreign-server refusal on BOTH the existing-session and fresh paths, and
+  no-foreign-mutation). Test suite grew to 220.
 - New pure, unit-tested helpers in `lib/core.sh`: `csp_filter_indices`,
   `csp_next_attention`, `csp_count_attention`. A shared `csp_prompt_line` now
   backs both the delete confirmation and the filter query (one home for the
