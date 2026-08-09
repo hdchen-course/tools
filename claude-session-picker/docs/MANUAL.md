@@ -360,8 +360,11 @@ on your machine under `~/.claude` and launches the `claude` command you already
 have. No conversation text, no titles, no telemetry leaves your computer.
 
 **Does it modify or delete my sessions?**
-No. It only ever *reads* `~/.claude`. Uninstalling removes one symlink and leaves
-every session intact.
+Only if you ask it to. Listing, filtering, opening, and resuming just *read*
+`~/.claude`. The one action that writes is **delete** (`d`/`x`): it permanently
+removes the selected session's transcript, but only after you confirm, and never
+a session that is currently running. Nothing else under `~/.claude` is ever
+touched, and uninstalling removes one symlink and leaves every session intact.
 
 **How do I switch modes?**
 Press `t` in the menu — it's remembered next time. Or put `CSP_BACKEND=hub` /

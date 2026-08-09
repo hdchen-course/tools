@@ -292,9 +292,8 @@ even when Claude dies unexpectedly.
 ```
 
 Removes the command symlink **only if it still points back into this repo**, so
-it can never delete an unrelated file that happens to share the name. It never
-touches your Claude data under `~/.claude` — this tool only ever *read* those
-files.
+it can never delete an unrelated file that happens to share the name.
+Uninstalling never touches your Claude data under `~/.claude`.
 
 ## How it works
 
@@ -308,7 +307,9 @@ lib/core.sh                 PURE logic. Text in, text out. No disk, no network,
 lib/sessions.sh             The ONLY file that touches the outside world: reads
                             Claude's session files under ~/.claude, pulls each
                             session's title / project / last-active time, and
-                            detects which sessions are live.
+                            detects which sessions are live. It also owns the one
+                            write path — deleting a session's transcript (the `d`
+                            action), guarded to stay within the projects dir.
 lib/backend.sh              The two ways to RUN a session: hub (foreground, one
                             at a time) and tmux (a window each, concurrent).
 install.sh / uninstall.sh   One-command setup and clean removal.
@@ -358,8 +359,12 @@ Nothing in the suite launches the real `claude` or touches your real `~/.claude`
 
 - **Nothing leaves your machine.** No conversation text, history, or telemetry is
   sent anywhere. The tool makes no network calls at all.
-- **Read-only on your data.** It never writes to or deletes anything under
-  `~/.claude`; it only reads. Uninstalling leaves your sessions untouched.
+- **Read-only while browsing.** Listing, filtering, opening, and resuming only
+  *read* `~/.claude` — none of them writes or deletes anything there. The one
+  exception is the explicit **delete** action (`d`/`x`), which permanently
+  removes the selected session's transcript **after you confirm**; it never
+  touches anything else, and never a session that is currently running.
+  Uninstalling leaves all your sessions untouched.
 - **Your terminal is always restored** — the cursor and your `stty` settings are
   put back on every exit path (normal quit, `Ctrl-C`, `TERM`, or an unexpected
   error), via a trap installed *before* the terminal is ever put into raw mode.

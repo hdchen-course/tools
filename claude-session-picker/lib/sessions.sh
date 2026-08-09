@@ -255,9 +255,14 @@ csp_session_meta() {
       | jq -rRn --argjson clip "$CSP_META_TITLE_CLIP" '
       [inputs | fromjson? // empty
         | {t: .aiTitle, p: .lastPrompt, c: .cwd}] as $o
-    | ($o | map(.t) | map(select(. != null)) | .[0]) as $t
-    | ($o | map(.p) | map(select(. != null)) | .[0]) as $p
-    | ($o | map(.c) | map(select(. != null)) | .[0]) as $c
+    # Keep only non-empty STRINGS (a present-but-empty "aiTitle":"" must NOT beat
+    # a real lastPrompt: the jq // operator treats "" as present, so filter it
+    # out here to match the python/awk branches, which accept only a non-empty
+    # string). NOTE: no apostrophes in this jq program — it is single-quoted in
+    # the shell, so an apostrophe would terminate the quote.
+    | ($o | map(.t) | map(select(type == "string" and . != "")) | .[0]) as $t
+    | ($o | map(.p) | map(select(type == "string" and . != "")) | .[0]) as $p
+    | ($o | map(.c) | map(select(type == "string" and . != "")) | .[0]) as $c
     | ((($t // $p // "")[:$clip] | gsub("[[:cntrl:]]"; " ")) + "\t" + ($c // ""))
     ' 2>/dev/null)
   elif command -v python3 >/dev/null 2>&1; then
@@ -339,6 +344,23 @@ PYEOF
   title="${out%%"$tab"*}"
   cwd="${out#*"$tab"}"
   [ "$cwd" = "$out" ] && cwd=""          # no tab found → no cwd
+  # Strip control characters from the cwd too. Each parser already neuters the
+  # TITLE inside its own engine (jq/python/awk), because the title must first be
+  # CLIPPED there to bound the work before it reaches bash. The cwd needs no such
+  # clipping (it is a short path), so one strip here — after the split, covering
+  # all three parsers at once — is the simpler place to do it. Without it, a
+  # crafted/corrupted transcript with an ESC/BEL/newline in Claude's own `cwd`
+  # field could emit an escape sequence to the screen or, via an embedded
+  # tab/newline, break the drawn row or the `--list` four-column TSV contract.
+  # Fold every control byte to a space (same `[[:cntrl:]]` set the parsers use).
+  # LC_ALL=C makes the class the fixed ASCII control set (0x00–0x1f, 0x7f) rather
+  # than a locale-dependent one, so the result is deterministic everywhere.
+  cwd=$(printf '%s' "$cwd" | LC_ALL=C tr '[:cntrl:]' ' ')
+  # A cwd that was ONLY control characters is now only spaces. Treat that (and a
+  # genuinely empty cwd) as "no cwd" so it falls to the "?" placeholder rather
+  # than a misleading blank — and so the awk path (which, unlike jq/python, will
+  # extract from a control-char-bearing line) agrees with the other two.
+  case "$cwd" in *[![:space:]]*) ;; *) cwd="" ;; esac
   [ -z "$title" ] && title="(untitled)"
   [ -z "$cwd" ] && cwd="?"
   printf '%s%s%s' "$title" "$tab" "$cwd"

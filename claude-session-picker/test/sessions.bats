@@ -296,6 +296,75 @@ EOF
   [ "$(csp_field "$output" 2)" = "/Volumes/demo/alpha" ]
 }
 
+@test "meta: control characters in the CWD are stripped too (not just the title)" {
+  # Regression: every parser neutered the title but passed cwd through verbatim,
+  # so an ESC/BEL in Claude's own cwd field could reach the screen or break the
+  # --list TSV. All three parsers must strip control chars from cwd as well.
+  #
+  # The control chars are delivered as VALID JSON escapes. A RAW control byte
+  # inside a JSON string is invalid JSON, which jq/python reject upstream (the
+  # strip would then never run and the test would pass vacuously). We write the
+  # fixture so the FILE holds the literal escape TEXT (backslash-u-001b = ESC,
+  # backslash-u-0007 = BEL); jq/python DECODE these into cwd, giving the strip
+  # real control bytes to remove. We assert the exact resulting cwd so the strip
+  # is genuinely exercised, not merely "no control char present".
+  cc="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-cwd.jsonl"
+  printf '{"aiTitle":"safe","cwd":"/Volumes/demo/a%su001b[2Jb%su0007c"}\n' '\' '\' > "$cc"
+  # Sanity: the fixture on disk holds the literal escape TEXT, not raw bytes.
+  grep -q 'a\\u001b\[2Jb\\u0007c' "$cc"
+  # jq and python decode the escapes -> each control char becomes one space:
+  #   /Volumes/demo/a [2Jb c
+  for shadow in '' 'jq'; do
+    run env CSP_CLAUDE_DIR="$CSP_CLAUDE_DIR" CSP_SHADOW="$shadow" bash -c '
+      command() { for s in $CSP_SHADOW; do if [ "$1" = "-v" ] && [ "$2" = "$s" ]; then return 1; fi; done; builtin command "$@"; }
+      . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
+      csp_session_meta "'"$cc"'"'
+    cwd="$(csp_field "$output" 2)"
+    case "$cwd" in *$'\033'*|*$'\007'*|*$'\t'*) bad=1 ;; *) bad=0 ;; esac
+    [ "$bad" = "0" ]
+    [ "$cwd" = "/Volumes/demo/a [2Jb c" ]
+  done
+  # awk path: it sees the literal escape TEXT (no real control byte), so the
+  # field is control-char-free either way -- the guard still holds.
+  run env CSP_CLAUDE_DIR="$CSP_CLAUDE_DIR" CSP_SHADOW="jq python3" bash -c '
+    command() { for s in $CSP_SHADOW; do if [ "$1" = "-v" ] && [ "$2" = "$s" ]; then return 1; fi; done; builtin command "$@"; }
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
+    csp_session_meta "'"$cc"'"'
+  cwd="$(csp_field "$output" 2)"
+  case "$cwd" in *$'\033'*|*$'\007'*|*$'\t'*) bad=1 ;; *) bad=0 ;; esac
+  [ "$bad" = "0" ]
+}
+
+@test "meta: a cwd of ONLY control chars becomes '?' on every parser (not a blank)" {
+  # After stripping, an all-control cwd would be only spaces; it must collapse to
+  # the "?" placeholder, and all three parsers must agree (the awk path extracts
+  # from such a line where jq/python reject it as invalid JSON).
+  co="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-cwdonly.jsonl"
+  printf '{"aiTitle":"t","cwd":"%b"}\n' '\007\007' > "$co"
+  for shadow in '' 'jq' 'jq python3'; do
+    run env CSP_CLAUDE_DIR="$CSP_CLAUDE_DIR" CSP_SHADOW="$shadow" bash -c '
+      command() { for s in $CSP_SHADOW; do if [ "$1" = "-v" ] && [ "$2" = "$s" ]; then return 1; fi; done; builtin command "$@"; }
+      . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
+      csp_session_meta "'"$co"'"'
+    [ "$(csp_field "$output" 2)" = "?" ]
+  done
+}
+
+@test "meta: an empty aiTitle falls back to lastPrompt on ALL parsers (jq // trap)" {
+  # Regression: jq's // treats a present-but-empty "aiTitle":"" as a value, so
+  # jq showed (untitled) while python/awk correctly used the prompt. Now all
+  # three select only a non-empty string.
+  et="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-empty.jsonl"
+  printf '%s\n' '{"aiTitle":"","lastPrompt":"real prompt here","cwd":"/Volumes/demo/alpha"}' > "$et"
+  for shadow in '' 'jq' 'jq python3'; do
+    run env CSP_CLAUDE_DIR="$CSP_CLAUDE_DIR" CSP_SHADOW="$shadow" bash -c '
+      command() { for s in $CSP_SHADOW; do if [ "$1" = "-v" ] && [ "$2" = "$s" ]; then return 1; fi; done; builtin command "$@"; }
+      . '"$BATS_TEST_DIRNAME"'/../lib/core.sh; . '"$BATS_TEST_DIRNAME"'/../lib/sessions.sh
+      csp_session_meta "'"$et"'"'
+    [ "$(csp_field "$output" 1)" = "real prompt here" ]
+  done
+}
+
 @test "meta: a huge tab-less title is handled quickly (no quadratic freeze)" {
   # Regression test for the quadratic bash-3.2 string split. A ~256KB single
   # title must be clipped by the extractor, so this returns effectively instantly

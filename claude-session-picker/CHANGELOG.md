@@ -36,6 +36,21 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   input history. tmux defaults to `mouse off`, which turns the wheel into arrow
   keys sent to the program; the picker now sets `mouse on` on its own dedicated
   socket (your `~/.tmux.conf` is untouched).
+- **Control characters in a session's `cwd` are now stripped** in every metadata
+  parser (jq/python/awk), matching the title handling — a crafted or corrupted
+  transcript can no longer emit an escape sequence to the screen or break the
+  `--list` TSV through the project column.
+- **Empty `aiTitle` falls back to the last prompt consistently.** The jq path
+  treated a present-but-empty `"aiTitle":""` as a value (so a session showed
+  `(untitled)` under jq but the real prompt under python/awk); all three parsers
+  now select only a non-empty string.
+- **Delete is safer.** Liveness is re-checked at the moment of deletion (not from
+  the possibly-stale list snapshot), so a session resumed since the last load
+  can't be deleted mid-run; and a failed delete is now reported instead of
+  silently looking like success.
+- **Docs corrected.** The safety notes no longer claim the tool "never deletes"
+  anything under `~/.claude`; they now state that browsing is read-only while the
+  explicit `d` action permanently removes a transcript after confirmation.
 - **Status bar never wraps the frame.** Spacing now uses display width (columns)
   throughout — a character count under-measured a CJK filter query (1 char = 2
   columns) and could push the bar past the frame; the shown query is bounded to
@@ -46,6 +61,12 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
 - Added a `shellcheck` gate to `test/run-all.sh` (runs if installed, skips
   cleanly if not) with a documented, minimal exclude list; the whole tree is
   clean. Removed dead locals/variables it surfaced.
+- Shared `csp_pause_notice` helper for the "show a message, wait for Enter"
+  moments (session still running, delete failed, tmux not installed), so they
+  toggle terminal state identically. Dropped the now-unused `csp_lives` array
+  (delete re-checks liveness live; the marker uses a local). `test/render.bats`
+  gained status-bar-overflow coverage and `sessions.bats` gained cwd-sanitize,
+  empty-title, and control-only-cwd regression tests. Test suite grew to 192.
 - New pure, unit-tested helpers in `lib/core.sh`: `csp_filter_indices`,
   `csp_next_attention`, `csp_count_attention`. A shared `csp_prompt_line` now
   backs both the delete confirmation and the filter query (one home for the

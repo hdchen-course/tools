@@ -324,7 +324,6 @@ csp_projects=()
 csp_fullprojects=()   # full cwd path, kept for the resume `cd`
 csp_files=()          # on-disk .jsonl path, kept for delete
 csp_ages=()
-csp_lives=()
 csp_states=()         # per-session hook state: working/waiting/"" (for ●/✳)
 csp_markers=()        # per-session resolved marker glyph (●/✳/space)
 csp_rows=()           # fully-formatted row body, precomputed once at load
@@ -422,7 +421,7 @@ csp_load_sessions() {
   local line file id meta title fullcwd project mtime now running is_live marker row
   local tab=$'\t'
   csp_ids=(); csp_titles=(); csp_projects=(); csp_fullprojects=()
-  csp_ages=(); csp_lives=(); csp_files=(); csp_states=(); csp_rows=()
+  csp_ages=(); csp_files=(); csp_states=(); csp_rows=()
   csp_markers=(); csp_line_normal=(); csp_line_selected=()
   csp_count=0
   now=$(csp_now_epoch)
@@ -456,7 +455,6 @@ csp_load_sessions() {
     csp_titles[$csp_count]="$title"
     csp_projects[$csp_count]="$project"
     csp_ages[$csp_count]="$(csp_humanize_age "$((now - mtime))")"
-    csp_lives[$csp_count]="$is_live"
     # Per-session hook state (working/waiting) for the ●/✳ marker; empty if the
     # hooks aren't installed, in which case the marker falls back to live/blank.
     # Skip the lookup entirely when no state dir exists (hooks never ran).
@@ -908,6 +906,20 @@ csp_prompt_line() {
   csp_enter_raw_mode
 }
 
+# csp_pause_notice MSG — show MSG, wait for the user to press Enter, then carry
+# on. The single home for the "something needs your attention; acknowledge and
+# continue" pattern (a session is still running, a delete failed, tmux isn't
+# installed): fully restore the terminal so MSG is readable, show it, wait for
+# one line, then re-enter raw mode. Centralised so every notice toggles terminal
+# state identically. MSG should already contain any leading newline it wants.
+csp_pause_notice() {
+  local _
+  csp_restore_terminal
+  csp_tty_print "$1"
+  csp_tty_readline _
+  csp_enter_raw_mode
+}
+
 # csp_confirm PROMPT — ask a yes/no question and return 0 only for an explicit
 # "y". Uses the shared cooked-mode line prompt. Used to guard the destructive
 # delete action.
@@ -945,17 +957,19 @@ csp_filter_prompt() {
 # session (one Claude is currently running) — killing its file mid-run would be
 # surprising; the user should quit that Claude first.
 csp_action_delete() {
-  local idx="$1" title file
+  local idx="$1" title file id
   [ "$csp_count" -gt 0 ] || return 0
   title="${csp_titles[$idx]}"
   file="${csp_files[$idx]}"
+  id="${csp_ids[$idx]}"
 
-  if [ "${csp_lives[$idx]}" = "1" ]; then
-    csp_restore_terminal
-    local _
-    csp_tty_print "$(printf '\n"%s" is running right now — quit that Claude first, then delete.\nPress Enter to continue…' "$title")"
-    csp_tty_readline _
-    csp_enter_raw_mode
+  # Liveness check, re-evaluated NOW rather than trusting the cached csp_lives
+  # from the last load: a session could have been resumed (by us in tmux, or by
+  # another terminal) since then, and deleting a live session's transcript
+  # mid-run is exactly what we promise not to do. Re-scan the running ids here so
+  # the guard reflects the current moment, not a stale snapshot.
+  if csp_is_live "$id" "$(csp_running_session_ids)"; then
+    csp_pause_notice "$(printf '\n"%s" is running right now — quit that Claude first, then delete.\nPress Enter to continue…' "$title")"
     return 0
   fi
 
@@ -963,6 +977,12 @@ csp_action_delete() {
     if csp_delete_session_file "$file"; then
       # Forget any recorded ●/✳ state for the now-deleted session (no residue).
       csp_clear_state "$(csp_session_id_from_path "$file")"
+    else
+      # Deleting is a "doing" action, so a failure is surfaced, not swallowed:
+      # a permission error, read-only filesystem, or a lost race must not look
+      # like success (the user might believe sensitive history is gone when it
+      # is still on disk). Tell them, then continue.
+      csp_pause_notice "$(printf '\nCould not delete "%s".\nIt may be protected, on a read-only disk, or already gone — it is still on disk if it existed.\nPress Enter to continue…' "$title")"
     fi
     csp_load_sessions
   fi
@@ -978,11 +998,7 @@ csp_toggle_backend() {
     CSP_ACTIVE_BACKEND="hub"
   else
     if ! csp_tmux_available; then
-      csp_restore_terminal
-      local _
-      csp_tty_print "$(printf '\ntmux mode needs the tmux command, which is not installed.\nInstall it (e.g. brew install tmux) then press t again. Enter to continue…')"
-      csp_tty_readline _
-      csp_enter_raw_mode
+      csp_pause_notice "$(printf '\ntmux mode needs the tmux command, which is not installed.\nInstall it (e.g. brew install tmux) then press t again. Enter to continue…')"
       return 0
     fi
     CSP_ACTIVE_BACKEND="tmux"
