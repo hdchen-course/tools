@@ -63,11 +63,21 @@ csp_read_state() {
 
 # csp_write_state ID VALUE — record a session's state (best-effort; if the dir
 # can't be created or written we just skip it, so this never fails a caller).
+#
+# The write is ATOMIC: we print to a unique temp file, then `mv` it into place.
+# A rename on the same filesystem is atomic, so a concurrent reader (the picker
+# loading the list) never sees a half-written or truncated file — it sees either
+# the old contents or the new, never a torn value. Two hooks firing at once
+# (e.g. a fast working→waiting) each land whole; last writer wins, which is the
+# correct "most recent event" outcome. The temp name includes $$ so parallel
+# hook processes don't clobber each other's temp file mid-write.
 csp_write_state() {
-  local id="$1" v="$2" f
+  local id="$1" v="$2" f tmp
   f=$(csp_state_file "$id")
   mkdir -p "$CSP_STATE_DIR" 2>/dev/null || return 0
-  { printf '%s\n' "$v" > "$f"; } 2>/dev/null || true
+  tmp="$f.$$.tmp"
+  { printf '%s\n' "$v" > "$tmp"; } 2>/dev/null || return 0
+  mv -f -- "$tmp" "$f" 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null; return 0; }
 }
 
 # csp_clear_state ID — forget a session's state (e.g. once you've opened it, so

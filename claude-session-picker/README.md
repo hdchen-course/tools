@@ -203,7 +203,7 @@ claude-session-picker
 | `/` | **filter** — type a word from a title or project to narrow the list; empty input (just Enter) shows everything again |
 | `Enter` | open the selected session |
 | `*` | jump to the next session that **needs you** (`✳`), wrapping around |
-| `n` | start a **new** session in the directory you launched the picker from |
+| `n` | start a **new** session in the directory you launched the picker from (in tmux mode, the directory you last re-attached from) |
 | `d` or `x` | **delete** the selected session's history (asks you to confirm first) |
 | `t` | **toggle** between hub and tmux mode (see below); the choice is remembered. Turning tmux **on** re-launches the picker inside tmux |
 | `R` or `l` | reload the list |
@@ -230,7 +230,9 @@ Opening a session `cd`s into that session's original project directory first (if
 it still exists) and runs `claude --resume <id>`, so you land where you left off.
 What happens next depends on the mode: hub returns you to the menu when you quit
 Claude; tmux opens the session in a new window and switches you to it, while the
-menu keeps running in window 0 — press `Ctrl-b` then `0` to come back to it.
+menu keeps running in window 0 — press `Ctrl-b` then `0` to come back to it. (If
+that session is already open in a tmux window, `Enter` just switches you to it
+rather than starting a second copy.)
 
 The list scrolls. However many sessions you have, only the rows that fit on your
 terminal are drawn, the highlighted row is always kept in view, and a

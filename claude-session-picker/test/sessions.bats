@@ -526,6 +526,46 @@ EOF
   [ "$output" = "waiting" ]
 }
 
+@test "state: write is atomic — leaves no temp file and lands the value whole" {
+  csp_write_state "sess-atomic" "working"
+  # The final state file holds exactly the value...
+  run csp_read_state "sess-atomic"
+  [ "$output" = "working" ]
+  # ...and no ".$$.tmp" scratch file is left behind in the state dir (which would
+  # mean the rename didn't happen or a temp leaked).
+  run bash -c 'ls "'"$CSP_STATE_DIR"'"/*.tmp 2>/dev/null | wc -l | tr -d " "'
+  [ "$output" = "0" ]
+}
+
+@test "state: concurrent writers leave a valid value and no temp residue" {
+  # Two background processes hammer the same state file with alternating
+  # working/waiting writes. This is the concurrency the atomic write is FOR.
+  # We can't deterministically catch a torn read mid-flight on a fast local FS
+  # (that timing is exactly why the guarantee must be structural, not tested by
+  # luck), so we assert what IS deterministic after the storm: the file survives,
+  # holds exactly one valid token (the rename never leaves it empty or partial),
+  # and NO .tmp scratch file leaked from any writer. With a truncate-in-place
+  # write the temp-residue check still passes, but the structural guarantee — a
+  # reader only ever sees the pre- or post-rename inode — is what this documents.
+  id="sess-race"
+  csp_write_state "$id" "working"
+  f="$(csp_state_file "$id")"
+  ( i=0; while [ "$i" -lt 200 ]; do csp_write_state "$id" working; i=$((i+1)); done ) &
+  w1=$!
+  ( i=0; while [ "$i" -lt 200 ]; do csp_write_state "$id" waiting; i=$((i+1)); done ) &
+  w2=$!
+  wait "$w1" "$w2" 2>/dev/null || true
+  # Survives as exactly one valid token (never emptied by a mid-write truncate).
+  v=$(cat "$f" 2>/dev/null)
+  case "$v" in working|waiting) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
+  # csp_read_state agrees, and no temp file leaked from the concurrent writers.
+  run csp_read_state "$id"; case "$output" in working|waiting) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
+  run bash -c 'ls "'"$CSP_STATE_DIR"'"/*.tmp 2>/dev/null | wc -l | tr -d " "'
+  [ "$output" = "0" ]
+}
+
 @test "state: reading an unknown session yields nothing (not an error)" {
   run csp_read_state "never-seen"
   [ "$status" -eq 0 ]

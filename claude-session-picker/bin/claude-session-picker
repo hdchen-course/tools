@@ -1202,8 +1202,15 @@ csp_main() {
            csp_clear_state "${csp_ids[$mi]}"
            csp_open "${csp_ids[$mi]}" "${csp_fullprojects[$mi]}" "$label"
          fi ;;
-      n) # Start a brand-new session (in the current directory).
-         csp_open "new" "$PWD" "new" ;;
+      n) # Start a brand-new session. In hub mode that's simply $PWD; as the
+         # resident tmux menu, use the directory the client actually re-attached
+         # from (window 0 keeps its original cwd), so `n` isn't stuck in the dir
+         # the picker was first launched from.
+         if csp_inside_tmux; then
+           csp_open "new" "$(csp_tmux_launch_pwd)" "new"
+         else
+           csp_open "new" "$PWD" "new"
+         fi ;;
       d|x) # Delete the selected session (asks to confirm first). Maps the view
            # position to a model index; the reload rebuilds the view afterwards.
          if [ "$csp_view_count" -gt 0 ]; then
@@ -1236,8 +1243,15 @@ csp_main() {
 #     (everything keeps running, you get your shell back, and `claude-session-picker`
 #     later re-attaches to the same menu). If the menu is the only window, there's
 #     nothing to strand, so we just exit normally.
+#
+# The decision keys off csp_inside_tmux — our PHYSICAL location — NOT the logical
+# CSP_ACTIVE_BACKEND. Those differ after you press `t` to toggle back to hub
+# while still sitting inside the tmux menu window: the backend says "hub" but the
+# picker is still window 0 with live sessions beside it, so quitting must still
+# detach (never strand the client on a bare shell / kill neighbours). Physical
+# state is what determines the safe action.
 csp_quit() {
-  if [ "$CSP_ACTIVE_BACKEND" = "tmux" ] && csp_inside_tmux; then
+  if csp_inside_tmux; then
     local wins
     wins=$(csp_tmux list-windows -t "=$CSP_TMUX_SESSION" 2>/dev/null | grep -c . || printf '0')
     if [ "$wins" -gt 1 ]; then

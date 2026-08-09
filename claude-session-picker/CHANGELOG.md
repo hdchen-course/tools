@@ -32,6 +32,22 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   without the picker taking on a fuzzy-finder dependency.
 
 ### Fixed
+- **tmux: no duplicate concurrent resume.** Opening a session that already has a
+  window switches to it instead of launching a second `claude --resume` over the
+  same transcript. Each session window is tagged with its id (`@csp_sid`).
+- **tmux: quitting is consistent after toggling to hub.** `q` now decides
+  detach-vs-exit from whether you're physically inside the tmux menu, not the
+  logical backend — so toggling to hub (`t`) while still in the menu no longer
+  strands the client or kills neighbouring session windows.
+- **tmux: `n` opens in the directory you re-attached from**, not the one the
+  resident picker was first launched in (recorded per-attach in a tmux session
+  env var, read live).
+- **tmux: menu recovery is checked.** If rebuilding the menu window (after a
+  previous `q` closed it) fails, the picker falls back to hub instead of
+  attaching you to an arbitrary window with a menu-less status bar.
+- **Hook state writes are atomic** (temp file + rename), so the picker never
+  reads a half-written `working`/`waiting` state and overlapping hooks can't
+  corrupt it.
 - **tmux: the scroll wheel now scrolls the pane** instead of walking a session's
   input history. tmux defaults to `mouse off`, which turns the wheel into arrow
   keys sent to the program; the picker now sets `mouse on` on its own dedicated
@@ -66,7 +82,8 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   toggle terminal state identically. Dropped the now-unused `csp_lives` array
   (delete re-checks liveness live; the marker uses a local). `test/render.bats`
   gained status-bar-overflow coverage and `sessions.bats` gained cwd-sanitize,
-  empty-title, and control-only-cwd regression tests. Test suite grew to 192.
+  empty-title, and control-only-cwd regression tests, plus tmux dedup /
+  brand-new-session and atomic-state-write coverage. Test suite grew to 196.
 - New pure, unit-tested helpers in `lib/core.sh`: `csp_filter_indices`,
   `csp_next_attention`, `csp_count_attention`. A shared `csp_prompt_line` now
   backs both the delete confirmation and the filter query (one home for the

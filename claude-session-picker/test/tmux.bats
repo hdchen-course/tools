@@ -62,6 +62,34 @@ make_home() {
   [ "$(printf '%s\n' "$output" | sed -n 3p)" = "2:beta" ]
 }
 
+@test "open: resuming the SAME session twice reuses its window (no duplicate)" {
+  # Resuming one transcript twice would run two Claude processes over the same
+  # conversation. The second Enter must switch to the existing window, not open
+  # a new one. Windows are tagged with @csp_sid; the second open finds the tag.
+  make_home
+  csp_tmux_open id-a /tmp alpha
+  csp_tmux_open id-b /tmp beta
+  before=$(csp_tmux list-windows -t "=$CSP_TMUX_SESSION" | grep -c .)
+  # Re-open id-a: should NOT add a window.
+  csp_tmux_open id-a /tmp alpha-again
+  after=$(csp_tmux list-windows -t "=$CSP_TMUX_SESSION" | grep -c .)
+  [ "$before" = "$after" ]
+  # The session's ACTIVE window is now the original id-a window (dedup selected
+  # it). Query the active window's tag via the session's active-window flag.
+  active_sid=$(csp_tmux list-windows -t "=$CSP_TMUX_SESSION" \
+    -F '#{window_active} #{@csp_sid}' | awk '$1==1 {print $2}')
+  [ "$active_sid" = "id-a" ]
+}
+
+@test "open: a brand-new ('new') session always opens fresh, never deduped" {
+  make_home
+  csp_tmux_open new /tmp one
+  csp_tmux_open new /tmp two
+  # Two distinct 'new' sessions → two windows besides the menu.
+  n=$(csp_tmux list-windows -t "=$CSP_TMUX_SESSION" | grep -c .)
+  [ "$n" = "3" ]
+}
+
 @test "open: a NEW session window inherits our window-status-format (bug D)" {
   make_home
   csp_tmux_open id-a /tmp alpha

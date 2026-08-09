@@ -216,14 +216,26 @@ csp_tmux_enter() {
   if csp_tmux has-session -t "=$CSP_TMUX_SESSION" 2>/dev/null; then
     csp_tmux_configure_home
     # Ensure there's a live menu to land on: if no window is named "menu" (e.g.
-    # a previous quit closed it), create one and make it window 0. We SWAP it
+    # a previous quit closed it), recreate one and make it window 0. We SWAP it
     # into index 0 rather than move-window -k (which would KILL whatever session
     # occupies index 0 — destroying a running Claude); swap is non-destructive.
+    #
+    # Every recovery step is CHECKED. Previously the results were ignored and we
+    # attached regardless — so if new-window/swap-window failed, the client would
+    # land on an arbitrary Claude window with no resident menu while the status
+    # bar still claimed window 0 was the menu. If recovery can't complete we
+    # return non-zero so the caller falls back to hub instead of attaching into a
+    # menu-less, misleading state.
     if ! csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_name}' 2>/dev/null \
          | grep -qx menu; then
-      csp_tmux new-window -t "=$CSP_TMUX_SESSION" -n menu "$cmd" 2>/dev/null
-      csp_tmux swap-window -s "=$CSP_TMUX_SESSION:\$" -t "=$CSP_TMUX_SESSION:0" 2>/dev/null
+      csp_tmux new-window -t "=$CSP_TMUX_SESSION" -n menu "$cmd" 2>/dev/null || return 1
+      csp_tmux swap-window -s "=$CSP_TMUX_SESSION:\$" -t "=$CSP_TMUX_SESSION:0" 2>/dev/null || return 1
+      # Confirm the recovery actually produced a menu window at index 0 before we
+      # commit to attaching (belt-and-suspenders against a partial swap).
+      csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_index}:#{window_name}' 2>/dev/null \
+        | grep -qx '0:menu' || return 1
     fi
+    csp_tmux_record_launch_pwd    # so `n` follows where this client re-attached
     # exec the REAL tmux (a bare `exec csp_tmux` fails — exec can't run a shell
     # function). If exec somehow can't replace us, return non-zero so the caller
     # restores the terminal instead of falling through in a broken state.
@@ -238,9 +250,39 @@ csp_tmux_enter() {
   # caller falls back to hub cleanly.
   csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu "$cmd" 2>/dev/null || return 1
   csp_tmux_configure_home
+  csp_tmux_record_launch_pwd    # seed the launch dir for `n` (see helper)
   exec command tmux -L "$CSP_TMUX_SOCKET" attach-session -t "=$CSP_TMUX_SESSION"
   csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null   # only if exec failed
   return 1
+}
+
+# csp_tmux_record_launch_pwd — remember the directory the CURRENT client is
+# attaching from, so a new session (`n`) opens there rather than in whatever
+# directory the resident picker (window 0) was first launched from. Stored as a
+# tmux session env var the running picker reads live at press time (see
+# csp_tmux_launch_pwd). Called on every attach — fresh or re-attach — so the
+# value always reflects the latest client. Best-effort.
+csp_tmux_record_launch_pwd() {
+  csp_tmux set-environment -t "=$CSP_TMUX_SESSION" CSP_LAUNCH_PWD "$PWD" 2>/dev/null
+}
+
+# csp_tmux_launch_pwd — the directory a NEW session (`n`) should start in when
+# the picker is running as the resident tmux menu. tmux window 0 keeps the cwd it
+# was first launched from, but a later re-attach from another directory records
+# that directory in the CSP_LAUNCH_PWD session env var (see csp_tmux_enter). We
+# read it live here so `n` follows where you actually re-attached from. Falls
+# back to the picker's own $PWD when unset/unreadable or the dir no longer exists.
+csp_tmux_launch_pwd() {
+  local d
+  # When set, tmux prints "CSP_LAUNCH_PWD=/the/path" on stdout; when unset it
+  # prints "unknown variable: …" to stderr and exits non-zero. We send stderr to
+  # /dev/null, so an unset var yields an empty $d. Stripping only the "NAME="
+  # prefix preserves a path that itself contains '='. Any empty/invalid result,
+  # or a directory that no longer exists, falls back to the picker's own $PWD.
+  d=$(csp_tmux show-environment -t "=$CSP_TMUX_SESSION" CSP_LAUNCH_PWD 2>/dev/null)
+  d="${d#CSP_LAUNCH_PWD=}"
+  [ -n "$d" ] && [ -d "$d" ] || d="$PWD"
+  printf '%s' "$d"
 }
 
 # csp_tmux_open ID PROJECT LABEL
@@ -259,9 +301,32 @@ csp_tmux_enter() {
 # injection. This assumes we are already inside the holding tmux session (the
 # picker put itself there via csp_tmux_enter at startup).
 csp_tmux_open() {
-  local id="$1" project="$2" label="$3" cmd win
+  local id="$1" project="$2" label="$3" cmd win existing
 
   label=$(csp_tmux_sanitize_label "$label")
+
+  # Don't open a SECOND window for a session already running in this holding
+  # session: resuming the same transcript twice means two Claude processes
+  # writing the same conversation. Each session window is tagged with a
+  # `@csp_sid` window option (set below); if one already carries this id, just
+  # switch to it. Only meaningful for a real resume — a brand-new session ("new")
+  # has no id yet, so it always opens fresh.
+  if [ "$id" != "new" ]; then
+    # Find a window already tagged with this session id. Each line is
+    # "<window_id> <sid>"; awk compares the WHOLE second field for exact equality
+    # ($2 == want), so an id can never match a window whose tag merely contains it
+    # (e.g. "id-a" won't match a window tagged "id-abc"), and the empty tag on the
+    # menu window can't match a real id. awk (not a `while read` subshell) also
+    # keeps the id out of any pattern/glob and reads cleanly under errexit.
+    existing=$(csp_tmux list-windows -t "=$CSP_TMUX_SESSION" \
+      -F '#{window_id} #{@csp_sid}' 2>/dev/null \
+      | awk -v want="$id" '$2 == want {print $1; exit}')
+    if [ -n "$existing" ]; then
+      csp_tmux select-window -t "$existing" 2>/dev/null && return 0
+      # If selecting the existing window somehow failed, fall through and open a
+      # fresh one rather than leaving the user stuck.
+    fi
+  fi
 
   # Compose the shell command the new window will run.
   if [ -n "$project" ] && [ -d "$project" ]; then
@@ -281,6 +346,10 @@ csp_tmux_open() {
   # picker's own loop keeps running in window 0 the whole time.
   win=$(csp_tmux new-window -t "=$CSP_TMUX_SESSION" -P -F '#{window_id}' -n "$label" "$cmd" 2>/dev/null) \
     || return 1
+  # Tag the window with the session id so a later Enter on the same session finds
+  # and reuses it (see the dedup check above). Best-effort: a failed tag only
+  # means we might later open a duplicate, never a crash.
+  [ "$id" != "new" ] && csp_tmux set-option -w -t "$win" '@csp_sid' "$id" 2>/dev/null
   csp_tmux select-window -t "$win" 2>/dev/null || return 1
   return 0
 }
