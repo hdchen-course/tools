@@ -290,6 +290,24 @@ csp_tmux_launch_pwd() {
   printf '%s' "$d"
 }
 
+# csp_tmux_window_for_sid ID — print the tmux window id (on OUR holding session)
+# whose @csp_sid tag exactly equals ID, or nothing. Each list line is
+# "<window_id> <sid>"; awk compares the WHOLE second field ($2 == want) so an id
+# can never match a window whose tag merely contains it (e.g. "id-a" won't match
+# "id-abc"), and the empty tag on the menu window can't match a real id. awk
+# (not a `while read` subshell) keeps the id out of any glob and reads cleanly
+# under errexit. Used BOTH to dedup an open (switch instead of a second copy) and
+# by the delete guard (a session with a live window must not be deleted, whatever
+# its hook state — a bare `n` session that's merely "waiting" is still in use).
+csp_tmux_window_for_sid() {
+  local id="$1"
+  [ -n "$id" ] && [ "$id" != "new" ] || return 0
+  csp_tmux_available || return 0
+  csp_tmux list-windows -t "=$CSP_TMUX_SESSION" \
+    -F '#{window_id} #{@csp_sid}' 2>/dev/null \
+    | awk -v want="$id" '$2 == want {print $1; exit}'
+}
+
 # csp_tmux_open ID PROJECT LABEL
 #
 # Open a session in its OWN tmux window and switch to it, WITHOUT killing the
@@ -317,15 +335,7 @@ csp_tmux_open() {
   # switch to it. Only meaningful for a real resume — a brand-new session ("new")
   # has no id yet, so it always opens fresh.
   if [ "$id" != "new" ]; then
-    # Find a window already tagged with this session id. Each line is
-    # "<window_id> <sid>"; awk compares the WHOLE second field for exact equality
-    # ($2 == want), so an id can never match a window whose tag merely contains it
-    # (e.g. "id-a" won't match a window tagged "id-abc"), and the empty tag on the
-    # menu window can't match a real id. awk (not a `while read` subshell) also
-    # keeps the id out of any pattern/glob and reads cleanly under errexit.
-    existing=$(csp_tmux list-windows -t "=$CSP_TMUX_SESSION" \
-      -F '#{window_id} #{@csp_sid}' 2>/dev/null \
-      | awk -v want="$id" '$2 == want {print $1; exit}')
+    existing=$(csp_tmux_window_for_sid "$id")
     if [ -n "$existing" ]; then
       csp_tmux select-window -t "$existing" 2>/dev/null && return 0
       # If selecting the existing window somehow failed, fall through and open a

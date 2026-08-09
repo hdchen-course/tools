@@ -125,3 +125,20 @@ _load_hook_helpers() {
   case "$out" in *'a\\b'*) ok=1 ;; *) ok=0 ;; esac
   [ "$ok" = "1" ]
 }
+
+@test "install: hook command produces VALID JSON even for a newline/tab path" {
+  # A POSIX path may contain control chars; the command value must still form a
+  # parseable JSON string (\n, \t, \u00XX), not a raw control char. We build the
+  # FULL {"command":"…"} object and parse it with python (available in CI) — a
+  # fragment check would miss an invalid-control-char error.
+  command -v python3 >/dev/null 2>&1 || skip "python3 not available to validate JSON"
+  _load_hook_helpers
+  ROOT="$(printf '/tmp/a\nb\tc')"        # embedded newline + tab
+  out=$(csp_hook_command working)
+  printf '{"command":"%s"}\n' "$out" > "$BATS_TEST_TMPDIR/h.json"
+  run python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["command"])' "$BATS_TEST_TMPDIR/h.json"
+  [ "$status" -eq 0 ]                    # parses without JSONDecodeError
+  # The decoded command still starts with the single-quoted (inert) path.
+  case "$output" in "'/tmp/a"*) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
+}

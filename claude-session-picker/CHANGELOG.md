@@ -112,8 +112,10 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   empty-title, and control-only-cwd regression tests, plus tmux dedup /
   brand-new-session and atomic-state-write coverage, plus full-path/full-title
   filter matching, a narrow-frame badge+filter overflow guard, and orphaned-menu
-  recovery, plus a status-bar right-block boundary (CSP_INNER-exact) case. Test
-  suite grew to 200.
+  recovery, plus a status-bar right-block boundary (CSP_INNER-exact) case, an
+  open-tmux-window delete guard, a delete confirm-race action test, installer
+  control-char JSON validity, and an unrelated-tmux hook-isolation test. Test
+  suite grew to 211.
 - New pure, unit-tested helpers in `lib/core.sh`: `csp_filter_indices`,
   `csp_next_attention`, `csp_count_attention`. A shared `csp_prompt_line` now
   backs both the delete confirmation and the filter query (one home for the

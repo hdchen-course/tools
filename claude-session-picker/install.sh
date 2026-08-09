@@ -56,14 +56,40 @@ csp_sh_quote() {
 }
 
 # csp_json_escape STRING — escape STRING for embedding inside a JSON double-quoted
-# value: backslash and double-quote are escaped (control chars don't occur in a
-# filesystem path we build here). Applied to the WHOLE shell command so the
-# printed snippet is always valid JSON even if the path contains " or \.
+# value. Handles backslash, double-quote, the named control escapes
+# (\b \f \n \t \r), and any other control byte (< 0x20) as \u00XX — so even a
+# POSIX path containing a newline or tab produces VALID JSON. Applied to the
+# WHOLE shell command so the printed snippet always parses.
+#
+# We use awk (single pass, present everywhere) rather than bash parameter
+# expansion because bash 3.2 can't emit a \u00XX for an arbitrary control byte.
 csp_json_escape() {
-  local s="$1"
-  s=${s//\\/\\\\}      # \  -> \\   (first, so we don't double-escape the next)
-  s=${s//\"/\\\"}      # "  -> \"
-  printf '%s' "$s"
+  printf '%s' "$1" | awk '
+    BEGIN {
+      # Map each byte value 0..31 to its JSON \u00XX (named form where defined).
+      for (i = 0; i < 32; i++) esc[sprintf("%c", i)] = sprintf("\\u%04x", i)
+      esc[sprintf("%c", 8)]  = "\\b"; esc[sprintf("%c", 12)] = "\\f"
+      esc[sprintf("%c", 10)] = "\\n"; esc[sprintf("%c", 13)] = "\\r"
+      esc[sprintf("%c", 9)]  = "\\t"
+    }
+    {
+      # awk splits input into records at \n, so a literal newline in the value
+      # arrives as a record boundary: re-insert it (escaped) between records. (A
+      # single TRAILING newline would be dropped by awk, but the only caller
+      # feeds a $(cd&&pwd) path, which never has one; output stays valid JSON.)
+      if (NR > 1) printf "\\n"
+      s = $0
+      out = ""
+      n = length(s)
+      for (j = 1; j <= n; j++) {
+        c = substr(s, j, 1)
+        if (c == "\\") out = out "\\\\"
+        else if (c == "\"") out = out "\\\""
+        else if (c in esc) out = out esc[c]
+        else out = out c
+      }
+      printf "%s", out
+    }'
 }
 
 # csp_hook_command STATE — the fully-safe JSON string for a hook's "command"

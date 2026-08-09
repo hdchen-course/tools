@@ -572,12 +572,16 @@ EOF
   [ -z "$output" ]
 }
 
-# csp_delete_would_hit_live lives in bin/ (wiring), so source that with the
-# main loop suppressed. It must block deletion of a session the hook marks
-# "working" (covers a bare `n` session the --resume scan can't see), but NOT a
-# "waiting"/idle one (which may be a crashed session that must stay deletable).
+# csp_delete_would_hit_live lives in bin/ (wiring), so source that with the main
+# loop suppressed. Its THREE signals: a live --resume process, an open tmux
+# window tagged @csp_sid=<id> on our socket, or hook state "working". A lone
+# "waiting" hook state with NO live window/process stays deletable (that's the
+# crashed/idle case). We pass CSP_TMUX_SOCKET so the tmux query targets a
+# throwaway socket, never the user's real tmux.
 _delete_guard() {  # $1 = id
-  CSP_SOURCED_FOR_TEST=1 CSP_STATE_DIR="$CSP_STATE_DIR" bash -c '
+  CSP_SOURCED_FOR_TEST=1 CSP_STATE_DIR="$CSP_STATE_DIR" \
+  CSP_TMUX_SOCKET="${CSP_TMUX_SOCKET:-csp-dg-$$}" CSP_TMUX_SESSION="${CSP_TMUX_SESSION:-csptest}" \
+  bash -c '
     . "'"$BATS_TEST_DIRNAME"'/../bin/claude-session-picker"
     csp_delete_would_hit_live "'"$1"'" && echo LIVE || echo NOTLIVE'
 }
@@ -588,11 +592,53 @@ _delete_guard() {  # $1 = id
   [ "$(_delete_guard sess-working)" = "LIVE" ]
 }
 
-@test "delete-guard: a 'waiting' or idle session is NOT blocked (crashed must stay deletable)" {
+@test "delete-guard: a lone 'waiting'/idle session (no window, no process) stays deletable" {
   mkdir -p "$CSP_STATE_DIR"
   csp_write_state "sess-waiting" "waiting"
   [ "$(_delete_guard sess-waiting)" = "NOTLIVE" ]
   [ "$(_delete_guard sess-never-seen)" = "NOTLIVE" ]
+}
+
+@test "delete-guard: a bare session with an OPEN tmux window is live even when 'waiting'" {
+  command -v tmux >/dev/null 2>&1 || skip "tmux not installed"
+  mkdir -p "$CSP_STATE_DIR"
+  # A bare 'n' session: hook state is "waiting" (Claude stopped for input) and no
+  # --resume process exists — but its tmux window is open, so it IS in use and
+  # must NOT be deletable. This is the High finding the review caught.
+  export CSP_TMUX_SOCKET="csp-dgwin-$$" CSP_TMUX_SESSION="csptest"
+  csp_write_state "sess-barewin" "waiting"
+  tmux -L "$CSP_TMUX_SOCKET" new-session -d -s "$CSP_TMUX_SESSION" -n work "sleep 30"
+  tmux -L "$CSP_TMUX_SOCKET" set-option -w -t "=$CSP_TMUX_SESSION:work" '@csp_sid' "sess-barewin"
+  result="$(_delete_guard sess-barewin)"
+  tmux -L "$CSP_TMUX_SOCKET" kill-server 2>/dev/null || true
+  [ "$result" = "LIVE" ]
+}
+
+@test "delete-action: a session that goes live DURING the confirm prompt is not unlinked" {
+  # Action-level: the second (post-confirmation) liveness check must stop the
+  # unlink even if the first check passed. We drive csp_action_delete with stubs:
+  # csp_confirm always says yes; csp_delete_would_hit_live is idle on the FIRST
+  # call and live on the SECOND (simulating a resume during the prompt); and we
+  # assert csp_delete_session_file is never reached (the file survives).
+  mkdir -p "$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha"
+  keep="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-keep.jsonl"
+  printf '%s\n' '{"type":"ai-title","aiTitle":"keep me"}' > "$keep"
+  run env CSP_SOURCED_FOR_TEST=1 CSP_CLAUDE_DIR="$CSP_CLAUDE_DIR" CSP_STATE_DIR="$CSP_STATE_DIR" \
+       CSP_TTY=/dev/null bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../bin/claude-session-picker"
+    # Minimal model with one session at index 0.
+    csp_count=1; csp_ids=(id-keep); csp_titles=("keep me")
+    csp_files=("'"$keep"'"); csp_view=(0); csp_view_count=1
+    # Stubs: confirm yes; terminal ops no-op; reload no-op; pause no-op.
+    csp_confirm() { return 0; }
+    csp_restore_terminal() { :; }; csp_enter_raw_mode() { :; }
+    csp_pause_notice() { :; }; csp_load_sessions() { :; }; csp_tty_print() { :; }; csp_tty_readline() { :; }
+    # First liveness check idle, second (post-confirm) live.
+    __n=0
+    csp_delete_would_hit_live() { __n=$(( __n + 1 )); [ "$__n" -ge 2 ]; }
+    csp_action_delete 0
+    [ -f "'"$keep"'" ] && echo SURVIVED || echo DELETED'
+  [ "$output" = "SURVIVED" ]
 }
 
 @test "state: an invalid stored value is ignored" {

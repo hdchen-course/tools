@@ -99,19 +99,42 @@ csp_state_count() {
   [ "$output" = "working" ]
 }
 
-@test "hook: inside tmux, tags the current window with @csp_sid (for dedup of bare sessions)" {
+@test "hook: inside OUR tmux, tags the current window with @csp_sid (dedup of bare sessions)" {
   command -v tmux >/dev/null 2>&1 || skip "tmux not installed"
   sock="csp-hooktag-$$"
   sd="$BATS_TEST_TMPDIR/hooktag-state"; mkdir -p "$sd"
-  # A detached session running an INTERACTIVE SHELL (no command), so $TMUX is set
-  # in the shell we send the hook into. A flag file marks completion.
+  # The window runs an interactive shell (so $TMUX is set) and we export
+  # CSP_TMUX_SOCKET to THIS socket, so csp_inside_tmux sees it as OUR tmux and the
+  # hook tags the window. A flag file marks completion.
   tmux -L "$sock" new-session -d -s s -n w
   sleep 0.5
   tmux -L "$sock" send-keys -t "=s:w" \
-    "printf '{\"session_id\":\"tag-me-77\"}' | CSP_STATE_DIR='$sd' '$HOOK' working; echo done > '$sd/flag'" Enter
+    "export CSP_TMUX_SOCKET='$sock' CSP_STATE_DIR='$sd'; printf '{\"session_id\":\"tag-me-77\"}' | '$HOOK' working; echo done > '$sd/flag'" Enter
   local i; for i in $(seq 1 40); do [ -f "$sd/flag" ] && break; sleep 0.25; done
   run tmux -L "$sock" show-options -w -t "=s:w" @csp_sid
   tmux -L "$sock" kill-server 2>/dev/null || true
   case "$output" in *tag-me-77*) ok=1 ;; *) ok=0 ;; esac
   [ "$ok" = "1" ]
+}
+
+@test "hook: inside an UNRELATED tmux, does NOT tag the window (no pollution)" {
+  command -v tmux >/dev/null 2>&1 || skip "tmux not installed"
+  # The user's own tmux: its socket name is NOT our CSP_TMUX_SOCKET, so
+  # csp_inside_tmux is false and the hook must leave the window's options alone.
+  sock="csp-foreign-$$"
+  sd="$BATS_TEST_TMPDIR/foreign-state"; mkdir -p "$sd"
+  tmux -L "$sock" new-session -d -s s -n w
+  sleep 0.5
+  tmux -L "$sock" send-keys -t "=s:w" \
+    "export CSP_TMUX_SOCKET='claude-sessions' CSP_STATE_DIR='$sd'; printf '{\"session_id\":\"nope-99\"}' | '$HOOK' working; echo done > '$sd/flag'" Enter
+  local i; for i in $(seq 1 40); do [ -f "$sd/flag" ] && break; sleep 0.25; done
+  # State IS still recorded (that part is socket-independent) — read from the
+  # same dir the hook wrote to.
+  run env CSP_STATE_DIR="$sd" bash -c '. "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/sessions.sh"; csp_read_state nope-99'
+  [ "$output" = "working" ]
+  # ...but the foreign window carries NO @csp_sid option.
+  run tmux -L "$sock" show-options -w -t "=s:w" @csp_sid
+  tmux -L "$sock" kill-server 2>/dev/null || true
+  case "$output" in *nope-99*) polluted=1 ;; *) polluted=0 ;; esac
+  [ "$polluted" = "0" ]
 }

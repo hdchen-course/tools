@@ -33,8 +33,11 @@ strip_sgr() { printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g'; }
   # CHARACTERS, not csp_display_width (which intentionally treats CJK as 2 cols
   # and would miscount the box-drawing glyphs).
   local c chars plain
-  # Include sub-6-column micro-pane widths: the title rule has fixed chrome
-  # ("┌─ … ┐") and must drop the title entirely rather than overflow.
+  # From 3 columns up (the practical floor — two corners + one rule column). A
+  # 1–2 column terminal can't hold even a bare border and isn't a usable TUI
+  # size; we only guarantee the frame fits at cols >= 3. Includes the sub-6-col
+  # micro-pane widths where the title rule must drop the title rather than
+  # overflow ("┌─ … ┐" has fixed chrome).
   for c in 3 4 5 6 10 20 30 40 42 60 80 200; do
     csp_build_chrome "$c" 5
     plain="$(strip_sgr "$CSP_CHROME_TOP")"

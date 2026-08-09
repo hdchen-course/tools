@@ -36,6 +36,11 @@ CSP_ROOT="$(cd "$(dirname "$csp_self")/.." && pwd)"
 . "$CSP_ROOT/lib/core.sh" 2>/dev/null || exit 0
 # shellcheck source=../lib/sessions.sh
 . "$CSP_ROOT/lib/sessions.sh" 2>/dev/null || exit 0
+# backend.sh gives us csp_inside_tmux (to tag ONLY our own tmux window below) and
+# the CSP_TMUX_SOCKET it keys off. Best-effort: if it can't load we simply skip
+# the tagging step later.
+# shellcheck source=../lib/backend.sh
+. "$CSP_ROOT/lib/backend.sh" 2>/dev/null || true
 
 state="${1:-}"
 case "$state" in working|waiting) ;; *) exit 0 ;; esac   # only valid states
@@ -81,16 +86,19 @@ esac
 
 csp_write_state "$id" "$state"
 
-# If this Claude is running inside a tmux window (our picker's or any tmux), tag
-# the CURRENT window with its session id. That lets the picker dedup a session
-# started with `n` — which launches a bare `claude` with no `--resume <id>` for
-# the picker to recognise — so a later Enter on it switches to this window
-# instead of opening a second copy over the same transcript. We use the AMBIENT
-# tmux ($TMUX is inherited by this hook process), so no socket/target guessing is
-# needed: the option lands on exactly the window this Claude occupies. Fully
-# best-effort and silent — a failure only means dedup falls back to "might open a
-# duplicate", never a broken hook.
-if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+# If this Claude is running inside the PICKER'S OWN tmux (its dedicated socket),
+# tag the current window with its session id. That lets the picker dedup a
+# session started with `n` — a bare `claude` with no `--resume <id>` to
+# recognise — so a later Enter switches to this window instead of opening a
+# second copy, and lets the delete guard treat it as in-use.
+#
+# We gate on csp_inside_tmux (true only when $TMUX's socket is OUR CSP_TMUX_SOCKET)
+# so we NEVER touch a window in the user's own, unrelated tmux — writing a
+# @csp_sid option there would pollute their session and could clobber a same-named
+# user option. Inside our socket the ambient $TMUX targets exactly this window, so
+# no -t guessing is needed. Fully best-effort and silent.
+if command -v tmux >/dev/null 2>&1 \
+   && command -v csp_inside_tmux >/dev/null 2>&1 && csp_inside_tmux; then
   tmux set-option -w '@csp_sid' "$id" >/dev/null 2>&1 || true
 fi
 exit 0
