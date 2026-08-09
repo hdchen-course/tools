@@ -23,6 +23,25 @@ Claude Session Picker   ● = running    mode: hub (one at a time)
 
 New here? The step-by-step user manual is at **[docs/MANUAL.md](docs/MANUAL.md)**.
 
+## Why not just `claude --resume`?
+
+Claude Code has its own `--resume` picker, and for a quick "reopen the last thing
+in *this* folder" it's perfect. This tool is for the other situation — when your
+sessions have piled up across many projects and you want one place to see and
+manage them all:
+
+| | `claude --resume` | claude-session-picker |
+|---|---|---|
+| Scope | sessions for the **current directory** | **every** session, **all** projects, in one list |
+| Sees at a glance | title + age | title + **project** + age, plus **●/✳ status** (which sessions are working vs waiting for you) |
+| Start a new session | separate command | `n`, right from the list |
+| Delete an old session | not from the picker | `d` (with confirmation) |
+| Run several at once | one at a time | optional **tmux mode** — each session in its own window, all live |
+| Jump straight in | pick, then it opens | same — `Enter` resumes into the session's original directory |
+
+If you only ever work in one repo, the built-in picker is enough. If you juggle
+many, this gives you the cross-project overview it doesn't.
+
 ## Two modes: hub and tmux
 
 The picker can *run* a session in one of two ways. **hub is the default
@@ -147,6 +166,12 @@ map of what's open **and** your reminder of the keys.
 | leave everything running and get your shell back | `Ctrl-b` then `d` (detach) |
 | come back later | `claude-session-picker` again, or `tmux attach -t claude-sessions` |
 
+The mouse works too: the scroll wheel scrolls the current pane (and clicking a
+window in the status bar selects it). This is on because tmux otherwise turns
+the wheel into arrow-key presses — which, inside a session, just walks its input
+history instead of scrolling. It's set only on the picker's own tmux socket, so
+your `~/.tmux.conf` is untouched.
+
 **How `Ctrl-b` works.** It's a *prefix*, not a command: press and release
 `Ctrl-b`, then press the second key. Nothing visible happens in between — that's
 normal, and it's why the status bar spells out the second key for you.
@@ -175,7 +200,9 @@ claude-session-picker
 |-----|--------|
 | `j` / `k`, or ↓ / ↑ | move the cursor (wraps around at both ends) |
 | `g` / `G` | jump to the first / last session |
+| `/` | **filter** — type a word from a title or project to narrow the list; empty input (just Enter) shows everything again |
 | `Enter` | open the selected session |
+| `*` | jump to the next session that **needs you** (`✳`), wrapping around |
 | `n` | start a **new** session in the directory you launched the picker from |
 | `d` or `x` | **delete** the selected session's history (asks you to confirm first) |
 | `t` | **toggle** between hub and tmux mode (see below); the choice is remembered. Turning tmux **on** re-launches the picker inside tmux |
@@ -184,6 +211,13 @@ claude-session-picker
 
 Only ↑ and ↓ are recognised as arrows; ← and → do nothing (a stray press won't
 quit). Just `q` or `Esc` quits.
+
+**Filtering a long list.** Press `/`, type any part of a session's title or
+project path, and Enter — the list narrows to the matches (case-insensitive;
+中文 works too). The status bar shows the active query and how many of the total
+are showing (e.g. `/parser  1/2 of 42`). Filter again with a different word, or
+press `/` then Enter on an empty line to clear it. The filter never changes your
+sessions — it only chooses which rows are on screen.
 
 Press `t` to switch modes right from the menu — no need to remember an
 environment variable. If tmux isn't installed it tells you so instead of

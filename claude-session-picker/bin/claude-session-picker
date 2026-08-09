@@ -47,7 +47,7 @@ set -u  # Treat use of an unset variable as an error — catches typos early.
 # changes and add a matching CHANGELOG.md entry; because the install is a
 # symlink updated in place by `git pull`, this is how a user (or a bug report)
 # knows exactly which build they're on.
-CSP_VERSION="1.1.1"
+CSP_VERSION="1.2.0"
 
 # --- Locate our own library files, following symlinks -----------------------
 # The installer symlinks this script into a bin dir, so we resolve the real
@@ -155,7 +155,10 @@ else
   CSP_C_SEL=""; CSP_C_LIVE=""; CSP_C_ATTN=""; CSP_C_DIM=""; CSP_C_KEY=""
 fi
 
-# Box-drawing characters (Unicode). These render the frame.
+# Box-drawing characters (Unicode). These render the frame. The set is kept
+# complete for readers even though the frame currently uses only horizontal
+# rules and junctions (no vertical sides — see the frame-style note below), so
+# CSP_BX_V is intentionally defined but unused.
 CSP_BX_TL="┌"; CSP_BX_TR="┐"; CSP_BX_BL="└"; CSP_BX_BR="┘"
 CSP_BX_H="─";  CSP_BX_V="│";  CSP_BX_ML="├"; CSP_BX_MR="┤"
 
@@ -323,10 +326,71 @@ csp_files=()          # on-disk .jsonl path, kept for delete
 csp_ages=()
 csp_lives=()
 csp_states=()         # per-session hook state: working/waiting/"" (for ●/✳)
+csp_markers=()        # per-session resolved marker glyph (●/✳/space)
 csp_rows=()           # fully-formatted row body, precomputed once at load
 csp_line_normal=()    # display-ready line (marker tinted), per row
 csp_line_selected=()  # display-ready line (reverse video + cursor), per row
 csp_count=0
+CSP_HAVE_STATE=0      # 1 if the hooks' state dir exists (●/✳ fully active)
+CSP_ATTENTION_COUNT=0 # how many sessions currently show ✳ (needs-you)
+
+# --- Filtered view -----------------------------------------------------------
+# Type-to-filter ('/') never touches the model arrays above; instead csp_view
+# holds the MODEL INDICES currently shown, in order. With no filter it is simply
+# 0,1,2,…; with a filter it is the matching subset. The interactive layer selects
+# and draws by VIEW POSITION (0..csp_view_count-1) and maps to a model index
+# through csp_view only where it actually reads the model (open, delete, draw).
+# This keeps the precomputed per-row lines (indexed by model position) reusable
+# and confines the indirection to a few well-marked spots.
+csp_view=()           # csp_view[view_pos] = model index shown at that position
+csp_view_count=0      # number of rows currently shown (len of csp_view)
+CSP_FILTER=""         # active filter needle ("" = show everything)
+
+# csp_rebuild_view — recompute csp_view from CSP_FILTER. Called after a load and
+# whenever the filter changes. With an empty filter it's the identity mapping;
+# otherwise it uses the pure csp_filter_indices over a per-row haystack of
+# "title␠project" so a search matches either column.
+csp_rebuild_view() {
+  csp_view=(); csp_view_count=0
+  if [ -z "$CSP_FILTER" ]; then
+    local i=0
+    while [ "$i" -lt "$csp_count" ]; do
+      csp_view[$i]="$i"; i=$(( i + 1 ))
+    done
+    csp_view_count="$csp_count"
+    return 0
+  fi
+  # Build the haystack (one line per session, model order) then filter.
+  local hay="" i=0
+  while [ "$i" -lt "$csp_count" ]; do
+    hay="${hay}${csp_titles[$i]} ${csp_projects[$i]}"$'\n'
+    i=$(( i + 1 ))
+  done
+  hay="${hay%$'\n'}"                       # drop the trailing newline
+  local idx
+  while IFS= read -r idx; do
+    [ -z "$idx" ] && continue
+    csp_view[$csp_view_count]="$idx"
+    csp_view_count=$(( csp_view_count + 1 ))
+  done <<EOF
+$(csp_filter_indices "$CSP_FILTER" "$hay")
+EOF
+  return 0
+}
+
+# csp_markers_nl — print the markers of the CURRENTLY VISIBLE rows (view order),
+# one per line, for the pure csp_next_attention / csp_count_attention helpers.
+# Iterating the view (not the model) keeps the '*' jump and the urgency badge
+# consistent with what's on screen under a filter. One small fork on load or a
+# '*' keypress — never the hot draw path.
+csp_markers_nl() {
+  local p=0 mi
+  while [ "$p" -lt "$csp_view_count" ]; do
+    mi="${csp_view[$p]}"
+    printf '%s\n' "${csp_markers[$mi]:-}"
+    p=$(( p + 1 ))
+  done
+}
 
 # csp_precompute_lines INDEX ROW — build the two display-ready line forms for a
 # row (see the comment at the call site). Depends on the colour variables and on
@@ -359,7 +423,7 @@ csp_load_sessions() {
   local tab=$'\t'
   csp_ids=(); csp_titles=(); csp_projects=(); csp_fullprojects=()
   csp_ages=(); csp_lives=(); csp_files=(); csp_states=(); csp_rows=()
-  csp_line_normal=(); csp_line_selected=()
+  csp_markers=(); csp_line_normal=(); csp_line_selected=()
   csp_count=0
   now=$(csp_now_epoch)
   running=$(csp_running_session_ids)
@@ -367,6 +431,7 @@ csp_load_sessions() {
   # the per-session state lookups entirely in that (common) case.
   local have_state=0
   [ -d "$CSP_STATE_DIR" ] && have_state=1
+  CSP_HAVE_STATE="$have_state"   # expose to the draw layer (legend / first-run hint)
 
   while IFS= read -r line; do
     [ -z "$line" ] && continue
@@ -415,6 +480,7 @@ csp_load_sessions() {
     #                          with the "› " cursor pointer
     # and the draw loop just appends the right one (no forks, no width work).
     marker=$(csp_marker_for_session "$is_live" "${csp_states[$csp_count]}")
+    csp_markers[$csp_count]="$marker"
     row=$(csp_format_line "$marker" "$title" "$project" "${csp_ages[$csp_count]}" 0)
     csp_rows[$csp_count]="$row"
     csp_precompute_lines "$csp_count" "$row"
@@ -423,6 +489,20 @@ csp_load_sessions() {
   done <<EOF
 $(csp_list_session_files_with_mtime)
 EOF
+
+  # Recompute which rows are visible under the current filter (identity when no
+  # filter is set). Keeps csp_view in sync after a reload/delete. Must run BEFORE
+  # the attention tally, which counts over the visible view.
+  csp_rebuild_view
+  csp_retally_attention
+}
+
+# csp_retally_attention — recompute CSP_ATTENTION_COUNT over the CURRENTLY VISIBLE
+# view. Done once per load / filter change (not per draw), for the status-bar
+# urgency badge and so '*' has something to target. Named so the two callers
+# (load, filter) can't drift.
+csp_retally_attention() {
+  CSP_ATTENTION_COUNT=$(csp_count_attention "$(csp_markers_nl)")
 }
 
 # csp_visible_rows — how many session rows fit on the current terminal, leaving
@@ -439,9 +519,10 @@ csp_visible_rows() {
   rows=$(stty size 2>/dev/null | { read -r r _ 2>/dev/null; printf '%s' "$r"; })
   case "$rows" in ''|*[!0-9]*) rows=$(tput lines 2>/dev/null) ;; esac
   case "$rows" in ''|*[!0-9]*) rows=24 ;; esac
-  # Reserve the frame chrome: top border, subtitle, divider, column header,
-  # divider, status bar, bottom border = 7 lines (8 for a little slack).
-  rows=$((rows - 8))
+  # Reserve the frame chrome: top border, mode line, marker legend, divider,
+  # column header, divider, status bar, bottom border = 8 lines (9 for a little
+  # slack).
+  rows=$((rows - 9))
   [ "$rows" -lt 1 ] && rows=1
   printf '%d' "$rows"
 }
@@ -556,6 +637,8 @@ CSP_CHROME_HEADER=""    # column-heading row (styled), ready for csp_buf_line
 CSP_CHROME_VISIBLE=1    # how many session rows fit
 CSP_CHROME_KEYS=""      # coloured key-hints string for the status bar
 CSP_CHROME_KEYS_W=0     # display width of the PLAIN key-hints text (for spacing)
+CSP_CHROME_LEGEND=""    # coloured, width-fitted marker legend (+ first-run hint)
+CSP_CHROME_HAVE_STATE="" # CSP_HAVE_STATE the legend was built for (cache key)
 
 # csp_build_chrome COLS ROWS — (re)build the cached chrome for a terminal size.
 # Called from csp_draw only when the size changed, so the forky width/rule work
@@ -564,6 +647,7 @@ csp_build_chrome() {
   local cols="$1" rows="$2" header keys_plain
   CSP_CHROME_COLS="$cols"
   CSP_CHROME_ROWS="$rows"
+  CSP_CHROME_HAVE_STATE="$CSP_HAVE_STATE"   # legend's first-run hint depends on this
 
   CSP_INNER=$(( cols - 2 ))
   [ "$CSP_INNER" -gt 96 ] && CSP_INNER=96
@@ -585,9 +669,28 @@ csp_build_chrome() {
   CSP_CHROME_HEADER="${CSP_C_HEADER} ${h}${CSP_C_RESET}"
 
   # Status-bar key hints (coloured) + the plain text's width for spacing math.
-  keys_plain="j/k move   Enter open   n new   d del   t tmux   R reload   q quit"
+  keys_plain="j/k move   / filter   Enter open   n new   d del   t tmux   q quit"
   CSP_CHROME_KEYS_W=$(csp_display_width "$keys_plain")
-  CSP_CHROME_KEYS="${CSP_C_KEY}j/k${CSP_C_RESET}${CSP_C_DIM} move   ${CSP_C_KEY}Enter${CSP_C_RESET}${CSP_C_DIM} open   ${CSP_C_KEY}n${CSP_C_RESET}${CSP_C_DIM} new   ${CSP_C_KEY}d${CSP_C_RESET}${CSP_C_DIM} del   ${CSP_C_KEY}t${CSP_C_RESET}${CSP_C_DIM} tmux   ${CSP_C_KEY}R${CSP_C_RESET}${CSP_C_DIM} reload   ${CSP_C_KEY}q${CSP_C_RESET}${CSP_C_DIM} quit${CSP_C_RESET}"
+  CSP_CHROME_KEYS="${CSP_C_KEY}j/k${CSP_C_RESET}${CSP_C_DIM} move   ${CSP_C_KEY}/${CSP_C_RESET}${CSP_C_DIM} filter   ${CSP_C_KEY}Enter${CSP_C_RESET}${CSP_C_DIM} open   ${CSP_C_KEY}n${CSP_C_RESET}${CSP_C_DIM} new   ${CSP_C_KEY}d${CSP_C_RESET}${CSP_C_DIM} del   ${CSP_C_KEY}t${CSP_C_RESET}${CSP_C_DIM} tmux   ${CSP_C_KEY}q${CSP_C_RESET}${CSP_C_DIM} quit${CSP_C_RESET}"
+
+  # Marker legend (+ optional first-run hint), width-FITTED here so it can never
+  # overflow the frame and wrap — which on a narrow/80-col terminal would push
+  # the frame taller than csp_visible_rows budgeted and make the bottom border
+  # jitter on every repaint. We build the plain text, append the "live status
+  # off" hint ONLY if it still fits CSP_INNER, then colour just the two marker
+  # glyphs at their known positions (never a content-wide search). The base
+  # legend "● working   ✳ needs you" is 24 columns and always fits (CSP_INNER>=40).
+  local base_plain hint_plain leg_plain leg
+  base_plain="${CSP_MARKER_WORKING} working   ${CSP_MARKER_ATTENTION} needs you"
+  hint_plain="   ·  live status off — run --doctor"
+  leg_plain="$base_plain"
+  if [ "$CSP_HAVE_STATE" != "1" ] \
+     && [ "$(csp_display_width "$base_plain$hint_plain")" -le "$CSP_INNER" ]; then
+    leg_plain="$base_plain$hint_plain"
+  fi
+  # Colour the ● (position 0) and the ✳ (position after "● working   " = 12).
+  leg="${CSP_C_LIVE}${CSP_MARKER_WORKING}${CSP_C_RESET}${CSP_C_DIM}${leg_plain:1:11}${CSP_C_ATTN}${CSP_MARKER_ATTENTION}${CSP_C_RESET}${CSP_C_DIM}${leg_plain:13}${CSP_C_RESET}"
+  CSP_CHROME_LEGEND=" ${leg}"
 
   # The selected-row line is padded to CSP_INNER, so rebuild every row's cached
   # display lines whenever the width (and thus CSP_INNER) changed.
@@ -603,8 +706,8 @@ csp_build_chrome() {
 # rule, column headings, session rows (selected one highlighted), rule, and a
 # status bar. Only the rows that fit are drawn; the selection is kept in view.
 csp_draw() {
-  local selected="$1" i marker row is_sel visible start last
-  local mode_line header cols
+  local selected="$1" i visible start last
+  local mode_line cols
 
   # Fit the layout to the terminal. Terminal size rarely changes between key
   # presses, so we only recompute the size-dependent CHROME (rules, header,
@@ -613,7 +716,10 @@ csp_draw() {
   # cursor movement instant instead of re-forking a dozen helpers per draw.
   cols=$(csp_term_cols)
   local rows_now; rows_now=$(csp_visible_rows)
-  if [ "$cols" != "$CSP_CHROME_COLS" ] || [ "$rows_now" != "$CSP_CHROME_ROWS" ]; then
+  # Rebuild the cached chrome when the width/height OR the hook-state flag changed
+  # (the latter only flips the legend's first-run hint, but must not go stale).
+  if [ "$cols" != "$CSP_CHROME_COLS" ] || [ "$rows_now" != "$CSP_CHROME_ROWS" ] \
+     || [ "$CSP_HAVE_STATE" != "$CSP_CHROME_HAVE_STATE" ]; then
     csp_build_chrome "$cols" "$rows_now"
   fi
 
@@ -640,6 +746,11 @@ csp_draw() {
     CSP_STARTUP_NOTICE=""
   fi
   csp_buf_row "$mode_line" 0 "$CSP_C_DIM"
+
+  # Marker legend (+ first-run hint), width-fitted and cached in csp_build_chrome
+  # so it can never overflow and wrap the frame. It spells out what ●/✳ mean, and
+  # — only until the optional hooks are wired — nudges toward --doctor.
+  csp_buf_line "$CSP_CHROME_LEGEND"
   csp_buf_line "$CSP_CHROME_MID"
 
   if [ "$csp_count" -eq 0 ]; then
@@ -653,25 +764,32 @@ csp_draw() {
 
   csp_buf_line "$CSP_CHROME_HEADER"   # cached column-heading row
 
+  # A filter that matches nothing: say so plainly instead of an empty pane, and
+  # still draw the status bar (which shows the query and how to clear it).
+  if [ "$csp_view_count" -eq 0 ]; then
+    csp_buf_row "No sessions match \"$CSP_FILTER\" — press / then Enter to clear."
+  fi
+
+  # We navigate/draw in VIEW positions (0..csp_view_count-1). Each visible row
+  # maps to a MODEL index via csp_view, and the precomputed line arrays are
+  # indexed by MODEL position — so we look those up through the mapping.
   visible="$CSP_CHROME_VISIBLE"
-  start=$(csp_window_start "$selected" "$csp_count" "$visible")
+  start=$(csp_window_start "$selected" "$csp_view_count" "$visible")
   last=$((start + visible))
-  [ "$last" -gt "$csp_count" ] && last="$csp_count"
+  [ "$last" -gt "$csp_view_count" ] && last="$csp_view_count"
 
   # Emit the precomputed, display-ready lines directly (no per-row width work or
   # forks — that's the hot path). Each row was rendered once at load into two
   # ready forms: csp_line_normal (marker tinted) and csp_line_selected (reverse
-  # video, cursor pointer). We just pick one and append it.
-  # The precomputed arrays are populated by the same sequential counter that
-  # sets csp_count, so index i (start..last-1) is always present. The `:-`
-  # defaults are belt-and-suspenders: should a gap ever occur, we draw a blank
-  # row instead of aborting under `set -u`.
+  # video, cursor pointer). The `:-` defaults are belt-and-suspenders: should a
+  # gap ever occur, we draw a blank row instead of aborting under `set -u`.
   i="$start"
   while [ "$i" -lt "$last" ]; do
+    local mi="${csp_view[$i]:-0}"          # view position → model index
     if [ "$i" -eq "$selected" ]; then
-      csp_buf_line "${csp_line_selected[$i]:-}"
+      csp_buf_line "${csp_line_selected[$mi]:-}"
     else
-      csp_buf_line "${csp_line_normal[$i]:-}"
+      csp_buf_line "${csp_line_normal[$mi]:-}"
     fi
     i=$((i + 1))
   done
@@ -681,12 +799,28 @@ csp_draw() {
   # left-pad width CSP_CHROME_KEYS_W) + the position indicator on the right.
   # Only the position changes per keypress, so we compute just its short pad
   # here (no forks): total inner width - keys width - position width.
-  local pos_plain="$((selected + 1))/${csp_count}"
-  local gap=$(( CSP_INNER - CSP_CHROME_KEYS_W - ${#pos_plain} ))
+  # Position counts within the VISIBLE view; when a filter is active we show it
+  # and the visible/total split so it's clear the list is narrowed.
+  local pos_plain
+  if [ -n "$CSP_FILTER" ]; then
+    pos_plain="/$CSP_FILTER  $((selected + 1))/${csp_view_count} of ${csp_count}"
+  else
+    pos_plain="$((selected + 1))/${csp_count}"
+  fi
+  # When any sessions need you, prefix the position with a "N✳" urgency badge and
+  # a hint that '*' jumps to them — so a ✳ buried far down the recency-sorted list
+  # is still discoverable. The badge's plain width is measured for the spacing
+  # math (the ✳ glyph is 1 column); the coloured form is built separately.
+  local badge_plain="" badge=""
+  if [ "$CSP_ATTENTION_COUNT" -gt 0 ]; then
+    badge_plain="${CSP_ATTENTION_COUNT}${CSP_MARKER_ATTENTION} *:jump   "
+    badge="${CSP_C_ATTN}${CSP_ATTENTION_COUNT}${CSP_MARKER_ATTENTION}${CSP_C_RESET}${CSP_C_DIM} ${CSP_C_KEY}*${CSP_C_RESET}${CSP_C_DIM}:jump   "
+  fi
+  local gap=$(( CSP_INNER - CSP_CHROME_KEYS_W - ${#badge_plain} - ${#pos_plain} ))
   [ "$gap" -lt 1 ] && gap=1
   local pad="" k=0
   while [ "$k" -lt "$gap" ]; do pad="$pad "; k=$(( k + 1 )); done
-  csp_buf_line " ${CSP_CHROME_KEYS}${pad}${CSP_C_DIM}${pos_plain}${CSP_C_RESET}"
+  csp_buf_line " ${CSP_CHROME_KEYS}${pad}${badge}${CSP_C_DIM}${pos_plain}${CSP_C_RESET}"
   csp_buf_line "$CSP_CHROME_BOT"
 
   # Paint the whole frame in one write: home the cursor (no full clear → no
@@ -734,22 +868,51 @@ csp_open() {
   csp_load_sessions
 }
 
-# csp_confirm PROMPT — ask a yes/no question and return 0 only for an explicit
-# "y". We briefly leave raw mode so the user can see what they type and use
-# Backspace, show the cursor, then restore raw mode afterwards. Used to guard
-# the destructive delete action.
-csp_confirm() {
-  local prompt="$1" answer
-  # Drop back to cooked mode + visible cursor for a normal line of input.
+# csp_prompt_line VARNAME PROMPT — read ONE line of input into VARNAME, from a
+# cooked-mode terminal so the user gets normal echo, Backspace, paste, and
+# correct multi-byte (CJK) entry — none of which raw single-byte reads give us.
+# This is the single home for the raw→cooked→raw transition every line prompt
+# needs: drop to the saved (cooked) settings + show the cursor, read the line,
+# then re-enter raw mode. Both the delete confirmation and the filter query use
+# it, so they can never drift apart in how they toggle terminal state.
+csp_prompt_line() {
+  local __var="$1" prompt="$2"
   [ -n "$csp_saved_stty" ] && stty "$csp_saved_stty" 2>/dev/null
   printf '\033[?25h'
-  csp_tty_print "$(printf '\n%s' "$prompt")"
-  csp_tty_readline answer
+  csp_tty_print "$prompt"
+  csp_tty_readline "$__var"
   csp_enter_raw_mode
+}
+
+# csp_confirm PROMPT — ask a yes/no question and return 0 only for an explicit
+# "y". Uses the shared cooked-mode line prompt. Used to guard the destructive
+# delete action.
+csp_confirm() {
+  local answer
+  csp_prompt_line answer "$(printf '\n%s' "$1")"
   case "$answer" in
     y|Y|yes|YES) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# csp_filter_prompt — read a filter query on one cooked-mode line, then apply it.
+#
+# WHY A LINE PROMPT (not per-keystroke raw reading): reading the query a byte at
+# a time in raw mode is fragile — it would have to reassemble multi-byte (CJK)
+# input and reimplement Backspace/paste by hand. The shared csp_prompt_line gives
+# us correct UTF-8, line editing, and paste for free, and it is trivially
+# testable. The whole list is in memory, so re-filtering on Enter is instant even
+# for a big store.
+#
+# Empty input CLEARS the filter (shows everything again). The query is applied by
+# rebuilding csp_view; the caller resets the selection to the top.
+csp_filter_prompt() {
+  local query
+  csp_prompt_line query "$(printf '\nFilter (substring of title or project; empty = show all):\n/ ')"
+  CSP_FILTER="$query"
+  csp_rebuild_view
+  csp_retally_attention   # the visible set changed → refresh the urgency count
 }
 
 # csp_action_delete INDEX — confirm, then permanently delete the selected
@@ -776,8 +939,6 @@ csp_action_delete() {
     if csp_delete_session_file "$file"; then
       # Forget any recorded ●/✳ state for the now-deleted session (no residue).
       csp_clear_state "$(csp_session_id_from_path "$file")"
-      # Keep the cursor sensible: if we deleted the last row, step up one.
-      [ "$idx" -ge "$((csp_count - 1))" ] && [ "$idx" -gt 0 ] && csp_selected_after_delete=$((idx - 1))
     fi
     csp_load_sessions
   fi
@@ -821,6 +982,88 @@ csp_toggle_backend() {
   csp_save_backend_pref "$CSP_ACTIVE_BACKEND"
 }
 
+# --- Diagnostics -------------------------------------------------------------
+# csp_doctor — a read-only preflight check. When markers never appear, titles
+# show "(untitled)", or tmux mode won't start, this tells you WHY in one screen:
+# each dependency and path the tool relies on, marked OK or WARN. It touches
+# nothing (no files written, no terminal raw mode, no session launched), so it is
+# always safe to run and to pipe. It never exits non-zero for a mere WARN — a
+# warning is informational, not a failure — but returns non-zero only if `claude`
+# itself is missing, the one thing that stops the tool working at all.
+csp_doctor() {
+  local ok=0 problem=0 parser hooks_file
+  # A small helper closure via positional printing; colour reuses the palette.
+  # We print "  OK  " in green and "  WARN" in yellow when colour is on.
+  local g="$CSP_C_LIVE" y="$CSP_C_ATTN" d="$CSP_C_DIM" r="$CSP_C_RESET"
+  csp_doctor_ok()   { printf '  %sOK%s   %s\n'   "$g" "$r" "$1"; }
+  csp_doctor_warn() { printf '  %sWARN%s %s\n'   "$y" "$r" "$1"; }
+
+  printf '%sclaude-session-picker %s — doctor%s\n\n' "$CSP_C_TITLE" "$CSP_VERSION" "$r"
+
+  # 1. claude on PATH — the only hard requirement.
+  if command -v claude >/dev/null 2>&1; then
+    csp_doctor_ok "claude command found: $(command -v claude)"
+  else
+    csp_doctor_warn "claude command NOT on PATH — the picker can't resume sessions."
+    printf '       Install Claude Code: https://claude.com/claude-code\n'
+    problem=1
+  fi
+
+  # 2. Which JSON parser will be used to read session titles (jq > python3 > awk).
+  if command -v jq >/dev/null 2>&1; then
+    parser="jq ($(command -v jq))"
+  elif command -v python3 >/dev/null 2>&1; then
+    parser="python3 ($(command -v python3))"
+  else
+    parser="built-in awk reader (no jq/python3 — still works)"
+  fi
+  csp_doctor_ok "JSON parser: $parser"
+
+  # 3. Claude's session store (where sessions are read from).
+  if [ -d "$CSP_CLAUDE_DIR/projects" ]; then
+    csp_doctor_ok "session store: $CSP_CLAUDE_DIR/projects"
+  else
+    csp_doctor_warn "no session store at $CSP_CLAUDE_DIR/projects — no sessions to list yet."
+  fi
+
+  # 4. Hooks wired for the ●/✳ markers. We look for our hook path referenced in
+  # Claude's settings.json; absence is fine (markers fall back to live/blank).
+  hooks_file="$CSP_CLAUDE_DIR/settings.json"
+  if [ -f "$hooks_file" ] && grep -q 'csp-hook\.sh' "$hooks_file" 2>/dev/null; then
+    csp_doctor_ok "status hooks wired in $hooks_file (● working / ✳ needs-you enabled)"
+  else
+    csp_doctor_warn "status hooks not detected in $hooks_file"
+    printf '       ● shows a running session; ✳ (needs-you) needs the hooks — see\n'
+    printf '       README "Status markers". Without them the picker still works.\n'
+  fi
+  # Report where hook state is recorded, and whether anything has been written.
+  if [ -d "$CSP_STATE_DIR" ]; then
+    csp_doctor_ok "state dir: $CSP_STATE_DIR"
+  else
+    csp_doctor_warn "state dir not created yet: $CSP_STATE_DIR (hooks have not run)"
+  fi
+
+  # 5. tmux — optional; only needed for concurrent windows.
+  if csp_tmux_available; then
+    csp_doctor_ok "tmux found: $(command -v tmux) (concurrent mode available via 't')"
+  else
+    csp_doctor_warn "tmux not installed — hub mode only (that's fine for most people)."
+  fi
+
+  # 6. Resolved paths and current backend choice, for context.
+  printf '\n%sconfig%s\n' "$d" "$r"
+  printf '  backend preference file: %s\n' "$CSP_PREF_FILE"
+  printf '  resolved backend:        %s\n' "$CSP_ACTIVE_BACKEND"
+
+  printf '\n'
+  if [ "$problem" = "1" ]; then
+    printf '%sOne or more problems above will stop the picker working.%s\n' "$y" "$r"
+    return 1
+  fi
+  printf 'All essentials present.\n'
+  return "$ok"
+}
+
 # --- Main loop ---------------------------------------------------------------
 csp_main() {
   # Handle informational flags before anything else (no terminal setup, no tmux
@@ -831,12 +1074,39 @@ csp_main() {
       exit 0 ;;
     -h|--help)
       printf 'claude-session-picker %s — a menu to list and resume Claude Code sessions.\n\n' "$CSP_VERSION"
-      printf 'Usage: claude-session-picker [-V|--version] [-h|--help]\n\n'
-      printf 'Run with no arguments to open the menu. Keys: j/k move, Enter open,\n'
-      printf 'n new, d delete, t toggle hub/tmux, R reload, q quit.\n'
+      printf 'Usage: claude-session-picker [-V|--version] [-h|--help] [--doctor] [--list]\n\n'
+      printf 'Run with no arguments to open the menu. Keys: j/k move, / filter,\n'
+      printf '* jump to next needs-you, Enter open, n new, d delete, t hub/tmux, R reload, q quit.\n'
       printf 'Markers: %s working, %s stopped/needs you (needs hooks — see README\n' "●" "✳"
-      printf '"Status markers"). A session started with n shows no %s until hooks are set up.\n' "●"
+      printf '"Status markers"). A session started with n shows no %s until hooks are set up.\n\n' "●"
+      printf '  --doctor   check dependencies, paths and hooks, then exit (read-only)\n'
+      printf '  --list     print all sessions as TSV (id, title, project, age) and exit\n\n'
       printf 'Env: CSP_BACKEND=hub|tmux. Full docs: README.md and docs/MANUAL.md.\n'
+      exit 0 ;;
+    --doctor)
+      csp_doctor
+      exit $? ;;
+    --list)
+      # Non-interactive: print every session as tab-separated
+      # "id<TAB>title<TAB>project<TAB>age" and exit. No raw mode, no launch — so
+      # it composes with other tools, e.g.  claude-session-picker --list | fzf
+      # This deliberately lives OUTSIDE the picker so we never take on a fuzzy
+      # finder as a dependency; the model is already assembled by csp_load_sessions.
+      # As a plain filter, restore default SIGPIPE handling so a downstream
+      # `| head` closing the pipe ends us quietly, not via our interactive
+      # PIPE→exit-130 trap (which would print a "broken pipe" write error).
+      trap - PIPE
+      csp_load_sessions
+      local __i=0 __tab
+      __tab=$'\t'
+      while [ "$__i" -lt "$csp_count" ]; do
+        printf '%s%s%s%s%s%s%s\n' \
+          "${csp_ids[$__i]}"       "$__tab" \
+          "${csp_titles[$__i]}"    "$__tab" \
+          "${csp_projects[$__i]}"  "$__tab" \
+          "${csp_ages[$__i]}"
+        __i=$(( __i + 1 ))
+      done
       exit 0 ;;
   esac
 
@@ -866,30 +1136,48 @@ csp_main() {
   # it raw if loading is interrupted), and the first frame appears fully built.
   csp_load_sessions
   csp_enter_raw_mode
+  # `selected` is a VIEW position (0..csp_view_count-1), not a model index. It is
+  # mapped to a model index through csp_view only where we read the model (open,
+  # delete). This keeps filtering a thin layer over the unchanged model.
+  local mi
   while :; do
-    selected=$(csp_clamp_index "$selected" "$csp_count")
+    selected=$(csp_clamp_index "$selected" "$csp_view_count")
     csp_draw "$selected"
     key=$(csp_read_key)
     case "$key" in
-      j) selected=$(csp_clamp_index "$((selected + 1))" "$csp_count") ;;
-      k) selected=$(csp_clamp_index "$((selected - 1))" "$csp_count") ;;
+      j) selected=$(csp_clamp_index "$((selected + 1))" "$csp_view_count") ;;
+      k) selected=$(csp_clamp_index "$((selected - 1))" "$csp_view_count") ;;
       g) selected=0 ;;
-      G) selected=$(csp_clamp_index "$((csp_count - 1))" "$csp_count") ;;
+      G) selected=$(csp_clamp_index "$((csp_view_count - 1))" "$csp_view_count") ;;
+      '/') # Type-to-filter: narrow the list to sessions whose title/project
+           # contains what you type. Empty input clears the filter.
+         csp_filter_prompt; selected=0 ;;
       $'\n'|$'\r'|'')
-         if [ "$csp_count" -gt 0 ]; then
+         if [ "$csp_view_count" -gt 0 ]; then
+           mi="${csp_view[$selected]}"        # view position → model index
            # A tmux window name can't contain much; use the short project path.
-           label="${csp_projects[$selected]}"
+           label="${csp_projects[$mi]}"
            # Opening a session means you've now looked at it, so clear any
            # "needs attention" (✳) state for it before handing off.
-           csp_clear_state "${csp_ids[$selected]}"
-           csp_open "${csp_ids[$selected]}" "${csp_fullprojects[$selected]}" "$label"
+           csp_clear_state "${csp_ids[$mi]}"
+           csp_open "${csp_ids[$mi]}" "${csp_fullprojects[$mi]}" "$label"
          fi ;;
       n) # Start a brand-new session (in the current directory).
          csp_open "new" "$PWD" "new" ;;
-      d|x) # Delete the selected session (asks to confirm first).
-         csp_selected_after_delete=""
-         csp_action_delete "$selected"
-         [ -n "$csp_selected_after_delete" ] && selected="$csp_selected_after_delete" ;;
+      d|x) # Delete the selected session (asks to confirm first). Maps the view
+           # position to a model index; the reload rebuilds the view afterwards.
+         if [ "$csp_view_count" -gt 0 ]; then
+           mi="${csp_view[$selected]}"
+           csp_action_delete "$mi"
+           # The reload rebuilt the view (now one shorter). If the cursor was on
+           # the last visible row, step it up to the new last row rather than
+           # letting the clamp wrap it to the top. Guard for an emptied view.
+           if [ "$csp_view_count" -gt 0 ] && [ "$selected" -ge "$csp_view_count" ]; then
+             selected=$(( csp_view_count - 1 ))
+           fi
+         fi ;;
+      '*') # Jump to the next VISIBLE session that needs attention (✳), wrapping.
+         selected=$(csp_next_attention "$selected" "$csp_view_count" "$(csp_markers_nl)") ;;
       t) csp_toggle_backend ;;   # switch hub <-> tmux (concurrency on/off)
       R|l) csp_load_sessions ;;
       q) csp_quit; break ;;

@@ -148,6 +148,15 @@ csp_tmux_configure_home() {
   csp_tmux set-option -g base-index 0 2>/dev/null
   csp_tmux set-option -g renumber-windows on 2>/dev/null
 
+  # Mouse on: without it tmux (default `mouse off`) translates the scroll wheel
+  # into arrow keys sent to the program — so scrolling a resumed Claude/shell
+  # just walks its input history instead of scrolling the pane, and native
+  # terminal scrollback (Shift-scroll) shows content from OUTSIDE the pane. With
+  # mouse on, the wheel scrolls the pane / enters copy-mode as expected, and
+  # clicking a window in the status bar selects it. Scoped to our dedicated
+  # socket, so the user's own tmux config is untouched.
+  csp_tmux set-option -g mouse on 2>/dev/null
+
   csp_tmux set-option -g status on 2>/dev/null
   csp_tmux set-option -g status-interval 2 2>/dev/null
   csp_tmux set-option -g status-justify left 2>/dev/null

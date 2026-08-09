@@ -43,6 +43,14 @@ make_home() {
   [ "$(csp_tmux show-options -g renumber-windows)" = "renumber-windows on" ]
 }
 
+@test "configure: enables mouse so the scroll wheel scrolls the pane (regression)" {
+  # Without `mouse on`, tmux translates the wheel into arrow keys — scrolling a
+  # resumed session just walks its input history instead of the pane. This is
+  # the bug report: "scrolling brings up previously typed input".
+  make_home
+  [ "$(csp_tmux show-options -g mouse)" = "mouse on" ]
+}
+
 @test "open: sessions accumulate as windows; the menu stays window 0" {
   make_home
   csp_tmux_open id-a /tmp alpha

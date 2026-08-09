@@ -166,6 +166,100 @@ csp_marker_for_session() {
 }
 
 # -----------------------------------------------------------------------------
+# csp_filter_indices NEEDLE HAYSTACK_NL
+#
+# The engine behind type-to-filter ('/'). Given a search NEEDLE and the per-row
+# search text as newline-separated lines (HAYSTACK_NL, one line per session in
+# list order, with NO trailing newline), print the 0-based indices of the rows
+# that CONTAIN the needle — case-insensitively — one index per line.
+#
+#   • An empty needle matches every row (so clearing the query restores the
+#     full list) — printed as 0,1,2,… in order.
+#   • Matching is a plain substring test, case-insensitive via `nocasematch`
+#     (bash 3.1+); ASCII case folds, CJK is compared as-is (it has no case).
+#   • Pure: no model access, no forks. The caller builds HAYSTACK_NL from the
+#     title/project arrays, so this stays trivially unit-testable.
+#
+# Kept pure precisely because filtering is the feature most likely to have off-
+# by-one and empty-input edge cases; testing the index math in isolation is what
+# makes the interactive wiring safe.
+# -----------------------------------------------------------------------------
+csp_filter_indices() {
+  local needle="$1" rows="$2" line i=0 out=""
+  # An empty haystack has NO rows. Guard explicitly: otherwise the heredoc below
+  # would feed `read` a single empty line and we'd emit a phantom index 0.
+  [ -z "$rows" ] && return 0
+  local had_nocase=0
+  shopt -q nocasematch && had_nocase=1
+  shopt -s nocasematch
+  while IFS= read -r line; do
+    if [ -z "$needle" ]; then
+      out="${out}${i}"$'\n'
+    else
+      case "$line" in
+        *"$needle"*) out="${out}${i}"$'\n' ;;
+      esac
+    fi
+    i=$(( i + 1 ))
+  done <<EOF
+$rows
+EOF
+  [ "$had_nocase" = "0" ] && shopt -u nocasematch
+  printf '%s' "$out"
+}
+
+# -----------------------------------------------------------------------------
+# csp_count_attention MARKERS_NL
+#
+# Count how many sessions currently need your attention (their marker is ✳).
+# MARKERS_NL is the per-session markers as newline-separated text, one per row
+# in list order. Pure and unit-tested; the caller builds the list from the model.
+# -----------------------------------------------------------------------------
+csp_count_attention() {
+  local markers="$1" line n=0
+  [ -z "$markers" ] && { printf '0'; return 0; }
+  while IFS= read -r line; do
+    [ "$line" = "$CSP_MARKER_ATTENTION" ] && n=$(( n + 1 ))
+  done <<EOF
+$markers
+EOF
+  printf '%d' "$n"
+}
+
+# -----------------------------------------------------------------------------
+# csp_next_attention CURRENT COUNT MARKERS_NL
+#
+# Find the NEXT session that needs attention (✳), searching forward from just
+# after CURRENT and wrapping around, so repeated presses cycle through every ✳.
+# Returns CURRENT unchanged if none is marked ✳ (so the key is a no-op then).
+#
+#   CURRENT     the currently selected index (0-based)
+#   COUNT       number of sessions
+#   MARKERS_NL  per-session markers, newline-separated, in list order
+#
+# Kept pure (no model access) so the cycling/wrapping logic is unit-tested. This
+# is what makes a buried ✳ — the one "come look at me" signal, easily lost when
+# the list is sorted by recency — reachable with a single keypress.
+# -----------------------------------------------------------------------------
+csp_next_attention() {
+  local current="$1" count="$2" markers="$3"
+  if [ "$count" -le 0 ]; then printf '0'; return 0; fi
+  local arr=() line
+  while IFS= read -r line; do arr[${#arr[@]}]="$line"; done <<EOF
+$markers
+EOF
+  local step=1 idx
+  while [ "$step" -le "$count" ]; do
+    idx=$(( (current + step) % count ))
+    if [ "${arr[$idx]:-}" = "$CSP_MARKER_ATTENTION" ]; then
+      printf '%d' "$idx"; return 0
+    fi
+    step=$(( step + 1 ))
+  done
+  printf '%d' "$current"     # none marked ✳ → stay put (no-op)
+}
+
+# -----------------------------------------------------------------------------
 # csp_clamp_index INDEX COUNT
 #
 # Keep a selection cursor inside the list. Given the index the user is trying

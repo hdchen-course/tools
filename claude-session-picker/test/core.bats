@@ -361,3 +361,84 @@ setup() {
   run csp_is_live "aaa" ""
   [ "$status" -ne 0 ]
 }
+
+# --- csp_count_attention / csp_next_attention (the '*' jump + urgency count) --
+
+@test "attention: count is 0 for an empty marker list" {
+  run csp_count_attention ""
+  [ "$output" = "0" ]
+}
+
+@test "attention: counts only the ✳ (needs-you) markers" {
+  # markers, one per line, in list order: ● ✳ (blank) ✳
+  markers="$(printf '%s\n%s\n%s\n%s' "$CSP_MARKER_WORKING" "$CSP_MARKER_ATTENTION" "$CSP_MARKER_NONE" "$CSP_MARKER_ATTENTION")"
+  run csp_count_attention "$markers"
+  [ "$output" = "2" ]
+}
+
+@test "attention: next jumps forward to the nearest ✳ and wraps around" {
+  # indices:        0=●        1=✳             2=blank            3=✳
+  markers="$(printf '%s\n%s\n%s\n%s' "$CSP_MARKER_WORKING" "$CSP_MARKER_ATTENTION" "$CSP_MARKER_NONE" "$CSP_MARKER_ATTENTION")"
+  # From 0, the next ✳ is index 1.
+  run csp_next_attention 0 4 "$markers"; [ "$output" = "1" ]
+  # From 1, the next ✳ is index 3.
+  run csp_next_attention 1 4 "$markers"; [ "$output" = "3" ]
+  # From 3, it wraps around back to index 1.
+  run csp_next_attention 3 4 "$markers"; [ "$output" = "1" ]
+}
+
+@test "attention: next is a no-op (returns current) when nothing needs attention" {
+  markers="$(printf '%s\n%s\n%s' "$CSP_MARKER_WORKING" "$CSP_MARKER_NONE" "$CSP_MARKER_NONE")"
+  run csp_next_attention 1 3 "$markers"
+  [ "$output" = "1" ]
+}
+
+@test "attention: next on an empty list returns 0 (never out of range)" {
+  run csp_next_attention 0 0 ""
+  [ "$output" = "0" ]
+}
+
+# --- csp_filter_indices (type-to-filter '/') ---------------------------------
+
+@test "filter: an empty needle matches every row, in order" {
+  rows="$(printf 'alpha\nbeta\ngamma')"
+  run csp_filter_indices "" "$rows"
+  [ "$(printf '%s' "$output" | tr '\n' ' ')" = "0 1 2" ]
+}
+
+@test "filter: matches a substring and returns only matching indices" {
+  rows="$(printf 'refactor parser\nflaky test\nparser cleanup')"
+  run csp_filter_indices "parser" "$rows"
+  [ "$(printf '%s' "$output" | tr '\n' ' ')" = "0 2" ]
+}
+
+@test "filter: matching is case-insensitive for ASCII" {
+  rows="$(printf 'Refactor Parser\nflaky test')"
+  run csp_filter_indices "PARSER" "$rows"
+  [ "$(printf '%s' "$output" | tr '\n' ' ')" = "0" ]
+}
+
+@test "filter: no match yields no indices (empty output)" {
+  rows="$(printf 'alpha\nbeta')"
+  run csp_filter_indices "zzz" "$rows"
+  [ -z "$output" ]
+}
+
+@test "filter: an empty haystack yields nothing (no phantom index 0)" {
+  run csp_filter_indices "" ""
+  [ -z "$output" ]
+  run csp_filter_indices "anything" ""
+  [ -z "$output" ]
+}
+
+@test "filter: CJK substrings match (no case folding needed)" {
+  rows="$(printf '重構解析器\n測試修復')"
+  run csp_filter_indices "解析" "$rows"
+  [ "$(printf '%s' "$output" | tr '\n' ' ')" = "0" ]
+}
+
+@test "filter: a needle with spaces matches within a line" {
+  rows="$(printf 'fix the flaky test\nunrelated')"
+  run csp_filter_indices "flaky test" "$rows"
+  [ "$(printf '%s' "$output" | tr '\n' ' ')" = "0" ]
+}

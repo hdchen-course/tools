@@ -7,6 +7,47 @@ command is a symlink updated in place by `git pull`, so this file (and the
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/);
 this project uses simple `MAJOR.MINOR.PATCH` version numbers.
 
+## 1.2.0
+
+### Added
+- **Type-to-filter** — press `/`, type any part of a title or project path, and
+  the list narrows to the matches (case-insensitive; works with CJK). The status
+  bar shows the active query and the visible/total split (`/parser  1/2 of 42`);
+  an empty query clears it. Filtering never changes your sessions — it only
+  chooses which rows are shown, layered over the model via a view-index map.
+- **Jump to next needs-you** — `*` moves the cursor to the next `✳` session and
+  wraps around, so a session waiting for you can't get lost far down a long,
+  recency-sorted list. A `N✳ *:jump` badge in the status bar shows how many need
+  you (counted over the currently visible rows).
+- **On-screen marker legend** — the header now spells out `● working  ✳ needs
+  you`, and when the optional status hooks aren't wired it adds a one-line
+  "live status off" hint pointing at `--doctor` / the README. With hooks present
+  it's a plain legend, no nag.
+- **`--doctor`** — a read-only preflight that reports, as OK/WARN lines, whether
+  `claude` is on PATH, which JSON parser will be used (jq/python3/awk), whether
+  the status hooks are wired, the session store and state dir, and tmux
+  availability. Exits non-zero only if `claude` itself is missing.
+- **`--list`** — print every session as `id<TAB>title<TAB>project<TAB>age` and
+  exit, for composing with other tools (e.g. `claude-session-picker --list | fzf`)
+  without the picker taking on a fuzzy-finder dependency.
+
+### Fixed
+- **tmux: the scroll wheel now scrolls the pane** instead of walking a session's
+  input history. tmux defaults to `mouse off`, which turns the wheel into arrow
+  keys sent to the program; the picker now sets `mouse on` on its own dedicated
+  socket (your `~/.tmux.conf` is untouched).
+
+### Engineering
+- Added a `shellcheck` gate to `test/run-all.sh` (runs if installed, skips
+  cleanly if not) with a documented, minimal exclude list; the whole tree is
+  clean. Removed dead locals/variables it surfaced.
+- New pure, unit-tested helpers in `lib/core.sh`: `csp_filter_indices`,
+  `csp_next_attention`, `csp_count_attention`. A shared `csp_prompt_line` now
+  backs both the delete confirmation and the filter query (one home for the
+  raw↔cooked terminal transition). New `test/render.bats` gives the draw layer
+  its first coverage (legend fits the frame, filter status bar, no-match hint).
+  Test suite grew to 187.
+
 ## 1.1.1
 
 ### Fixed
