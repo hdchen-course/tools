@@ -198,6 +198,35 @@ make_home() {
   csp_tmux has-session -t "=$CSP_TMUX_SESSION" 2>/dev/null
 }
 
+@test "recovery: a menu window orphaned at a NON-zero index is swapped back to 0" {
+  # Edge case: an earlier partial recovery can leave a 'menu' window at a
+  # non-zero index. The old guard ("does ANY window named menu exist?") would see
+  # it and skip verification, attaching with a non-menu window 0. Recovery must
+  # instead ensure window 0 IS menu. We reproduce the orphaned state and run the
+  # same recovery the enter path uses, then assert 0:menu.
+  #
+  # Build: window 0 = a session (not menu), window 1 = menu (orphaned).
+  csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n work "sleep 60"
+  csp_tmux new-window -t "=$CSP_TMUX_SESSION" -n menu "sleep 60"
+  csp_tmux_configure_home
+  # Precondition: window 0 is NOT menu, but a menu window exists (at index 1).
+  run csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_index}:#{window_name}'
+  [ "$(printf '%s\n' "$output" | sed -n 1p)" = "0:work" ]
+  # Run the recovery sequence (the branch guarded by "window 0 is not 0:menu").
+  if ! csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_index}:#{window_name}' \
+       | grep -qx '0:menu'; then
+    if ! csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_name}' | grep -qx menu; then
+      csp_tmux new-window -t "=$CSP_TMUX_SESSION" -n menu "sleep 60"
+    fi
+    csp_tmux swap-window -s "=$CSP_TMUX_SESSION:menu" -t "=$CSP_TMUX_SESSION:0"
+  fi
+  # Postcondition: window 0 is now menu (the orphan was swapped in, not duplicated).
+  run csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_index}:#{window_name}'
+  [ "$(printf '%s\n' "$output" | sed -n 1p)" = "0:menu" ]
+  # Exactly one menu window (no duplicate created).
+  [ "$(csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_name}' | grep -cx menu)" = "1" ]
+}
+
 @test "session name: ':' and '.' are stripped so tmux targets don't mis-parse (bug 4)" {
   # Re-source with a hostile session name and confirm it's been sanitised.
   CSP_TMUX_SESSION="a:b.c" bash -c '

@@ -32,6 +32,16 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   without the picker taking on a fuzzy-finder dependency.
 
 ### Fixed
+- **Filter matches the full title and full project path**, not the on-screen
+  (truncated title / shortened path) strings — so a query for a parent directory
+  or for text past the 60-column title cut now matches, as the docs promise.
+- **Status bar can't overflow even on a very narrow terminal.** When the badge +
+  filter position alone exceed the frame width, the right block is shrunk in
+  priority order (drop the badge, then hard-truncate the position) before laying
+  out the key hints, so the bar never wraps at 40 columns.
+- **tmux menu recovery always lands you on `0:menu`.** A `menu` window orphaned at
+  a non-zero index (e.g. by an earlier partial recovery) is now swapped back to
+  index 0 rather than skipped, closing the menu-less-window-0 gap.
 - **tmux: no duplicate concurrent resume.** Opening a session that already has a
   window switches to it instead of launching a second `claude --resume` over the
   same transcript. Each session window is tagged with its id (`@csp_sid`).
@@ -83,7 +93,10 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   (delete re-checks liveness live; the marker uses a local). `test/render.bats`
   gained status-bar-overflow coverage and `sessions.bats` gained cwd-sanitize,
   empty-title, and control-only-cwd regression tests, plus tmux dedup /
-  brand-new-session and atomic-state-write coverage. Test suite grew to 196.
+  brand-new-session and atomic-state-write coverage, plus full-path/full-title
+  filter matching, a narrow-frame badge+filter overflow guard, and orphaned-menu
+  recovery, plus a status-bar right-block boundary (CSP_INNER-exact) case. Test
+  suite grew to 200.
 - New pure, unit-tested helpers in `lib/core.sh`: `csp_filter_indices`,
   `csp_next_attention`, `csp_count_attention`. A shared `csp_prompt_line` now
   backs both the delete confirmation and the filter query (one home for the

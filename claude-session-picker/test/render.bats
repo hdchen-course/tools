@@ -59,7 +59,8 @@ strip_sgr() { printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g'; }
   # Build a model of 2 sessions, apply a filter that matches nothing, draw, and
   # capture the frame. The hint must NOT claim Esc clears the filter (Esc quits).
   csp_count=2
-  csp_ids=(a b); csp_titles=("alpha" "beta"); csp_projects=("p/a" "p/b")
+  csp_ids=(a b); csp_titles=("alpha" "beta"); csp_titles_full=("alpha" "beta")
+  csp_projects=("p/a" "p/b")
   csp_fullprojects=(/t /t); csp_files=(a.jsonl b.jsonl); csp_ages=("1m ago" "2m ago")
   csp_lives=(0 0); csp_states=("" ""); csp_markers=(" " " "); CSP_HAVE_STATE=1
   local i r
@@ -80,6 +81,7 @@ strip_sgr() { printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g'; }
 @test "render: an active filter shows the query and visible/total in the status bar" {
   csp_count=3
   csp_ids=(a b c); csp_titles=("refactor parser" "flaky test" "parser cleanup")
+  csp_titles_full=("refactor parser" "flaky test" "parser cleanup")
   csp_projects=("p/x" "p/y" "p/z"); csp_fullprojects=(/t /t /t)
   csp_files=(a.jsonl b.jsonl c.jsonl); csp_ages=("1m ago" "2m ago" "3m ago")
   csp_lives=(0 0 0); csp_states=("" "" ""); csp_markers=(" " " " " "); CSP_HAVE_STATE=1
@@ -118,6 +120,7 @@ _measure_status_bar() {
 _setup_cjk_model() {
   csp_count=3
   csp_ids=(a b c); csp_titles=("重構解析器" "flaky test" "解析清理")
+  csp_titles_full=("重構解析器" "flaky test" "解析清理")
   csp_projects=("專案/甲" "p/y" "專案/乙"); csp_fullprojects=(/t /t /t)
   csp_files=(a.jsonl b.jsonl c.jsonl); csp_ages=("1m ago" "2m ago" "3m ago")
   csp_lives=(0 0 0); csp_states=("" "" ""); csp_markers=(" " "✳" " "); CSP_HAVE_STATE=1
@@ -143,6 +146,93 @@ _setup_cjk_model() {
     [ "$CSP_TEST_SB_W" -le "$CSP_INNER" ] \
       || { echo "cols=$cols INNER=$CSP_INNER width=$CSP_TEST_SB_W : [$CSP_TEST_SB]"; false; }
   done
+}
+
+@test "filter: matches the FULL project path and FULL title, not the display strings" {
+  # The filter haystack must use csp_fullprojects (full cwd) and csp_titles_full
+  # (untruncated title), so a query can match a parent dir the display dropped or
+  # text past the 60-col title cut — the docs promise "any part of a title or
+  # project path".
+  csp_count=1
+  csp_ids=(a)
+  # Display title truncated; full title has extra text past the cut.
+  csp_titles=("short shown")
+  csp_titles_full=("short shown … then a UNIQUEWORD far past the visible part")
+  # Display project is the last two components only; full path has more parents.
+  csp_projects=("EnglishTraining/tools")
+  csp_fullprojects=("/Users/me/work/EnglishTraining/tools")
+  csp_files=(a.jsonl); csp_ages=("1m ago"); csp_states=(""); csp_markers=(" ")
+  # A parent directory dropped from the display path still matches.
+  CSP_FILTER="work"; csp_rebuild_view
+  [ "$csp_view_count" -eq 1 ]
+  # Text past the display-title truncation still matches.
+  CSP_FILTER="UNIQUEWORD"; csp_rebuild_view
+  [ "$csp_view_count" -eq 1 ]
+  # A genuine non-match still yields nothing.
+  CSP_FILTER="zzz-no-such"; csp_rebuild_view
+  [ "$csp_view_count" -eq 0 ]
+}
+
+@test "render: badge + active filter together never overflow a narrow (40 col) frame" {
+  # Edge case: at 40 cols the RIGHT block alone (N✳ badge + a 20-col-bounded
+  # filter position) can exceed CSP_INNER, which the earlier (short-filter, tiny
+  # count) fixture never actually triggered. To genuinely drive the shrink block
+  # we build MANY ✳ rows that all match the filter — so the badge count is large
+  # (3 digits) AND a filter is active — with a long query (bounded to 20 cols)
+  # and 3-digit totals. That makes badge_col + pos_col > 40, forcing the code to
+  # drop the badge / truncate the position; the emitted bar must still fit.
+  csp_count=150
+  local k
+  csp_ids=(); csp_titles=(); csp_titles_full=(); csp_projects=(); csp_fullprojects=()
+  csp_files=(); csp_ages=(); csp_lives=(); csp_states=(); csp_markers=(); csp_rows=()
+  # Full title is long enough that a ~12-column CJK query is a real substring.
+  for k in $(seq 0 149); do
+    csp_ids[$k]="id-$k"
+    csp_titles[$k]="解析工作階段"
+    csp_titles_full[$k]="解析工作階段重構清理維護測試 $k"
+    csp_projects[$k]="p/$k"; csp_fullprojects[$k]="/t/$k"
+    csp_files[$k]="$k.jsonl"; csp_ages[$k]="1m ago"; csp_lives[$k]=0
+    csp_states[$k]=""; csp_markers[$k]="✳"       # every row needs attention
+    csp_rows[$k]=$(csp_format_line "✳" "解析工作階段" "p/$k" "1m ago" 0)
+  done
+  CSP_HAVE_STATE=1
+  csp_visible_rows() { printf '10'; }
+  eval "csp_term_cols() { printf '40'; }"
+  CSP_CHROME_COLS=""
+  # A long CJK query (a genuine substring of the full titles) so the shown filter
+  # fills its ~20-column budget and the right block exceeds the 40-col frame.
+  CSP_FILTER="解析工作階段重構清理維護"; csp_rebuild_view; csp_retally_attention
+  [ "$CSP_ATTENTION_COUNT" -gt 0 ]        # badge is genuinely present
+  _measure_status_bar
+  [ "$CSP_TEST_SB_W" -le "$CSP_INNER" ] \
+    || { echo "INNER=$CSP_INNER width=$CSP_TEST_SB_W : [$CSP_TEST_SB]"; false; }
+}
+
+@test "render: right block filling CSP_INNER exactly does not overflow via the gap floor" {
+  # Adversarial boundary: when the right block (badge dropped, position kept) is
+  # exactly CSP_INNER wide and NO key hints fit, the gap-floor-to-1 used to add a
+  # separator space that isn't needed (no hints to separate from), pushing the
+  # line to CSP_INNER+1. With 1000 matching ✳ rows the counts are "1/1000 of
+  # 1000" and a 20-col filter, so the position alone approaches the 40-col frame.
+  csp_count=1000
+  local k
+  csp_ids=(); csp_titles=(); csp_titles_full=(); csp_projects=(); csp_fullprojects=()
+  csp_files=(); csp_ages=(); csp_lives=(); csp_states=(); csp_markers=(); csp_rows=()
+  for k in $(seq 0 999); do
+    csp_ids[$k]="id-$k"; csp_titles[$k]="t"
+    csp_titles_full[$k]="解析工作階段重構清理維護測試除錯 $k"
+    csp_projects[$k]="p"; csp_fullprojects[$k]="/t/$k"; csp_files[$k]="$k.jsonl"
+    csp_ages[$k]="1m ago"; csp_lives[$k]=0; csp_states[$k]=""; csp_markers[$k]="✳"
+    csp_rows[$k]=$(csp_format_line "✳" "t" "p" "1m ago" 0)
+  done
+  CSP_HAVE_STATE=1
+  csp_visible_rows() { printf '5'; }
+  eval "csp_term_cols() { printf '42'; }"     # CSP_INNER = 40
+  CSP_CHROME_COLS=""
+  CSP_FILTER="解析工作階段重構清理維護"; csp_rebuild_view; csp_retally_attention
+  _measure_status_bar
+  [ "$CSP_TEST_SB_W" -le "$CSP_INNER" ] \
+    || { echo "INNER=$CSP_INNER width=$CSP_TEST_SB_W : [$CSP_TEST_SB]"; false; }
 }
 
 @test "render: a long/wide filter query is truncated in the status bar, not shown whole" {

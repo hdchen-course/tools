@@ -215,23 +215,28 @@ csp_tmux_enter() {
 
   if csp_tmux has-session -t "=$CSP_TMUX_SESSION" 2>/dev/null; then
     csp_tmux_configure_home
-    # Ensure there's a live menu to land on: if no window is named "menu" (e.g.
-    # a previous quit closed it), recreate one and make it window 0. We SWAP it
-    # into index 0 rather than move-window -k (which would KILL whatever session
-    # occupies index 0 — destroying a running Claude); swap is non-destructive.
-    #
-    # Every recovery step is CHECKED. Previously the results were ignored and we
-    # attached regardless — so if new-window/swap-window failed, the client would
-    # land on an arbitrary Claude window with no resident menu while the status
-    # bar still claimed window 0 was the menu. If recovery can't complete we
-    # return non-zero so the caller falls back to hub instead of attaching into a
-    # menu-less, misleading state.
-    if ! csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_name}' 2>/dev/null \
-         | grep -qx menu; then
-      csp_tmux new-window -t "=$CSP_TMUX_SESSION" -n menu "$cmd" 2>/dev/null || return 1
-      csp_tmux swap-window -s "=$CSP_TMUX_SESSION:\$" -t "=$CSP_TMUX_SESSION:0" 2>/dev/null || return 1
-      # Confirm the recovery actually produced a menu window at index 0 before we
-      # commit to attaching (belt-and-suspenders against a partial swap).
+    # Guarantee window 0 IS a menu before we attach — otherwise the client lands
+    # on an arbitrary Claude window with no resident picker while the status bar
+    # still claims window 0 is the menu. We must handle THREE states, not just
+    # "no menu at all": (a) no menu window anywhere → create one; (b) a menu
+    # window exists but at a NON-ZERO index (e.g. left orphaned by an earlier
+    # partial recovery) → swap it to 0; (c) already 0:menu → nothing to do. Every
+    # step is checked; if we can't end at 0:menu we return non-zero so the caller
+    # falls back to hub rather than attaching into a menu-less, misleading state.
+    # We SWAP into index 0 (never move-window -k, which would KILL whatever
+    # occupies 0 — destroying a running Claude); swap is non-destructive.
+    if ! csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_index}:#{window_name}' 2>/dev/null \
+         | grep -qx '0:menu'; then
+      # Create a menu window only if none exists at all; otherwise reuse the one
+      # that's already there (at whatever index) and just swap it to 0.
+      if ! csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_name}' 2>/dev/null \
+           | grep -qx menu; then
+        csp_tmux new-window -t "=$CSP_TMUX_SESSION" -n menu "$cmd" 2>/dev/null || return 1
+      fi
+      # Swap the (now-guaranteed-to-exist) menu window into index 0. `:menu`
+      # targets it by name regardless of its current index.
+      csp_tmux swap-window -s "=$CSP_TMUX_SESSION:menu" -t "=$CSP_TMUX_SESSION:0" 2>/dev/null || return 1
+      # Confirm we really ended at 0:menu before committing to attach.
       csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_index}:#{window_name}' 2>/dev/null \
         | grep -qx '0:menu' || return 1
     fi

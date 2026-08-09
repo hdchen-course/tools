@@ -320,8 +320,9 @@ csp_read_key() {
 # access is guarded by csp_clamp_index so an out-of-range read is impossible.
 csp_ids=()
 csp_titles=()
+csp_titles_full=()    # untruncated title, used only for the '/' filter haystack
 csp_projects=()
-csp_fullprojects=()   # full cwd path, kept for the resume `cd`
+csp_fullprojects=()   # full cwd path, kept for the resume `cd` and filter haystack
 csp_files=()          # on-disk .jsonl path, kept for delete
 csp_ages=()
 csp_states=()         # per-session hook state: working/waiting/"" (for ●/✳)
@@ -348,7 +349,14 @@ CSP_FILTER=""         # active filter needle ("" = show everything)
 # csp_rebuild_view — recompute csp_view from CSP_FILTER. Called after a load and
 # whenever the filter changes. With an empty filter it's the identity mapping;
 # otherwise it uses the pure csp_filter_indices over a per-row haystack of
-# "title␠project" so a search matches either column.
+# "full-title␠full-project-path" so a search matches either column.
+#
+# The haystack uses the FULL title and the FULL cwd (csp_titles_full /
+# csp_fullprojects), NOT the display strings: the display title is truncated to
+# 60 columns and the display project keeps only the last two path components, so
+# filtering on those would silently fail to match text past the title cut or a
+# parent directory the display dropped — contradicting the docs' "type any part
+# of a title or project path". Matching the full strings makes that promise true.
 csp_rebuild_view() {
   csp_view=(); csp_view_count=0
   if [ -z "$CSP_FILTER" ]; then
@@ -362,7 +370,7 @@ csp_rebuild_view() {
   # Build the haystack (one line per session, model order) then filter.
   local hay="" i=0
   while [ "$i" -lt "$csp_count" ]; do
-    hay="${hay}${csp_titles[$i]} ${csp_projects[$i]}"$'\n'
+    hay="${hay}${csp_titles_full[$i]} ${csp_fullprojects[$i]}"$'\n'
     i=$(( i + 1 ))
   done
   hay="${hay%$'\n'}"                       # drop the trailing newline
@@ -418,9 +426,9 @@ csp_precompute_lines() {
 # csp_load_sessions — build the model from Claude's session store. Enforces the
 # CSP_MAX_SESSIONS cap (via csp_list_session_files) so memory stays bounded.
 csp_load_sessions() {
-  local line file id meta title fullcwd project mtime now running is_live marker row
+  local line file id meta title fulltitle fullcwd project mtime now running is_live marker row
   local tab=$'\t'
-  csp_ids=(); csp_titles=(); csp_projects=(); csp_fullprojects=()
+  csp_ids=(); csp_titles=(); csp_titles_full=(); csp_projects=(); csp_fullprojects=()
   csp_ages=(); csp_files=(); csp_states=(); csp_rows=()
   csp_markers=(); csp_line_normal=(); csp_line_selected=()
   csp_count=0
@@ -446,13 +454,17 @@ csp_load_sessions() {
     # separator is visible in the source) rather than via two csp_field forks.
     meta=$(csp_session_meta "$file")
     fullcwd="${meta#*"$tab"}"; [ "$fullcwd" = "$meta" ] && fullcwd=""
-    title=$(csp_truncate "${meta%%"$tab"*}" "$CSP_MAX_TITLE_LEN")
+    fulltitle="${meta%%"$tab"*}"                       # pre-display-truncation title
+    title=$(csp_truncate "$fulltitle" "$CSP_MAX_TITLE_LEN")
     project=$(csp_short_path "$fullcwd")
     is_live=0
     csp_is_live "$id" "$running" && is_live=1
 
     csp_ids[$csp_count]="$id"
     csp_titles[$csp_count]="$title"
+    # Full title kept ONLY for the '/' filter haystack, so a query can match past
+    # the 60-column display truncation (the docs promise "any part of a title").
+    csp_titles_full[$csp_count]="$fulltitle"
     csp_projects[$csp_count]="$project"
     csp_ages[$csp_count]="$(csp_humanize_age "$((now - mtime))")"
     # Per-session hook state (working/waiting) for the ●/✳ marker; empty if the
@@ -829,9 +841,28 @@ csp_draw() {
     badge_col=$(csp_display_width "${CSP_ATTENTION_COUNT}${CSP_MARKER_ATTENTION} *:jump   ")
     badge="${CSP_C_ATTN}${CSP_ATTENTION_COUNT}${CSP_MARKER_ATTENTION}${CSP_C_RESET}${CSP_C_DIM} ${CSP_C_KEY}*${CSP_C_RESET}${CSP_C_DIM}:jump   "
   fi
+  # First bound the RIGHT block itself against the frame — it has priority, but
+  # it must still fit. On a very narrow terminal (e.g. 40 cols) the badge plus a
+  # bounded filter position can alone exceed CSP_INNER; if we only sized the LEFT
+  # hints against it, the line would still overflow and wrap. So we shrink the
+  # right block in priority order until it fits: drop the badge first (the
+  # position + filter carry more information), then, if the position alone is
+  # still too wide, hard-truncate it. We truncate to CSP_INNER-1, not CSP_INNER:
+  # even with no key hints the line is emitted as one leading pad space + the
+  # position, and the pad is clamped to a minimum of 1, so the position must
+  # leave room for that one column or the line would be CSP_INNER+1 wide.
+  local right_col=$(( badge_col + pos_col ))
+  if [ "$right_col" -gt "$CSP_INNER" ]; then
+    badge=""; badge_col=0
+    right_col="$pos_col"
+    if [ "$right_col" -gt "$(( CSP_INNER - 1 ))" ]; then
+      pos_plain=$(csp_truncate_display "$pos_plain" "$(( CSP_INNER - 1 ))")
+      pos_col=$(csp_display_width "$pos_plain")
+      right_col="$pos_col"
+    fi
+  fi
   # Choose the widest key-hints variant that still leaves the right block room
   # (with at least one space of separation). If neither fits, drop the hints.
-  local right_col=$(( badge_col + pos_col ))
   local keys="" keys_col=0
   if [ "$(( CSP_CHROME_KEYS_W + 1 + right_col ))" -le "$CSP_INNER" ]; then
     keys="$CSP_CHROME_KEYS"; keys_col="$CSP_CHROME_KEYS_W"
@@ -839,7 +870,16 @@ csp_draw() {
     keys="$CSP_CHROME_KEYS_C"; keys_col="$CSP_CHROME_KEYS_C_W"
   fi
   local gap=$(( CSP_INNER - keys_col - right_col ))
-  [ "$gap" -lt 1 ] && gap=1
+  # Floor the gap to a 1-column SEPARATOR only when key hints are actually
+  # present — a separator between the (left) hints and the (right) block. With no
+  # hints there is nothing to separate, so a forced pad of 1 would push a
+  # right-block that exactly fills CSP_INNER one column past it (CSP_INNER+1). So:
+  # hints present → min gap 1; no hints → min gap 0.
+  if [ -n "$keys" ]; then
+    [ "$gap" -lt 1 ] && gap=1
+  else
+    [ "$gap" -lt 0 ] && gap=0
+  fi
   local pad="" k=0
   while [ "$k" -lt "$gap" ]; do pad="$pad "; k=$(( k + 1 )); done
   csp_buf_line " ${keys}${pad}${badge}${CSP_C_DIM}${pos_plain}${CSP_C_RESET}"
