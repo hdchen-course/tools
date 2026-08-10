@@ -123,23 +123,30 @@ csp_resident_file() {
 }
 
 # csp_record_residency ID SOCKET_PATH [SERVER_PID] [PANE_ID] — record the
-# residency (best-effort). The write is atomic and symlink-safe: an unpredictable
-# temp is created with mktemp INSIDE the 0700 dir (O_EXCL, so it can't follow a
+# residency. The write is atomic and symlink-safe: an unpredictable temp is
+# created with mktemp INSIDE the 0700 dir (O_EXCL, so it can't follow a
 # pre-planted symlink) and renamed into place. SOCKET_PATH is required; SERVER_PID
 # and PANE_ID are optional (empty lines if absent) so we still record something
-# useful when the hook's env lacks them. Never fails a caller.
+# useful when the hook's env lacks them.
+#
+# Returns 0 only if the record actually landed on disk; NON-ZERO on any failure
+# (no socket, unwritable dir, mktemp/write/rename error). The caller MUST react to
+# a failure — this record can be a live session's ONLY delete protection, so a
+# silent loss would be a data-loss hole. (Callers fall back to marking the session
+# "working", which the delete guard also blocks on.)
 csp_record_residency() {
   local id="$1" sock="$2" spid="${3:-}" pane="${4:-}" f d tmp
-  [ -n "$sock" ] || return 0
+  [ -n "$sock" ] || return 1
   case "$spid" in *[!0-9]*) spid="" ;; esac      # pid must be all digits or empty
   f=$(csp_resident_file "$id"); d=$(dirname "$f")
-  mkdir -p "$d" 2>/dev/null || return 0
+  mkdir -p "$d" 2>/dev/null || return 1
   chmod 700 "$d" 2>/dev/null || true
-  tmp=$(mktemp "$d/.res.XXXXXX" 2>/dev/null) || return 0
+  tmp=$(mktemp "$d/.res.XXXXXX" 2>/dev/null) || return 1
   { printf '%s\n%s\n%s\n' "$sock" "$spid" "$pane" > "$tmp"; } 2>/dev/null \
-    || { rm -f -- "$tmp" 2>/dev/null; return 0; }
+    || { rm -f -- "$tmp" 2>/dev/null; return 1; }
   chmod 600 "$tmp" 2>/dev/null || true
-  mv -f -- "$tmp" "$f" 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null; return 0; }
+  mv -f -- "$tmp" "$f" 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null; return 1; }
+  return 0
 }
 
 # csp_clear_residency ID — drop a residency record (best-effort).
@@ -147,6 +154,27 @@ csp_clear_residency() {
   local f
   f=$(csp_resident_file "$1")
   rm -f -- "$f" 2>/dev/null || true
+}
+
+# csp_clear_residency_if_matches ID SOCKET [PANE] — clear the record for ID ONLY
+# if it belongs to the given (socket[, pane]). Used by SessionEnd: an OLD
+# instance's SessionEnd must not wipe a NEWER same-id instance's record (which a
+# recent working/waiting hook may have just written for a different socket/pane).
+# If the stored record's socket (and pane, when both are known) don't match, we
+# leave it alone. Best-effort.
+csp_clear_residency_if_matches() {
+  local id="$1" sock="$2" pane="${3:-}" rec rsock rpane
+  rec=$(csp_read_residency "$id")
+  [ -n "$rec" ] || return 0                        # nothing to clear
+  rsock=${rec%%$'\t'*}
+  rpane=${rec##*$'\t'}
+  [ "$rsock" = "$sock" ] || return 0               # different server → not ours
+  # If both sides know a pane, require it to match too; if either is unknown, the
+  # socket match is the best signal we have and we clear on it.
+  if [ -n "$pane" ] && [ -n "$rpane" ] && [ "$pane" != "$rpane" ]; then
+    return 0
+  fi
+  csp_clear_residency "$id"
 }
 
 # csp_read_residency ID — print "SOCKET_PATH<TAB>SERVER_PID<TAB>PANE_ID" for a
@@ -178,20 +206,26 @@ csp_read_residency() {
 # READ-ONLY: we query the ambient server by its socket path with `tmux -S`,
 # listing "<server_pid> <pane_id>" per pane — never setting an option, so the
 # "we never touch your tmux" promise holds even for a server we don't own. We run
-# ONE query and branch on its exit status (no double-probe race):
-#   • query FAILS (nonzero): NOT proof of death — could be a transient tmux error.
-#     We only conclude "dead" if we recorded the server pid AND that exact process
-#     is gone (kill -0 fails). Otherwise stay live (fail closed).
-#   • query SUCCEEDS but the live server's pid DIFFERS from the one we recorded:
-#     the socket was reused by a NEW instance. Our session belonged to the OLD
-#     instance; if that pid is still alive we stay live (we just can't see its
-#     panes through this reused socket), else the old instance is gone → clear.
-#   • query SUCCEEDS, same instance: if we recorded a pane, clear only when that
-#     pane is positively absent; with no recorded pane, a live same-instance
-#     server counts as live.
-# If there's no tmux binary at all we cannot probe → fail closed (live).
+# ONE query, then require POSITIVE, VALIDATED evidence before ever clearing:
+#   • query FAILS (nonzero): NOT proof of death (transient tmux error, EINTR,
+#     busy). Clear only if we recorded a server pid AND that exact process is gone
+#     (kill -0 fails). Otherwise stay live.
+#   • query SUCCEEDS but the output is EMPTY or MALFORMED (no valid "<pid>
+#     <pane_id>" lines, or no usable current pid): this is NOT positive proof the
+#     pane is gone — a valid live server always lists at least its own pane with a
+#     numeric pid. Treat as uncertain → stay live (fail closed). This is the
+#     round-4 finding: an exit-0-with-garbage result must never green-light a
+#     delete.
+#   • query SUCCEEDS, valid output, current pid DIFFERS from recorded: socket
+#     reused by a NEW instance. Stay live if our recorded pid is still alive
+#     (session may run in the old instance we can't enumerate here), else clear.
+#   • query SUCCEEDS, valid output, SAME instance: clear only when the recorded
+#     pane is positively ABSENT from the (validated) listing. A legacy record with
+#     no pid is UPGRADED here to a 3-line record using the current pid, so a later
+#     death can be proven.
+# No tmux binary → can't probe → fail closed (live).
 csp_residency_is_live() {
-  local id="$1" rec sock spid pane out st cur_pid
+  local id="$1" rec sock spid pane out st cur_pid panes
   rec=$(csp_read_residency "$id")
   [ -n "$rec" ] || return 1
   sock=${rec%%$'\t'*}
@@ -203,22 +237,26 @@ csp_residency_is_live() {
   out=$(command tmux -S "$sock" list-panes -a -F '#{pid} #{pane_id}' 2>/dev/null)
   st=$?
   if [ "$st" -ne 0 ]; then
-    # Could not reach a server at this socket. NOT proof of death (transient tmux
-    # failure, EINTR, busy). Only positively dead if we know the server pid AND it
-    # is gone. Without a recorded pid we cannot prove death → stay live.
     if [ -n "$spid" ] && ! kill -0 "$spid" 2>/dev/null; then
-      csp_clear_residency "$id"
+      csp_clear_residency "$id"                    # recorded server pid gone → dead
       return 1
     fi
-    return 0
+    return 0                                       # transient/unknown → stay live
   fi
 
-  # Server reachable. Confirm it's the SAME instance we recorded (socket reuse).
-  cur_pid=$(printf '%s\n' "$out" | sed -n '1s/ .*//p')
-  if [ -n "$spid" ] && [ -n "$cur_pid" ] && [ "$cur_pid" != "$spid" ]; then
-    # A DIFFERENT server now holds this socket path. Our recorded instance isn't
-    # this one; if it's still alive elsewhere, the session may still be running in
-    # it (we just can't enumerate its panes via the reused socket) → stay live.
+  # Query SUCCEEDED. VALIDATE the output before trusting it as evidence. Keep only
+  # well-formed "<digits> <%pane>" lines; a valid live server yields at least one.
+  panes=$(printf '%s\n' "$out" | grep -E '^[0-9]+ %[0-9]+$')
+  if [ -z "$panes" ]; then
+    return 0                                       # empty/malformed → NOT proof → live
+  fi
+  cur_pid=$(printf '%s\n' "$panes" | sed -n '1s/ .*//p')
+  case "$cur_pid" in ''|*[!0-9]*) return 0 ;; esac # no usable pid → uncertain → live
+
+  # Valid listing. Is it the SAME instance we recorded?
+  if [ -n "$spid" ] && [ "$cur_pid" != "$spid" ]; then
+    # A DIFFERENT server now holds this socket path. If our recorded instance is
+    # still alive elsewhere, the session may still run in it → stay live.
     if kill -0 "$spid" 2>/dev/null; then
       return 0
     fi
@@ -226,9 +264,15 @@ csp_residency_is_live() {
     return 1
   fi
 
-  # Same instance (or no recorded pid to compare against — legacy record).
+  # Same instance (or a legacy record with no recorded pid). Upgrade a pidless
+  # legacy record to 3-line now, using the pid we just observed, so a future death
+  # is provable rather than blocking forever.
+  if [ -z "$spid" ]; then
+    csp_record_residency "$id" "$sock" "$cur_pid" "$pane"
+  fi
+
   [ -n "$pane" ] || return 0                       # no pane recorded, server up → live
-  if printf '%s\n' "$out" | awk '{print $2}' | grep -qxF -- "$pane"; then
+  if printf '%s\n' "$panes" | awk '{print $2}' | grep -qxF -- "$pane"; then
     return 0                                       # pane still open → live → block
   fi
   csp_clear_residency "$id"                        # same instance, pane gone → ended

@@ -403,6 +403,75 @@ make_home() {
   [ -z "$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)" ]
 }
 
+@test "enter: fresh-path post-configure @csp_owner MISMATCH → bail WITHOUT killing the (possibly foreign) server" {
+  # Round-4: identity after configure is proven by the OWNER TOKEN, not the pid.
+  # If @csp_owner does NOT equal our freshly-minted token, the server on this
+  # socket is not the one we created (a swap, or configure didn't take) — we must
+  # NOT kill-session via it (it may be a replacement/foreign server whose session
+  # we'd destroy). We stub show-options to return a DIFFERENT owner and assert
+  # kill-session is never invoked.
+  self="$BATS_TEST_DIRNAME/../bin/claude-session-picker"
+  killlog="$BATS_TEST_TMPDIR/killlog"; : > "$killlog"
+  lscount="$BATS_TEST_TMPDIR/lscount"; echo 0 > "$lscount"
+  run bash -c "CSP_TMUX_SOCKET='$CSP_TMUX_SOCKET' CSP_TMUX_SESSION='$CSP_TMUX_SESSION' CSP_STATE_DIR='$CSP_STATE_DIR' \
+    bash -c '. \"$BATS_TEST_DIRNAME/../lib/core.sh\"; . \"$BATS_TEST_DIRNAME/../lib/backend.sh\"; \
+      csp_tmux_server_is_ours() { return 1; }; \
+      csp_tmux() { \
+        case \"\$1\" in \
+          has-session) return 1 ;; \
+          new-session) return 0 ;; \
+          list-sessions) \
+            n=\$(cat \"$lscount\"); n=\$(( n + 1 )); echo \"\$n\" > \"$lscount\"; \
+            if [ \"\$n\" -eq 1 ]; then return 1; fi; \
+            printf \"%s\\n\" \"$CSP_TMUX_SESSION\"; return 0 ;; \
+          display-message) echo 1000; return 0 ;; \
+          show-options) echo \"csp-SOMEONE-ELSE\"; return 0 ;; \
+          kill-session) echo kill >> \"$killlog\"; return 0 ;; \
+          set-option) return 0 ;; \
+          *) return 0 ;; \
+        esac; }; \
+      csp_tmux_new_owner_token() { echo csp-tok; }; \
+      csp_tmux_configure_home() { :; }; \
+      csp_tmux_enter \"$self\"' </dev/null 2>&1"
+  # @csp_owner ('csp-SOMEONE-ELSE') != our token ('csp-tok') → bail, NO kill.
+  [ ! -s "$killlog" ]
+}
+
+@test "enter: fresh-path with MATCHING @csp_owner does NOT bail on a pid re-read (no leaked placeholder)" {
+  # The anti-leak guard: once configure stamped OUR token, a transient
+  # display-message glitch must NOT make us abandon a detached holding session
+  # whose window 0 is still the bootstrap placeholder. With a matching token we
+  # proceed to respawn window 0 as the picker. We assert respawn-window IS called
+  # (proving we didn't bail after configure) even though display-message returns
+  # empty.
+  self="$BATS_TEST_DIRNAME/../bin/claude-session-picker"
+  respawnlog="$BATS_TEST_TMPDIR/respawnlog"; : > "$respawnlog"
+  lscount="$BATS_TEST_TMPDIR/lscount2"; echo 0 > "$lscount"
+  run bash -c "CSP_TMUX_SOCKET='$CSP_TMUX_SOCKET' CSP_TMUX_SESSION='$CSP_TMUX_SESSION' CSP_STATE_DIR='$CSP_STATE_DIR' \
+    bash -c '. \"$BATS_TEST_DIRNAME/../lib/core.sh\"; . \"$BATS_TEST_DIRNAME/../lib/backend.sh\"; \
+      csp_tmux_server_is_ours() { return 1; }; \
+      csp_tmux() { \
+        case \"\$1\" in \
+          has-session) return 1 ;; \
+          new-session) return 0 ;; \
+          list-sessions) \
+            n=\$(cat \"$lscount\"); n=\$(( n + 1 )); echo \"\$n\" > \"$lscount\"; \
+            if [ \"\$n\" -eq 1 ]; then return 1; fi; \
+            printf \"%s\\n\" \"$CSP_TMUX_SESSION\"; return 0 ;; \
+          display-message) echo 1000; return 0 ;; \
+          show-options) echo \"csp-tok\"; return 0 ;; \
+          respawn-window) echo respawn >> \"$respawnlog\"; return 0 ;; \
+          set-option) return 0 ;; \
+          *) return 0 ;; \
+        esac; }; \
+      csp_tmux_new_owner_token() { echo csp-tok; }; \
+      csp_tmux_configure_home() { :; }; \
+      csp_tmux_record_launch_pwd() { :; }; \
+      csp_tmux_enter \"$self\"' </dev/null 2>&1"
+  # Matching token → proceeded past the identity check to respawn window 0.
+  [ -s "$respawnlog" ]
+}
+
 @test "recovery: a menu window orphaned at a NON-zero index is swapped back to 0" {
   # Edge case: an earlier partial recovery can leave a 'menu' window at a
   # non-zero index. The old guard ("does ANY window named menu exist?") would see

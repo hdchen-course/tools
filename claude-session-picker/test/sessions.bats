@@ -727,6 +727,106 @@ _write_residency() {  # $1=id $2=socket $3=server_pid $4=pane
   [ -f "$CSP_STATE_DIR/resident/sess-reuse" ]
 }
 
+# A pid that is (almost certainly) not a live process — used so the ONLY thing
+# that can keep a residency "live" is the output-validation guard, not the
+# recorded-pid-still-alive branch. Isolates the round-4 High fix.
+_dead_pid() {
+  local p=999999
+  while kill -0 "$p" 2>/dev/null; do p=$(( p + 1 )); done
+  printf '%s' "$p"
+}
+
+@test "residency-live: a SUCCESSFUL probe with EMPTY output stays LIVE (round-4 High, fail closed)" {
+  # The round-4 High: `tmux list-panes` exiting 0 with empty output is NOT positive
+  # proof the pane is gone. We record a DEAD pid so the only thing that can keep it
+  # live is the output-validation guard (not the pid-alive reuse branch). A fake
+  # tmux exits 0 and prints nothing; the guard must keep the record and stay live.
+  mkdir -p "$CSP_STATE_DIR/resident"
+  _write_residency sess-emptyout "/tmp/whatever.sock" "$(_dead_pid)" "%0"
+  fakebin="$BATS_TEST_TMPDIR/emptyout-bin"; mkdir -p "$fakebin"
+  printf '#!/bin/sh\nexit 0\n' > "$fakebin/tmux"; chmod +x "$fakebin/tmux"
+  run env CSP_STATE_DIR="$CSP_STATE_DIR" PATH="$fakebin:$PATH" bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/sessions.sh"
+    csp_residency_is_live sess-emptyout && echo LIVE || echo DEAD'
+  [ "$output" = "LIVE" ]
+  [ -f "$CSP_STATE_DIR/resident/sess-emptyout" ]   # record preserved
+}
+
+@test "residency-live: a SUCCESSFUL probe with MALFORMED output stays LIVE (fail closed)" {
+  # Exit 0 but the lines don't match "<pid> <%pane>" (e.g. an error banner on
+  # stdout). Recorded pid is DEAD, so only the validation guard can keep it live.
+  mkdir -p "$CSP_STATE_DIR/resident"
+  _write_residency sess-garbled "/tmp/whatever.sock" "$(_dead_pid)" "%0"
+  fakebin="$BATS_TEST_TMPDIR/garbled-bin"; mkdir -p "$fakebin"
+  printf '#!/bin/sh\necho "protocol version mismatch"\nexit 0\n' > "$fakebin/tmux"; chmod +x "$fakebin/tmux"
+  run env CSP_STATE_DIR="$CSP_STATE_DIR" PATH="$fakebin:$PATH" bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/sessions.sh"
+    csp_residency_is_live sess-garbled && echo LIVE || echo DEAD'
+  [ "$output" = "LIVE" ]
+  [ -f "$CSP_STATE_DIR/resident/sess-garbled" ]
+}
+
+@test "residency-live: a VALID same-instance listing WITHOUT our pane clears (positive proof)" {
+  # The complement: a well-formed listing from the SAME server pid that genuinely
+  # lacks our pane is positive proof → clear + dead.
+  mkdir -p "$CSP_STATE_DIR/resident"
+  _write_residency sess-realgone "/tmp/whatever.sock" "4242" "%7"
+  fakebin="$BATS_TEST_TMPDIR/realgone-bin"; mkdir -p "$fakebin"
+  # Same pid (4242), but only pane %0 exists — %7 is gone.
+  printf '#!/bin/sh\necho "4242 %%0"\nexit 0\n' > "$fakebin/tmux"; chmod +x "$fakebin/tmux"
+  run env CSP_STATE_DIR="$CSP_STATE_DIR" PATH="$fakebin:$PATH" bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/sessions.sh"
+    csp_residency_is_live sess-realgone && echo LIVE || echo DEAD'
+  [ "$output" = "DEAD" ]
+  [ ! -f "$CSP_STATE_DIR/resident/sess-realgone" ]  # cleared on positive proof
+}
+
+@test "residency-live: a LEGACY pidless record is UPGRADED to 3-line on a live probe" {
+  command -v tmux >/dev/null 2>&1 || skip "tmux not installed"
+  # A legacy (socket, pane) record has no pid, so a later probe-failure could never
+  # prove death. On a live probe we upgrade it to 3-line with the observed pid.
+  sock="csp-upg-$$"
+  tmux -L "$sock" new-session -d -s foreign -n w "sleep 30"
+  sockpath=$(tmux -L "$sock" display-message -p '#{socket_path}')
+  spid=$(tmux -L "$sock" display-message -p '#{pid}')
+  pane=$(tmux -L "$sock" display-message -p -t "=foreign:w" '#{pane_id}')
+  mkdir -p "$CSP_STATE_DIR/resident"
+  printf '%s\n%s\n' "$sockpath" "$pane" > "$CSP_STATE_DIR/resident/sess-upg"   # 2-line legacy
+  run env CSP_STATE_DIR="$CSP_STATE_DIR" bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/sessions.sh"
+    csp_residency_is_live sess-upg && echo LIVE || echo DEAD'
+  tmux -L "$sock" kill-server 2>/dev/null || true
+  [ "$output" = "LIVE" ]
+  # The record is now 3-line: line 2 is the numeric pid we observed.
+  line2=$(sed -n '2p' "$CSP_STATE_DIR/resident/sess-upg")
+  [ "$line2" = "$spid" ]
+}
+
+@test "residency: csp_clear_residency_if_matches only clears a matching (socket,pane)" {
+  mkdir -p "$CSP_STATE_DIR/resident"
+  . "$BATS_TEST_DIRNAME/../lib/core.sh"; . "$BATS_TEST_DIRNAME/../lib/sessions.sh"
+  _write_residency sess-cond "/tmp/A.sock" "111" "%1"
+  # Wrong socket → NOT cleared.
+  csp_clear_residency_if_matches sess-cond "/tmp/B.sock" "%1"
+  [ -f "$CSP_STATE_DIR/resident/sess-cond" ]
+  # Right socket, wrong pane → NOT cleared.
+  csp_clear_residency_if_matches sess-cond "/tmp/A.sock" "%9"
+  [ -f "$CSP_STATE_DIR/resident/sess-cond" ]
+  # Right socket + right pane → cleared.
+  csp_clear_residency_if_matches sess-cond "/tmp/A.sock" "%1"
+  [ ! -f "$CSP_STATE_DIR/resident/sess-cond" ]
+}
+
+@test "residency: csp_record_residency reports failure when the state dir is unwritable" {
+  . "$BATS_TEST_DIRNAME/../lib/core.sh"; . "$BATS_TEST_DIRNAME/../lib/sessions.sh"
+  # Point the state dir at a path that can't be created (under a regular file).
+  blocker="$BATS_TEST_TMPDIR/blocker"; : > "$blocker"
+  run env CSP_STATE_DIR="$blocker/state" bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/sessions.sh"
+    csp_record_residency x /tmp/s.sock 1 %0 && echo OK || echo FAIL'
+  [ "$output" = "FAIL" ]
+}
+
 @test "delete-guard: a FRESH transcript (recent mtime) is live even with no tmux/process (fail closed)" {
   # The topology-independent backstop for the High data-loss finding: a live bare
   # session that the picker's tmux ownership no longer recognises still keeps

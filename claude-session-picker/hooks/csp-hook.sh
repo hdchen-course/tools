@@ -87,14 +87,35 @@ case "$id" in
   ''|*[!A-Za-z0-9_-]*) exit 0 ;;
 esac
 
+# Parse our own read-only $TMUX once, up front: "<socket_path>,<server_pid>,<sid>".
+# Socket = before the 1st comma; server pid = between the 1st and 2nd. $TMUX_PANE
+# is this pane's stable id (e.g. %3). Used by both SessionEnd and the tagging step.
+csp_tmux_sock=""; csp_tmux_spid=""
+if [ -n "${TMUX:-}" ]; then
+  csp_tmux_sock="${TMUX%%,*}"
+  csp_tmux_rest="${TMUX#*,}"; csp_tmux_spid="${csp_tmux_rest%%,*}"
+  case "$csp_tmux_spid" in *[!0-9]*) csp_tmux_spid="" ;; esac
+fi
+
 # SessionEnd: Claude for this id has exited. Clear its state and its residency
 # record — residency tracks a PANE, but a pane in a foreign shell outlives the
 # Claude that ran in it (you drop back to the shell), so without this an ended
 # session's transcript would stay un-deletable until the whole pane/server closed.
-# SessionEnd fires in the same environment the session ran in, so the id matches.
+#
+# CONDITIONAL clear: a DELAYED SessionEnd from an OLD instance must not wipe a
+# record a NEWER same-id instance just wrote (e.g. `claude --continue` reusing the
+# id in a different pane). We clear the residency ONLY if it matches the socket
+# (and pane, when both known) this SessionEnd fired in. The ●/✳ state is a mere
+# hint, so clearing it unconditionally is fine.
 if [ "$state" = "ended" ]; then
   csp_clear_state "$id"
-  command -v csp_clear_residency >/dev/null 2>&1 && csp_clear_residency "$id"
+  if command -v csp_clear_residency_if_matches >/dev/null 2>&1 && [ -n "$csp_tmux_sock" ]; then
+    csp_clear_residency_if_matches "$id" "$csp_tmux_sock" "${TMUX_PANE:-}"
+  elif [ -z "${TMUX:-}" ] && command -v csp_clear_residency >/dev/null 2>&1; then
+    # Not in tmux at all → no instance to disambiguate against; a plain clear is
+    # correct (there's no foreign-pane residency to protect here).
+    csp_clear_residency "$id"
+  fi
   exit 0
 fi
 
@@ -126,26 +147,32 @@ csp_write_state "$id" "$state"
 #       closes the data-loss gap where an untagged idle session went deletable
 #       after the mtime window elapsed.
 #   (c) not in tmux at all → nothing to do.
+# csp_record_residency_or_fallback ID — record residency; if that WRITE FAILS
+# (mktemp/rename error, unwritable state dir), the session would otherwise be left
+# with no live signal at all. Fall back to marking it "working", which the delete
+# guard also blocks on — so a storage failure over-blocks (safe) rather than
+# silently losing the last protection.
+csp_record_residency_or_fallback() {
+  if csp_record_residency "$1" "$2" "$3" "$4"; then
+    return 0
+  fi
+  csp_write_state "$1" "working"
+}
+
 if command -v tmux >/dev/null 2>&1 && command -v csp_inside_tmux >/dev/null 2>&1; then
-  # $TMUX is "<socket_path>,<server_pid>,<session_id>". Split off the socket path
-  # (before the 1st comma) and the server pid (between the 1st and 2nd commas).
-  # $TMUX_PANE is this pane's stable id (e.g. %3). All read-only from our own env.
-  csp_tmux_sock="${TMUX%%,*}"
-  csp_tmux_rest="${TMUX#*,}"; csp_tmux_spid="${csp_tmux_rest%%,*}"
-  case "$csp_tmux_spid" in *[!0-9]*) csp_tmux_spid="" ;; esac
   if csp_inside_tmux; then
     # Our OWN server: tag the window. Clear the residency fallback ONLY if the tag
     # actually succeeded — otherwise a bare session would be left with no tag AND
     # no residency (deletable once idle). On tag failure, fall back to residency.
     if tmux set-option -w '@csp_sid' "$id" >/dev/null 2>&1; then
       command -v csp_clear_residency >/dev/null 2>&1 && csp_clear_residency "$id"
-    elif [ -n "${TMUX:-}" ] && command -v csp_record_residency >/dev/null 2>&1; then
-      csp_record_residency "$id" "$csp_tmux_sock" "$csp_tmux_spid" "${TMUX_PANE:-}"
+    elif [ -n "$csp_tmux_sock" ] && command -v csp_record_residency >/dev/null 2>&1; then
+      csp_record_residency_or_fallback "$id" "$csp_tmux_sock" "$csp_tmux_spid" "${TMUX_PANE:-}"
     fi
-  elif [ -n "${TMUX:-}" ] && command -v csp_record_residency >/dev/null 2>&1; then
+  elif [ -n "$csp_tmux_sock" ] && command -v csp_record_residency >/dev/null 2>&1; then
     # A tmux we do NOT own: record residency so the delete guard protects this
     # live session without our touching the foreign server.
-    csp_record_residency "$id" "$csp_tmux_sock" "$csp_tmux_spid" "${TMUX_PANE:-}"
+    csp_record_residency_or_fallback "$id" "$csp_tmux_sock" "$csp_tmux_spid" "${TMUX_PANE:-}"
   fi
 fi
 exit 0

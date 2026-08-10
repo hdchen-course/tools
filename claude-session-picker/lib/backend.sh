@@ -334,6 +334,18 @@ csp_tmux_configure_home() {
   csp_tmux set-option -g display-time 1500 2>/dev/null
 }
 
+# csp_tmux_enter_cleanup EXPECTED_PID — remove OUR holding session from the fresh
+# path, but ONLY if the server on this socket is still the same instance we created
+# (its pid equals EXPECTED_PID). On a reusable socket path a replacement server may
+# have taken over; killing "our" session there could destroy a foreign session, so
+# if the pid no longer matches we leave the server untouched. Best-effort.
+csp_tmux_enter_cleanup() {
+  local expected="$1" cur
+  cur=$(csp_tmux display-message -p '#{pid}' 2>/dev/null)
+  [ -n "$expected" ] && [ "$cur" = "$expected" ] || return 0
+  csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null || true
+}
+
 # csp_tmux_enter SELF_PATH — put the picker itself inside the holding tmux
 # session (on our dedicated socket) as window 0, so it stays resident as your
 # "home base".
@@ -476,29 +488,47 @@ csp_tmux_enter() {
     csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null
     return 1
   fi
-  # Remember the server pid so we can confirm configure_home acted on the SAME
-  # instance (not one swapped in underneath us).
+  # Remember the server pid so we can confirm every later step acts on the SAME
+  # instance (not one swapped in underneath us on this reusable socket path). We
+  # require a numeric pid up front — without it we can't bind identity, so bail.
   srv_pid=$(csp_tmux display-message -p '#{pid}' 2>/dev/null)
+  case "$srv_pid" in ''|*[!0-9]*) csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null; return 1 ;; esac
   tok=$(csp_tmux_new_owner_token)
   [ -n "$tok" ] || { csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null; return 1; }
-  csp_tmux_configure_home
-  # Confirm (a) the token landed as @csp_owner and (b) the server pid is unchanged
-  # — if either fails (a wedged server, or the socket got swapped mid-configure),
-  # tear down our session and fall back to hub rather than racing.
+  # Re-verify the instance is STILL ours-only and unchanged IMMEDIATELY before the
+  # first global mutation, to shrink the check→configure window to near-zero. (The
+  # -L CLI can't hold one connection across ops, so a sub-op swap can't be made
+  # strictly impossible; this makes it vanishingly unlikely and, combined with the
+  # post-check below, ensures we NEVER trust or clean up a swapped instance.)
   srv_pid2=$(csp_tmux display-message -p '#{pid}' 2>/dev/null)
-  if [ "$(csp_tmux show-options -gv @csp_owner 2>/dev/null)" != "$tok" ] \
-     || [ -z "$srv_pid" ] || [ "$srv_pid" != "$srv_pid2" ]; then
-    csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null
+  sessions=$(csp_tmux list-sessions -F '#{session_name}' 2>/dev/null)
+  if [ "$srv_pid" != "$srv_pid2" ] || [ "$sessions" != "$CSP_TMUX_SESSION" ]; then
+    csp_tmux_enter_cleanup "$srv_pid"              # only kills if still our instance
+    return 1
+  fi
+  csp_tmux_configure_home
+  # Confirm identity by the OWNER TOKEN, which is the strongest signal we have: it
+  # is an unguessable per-instance value we just minted and only WE wrote, so a
+  # replacement/foreign server that grabbed this socket can never carry it.
+  #   • @csp_owner == our token → this IS our freshly-created instance. Proceed to
+  #     respawn window 0 as the picker. (We do NOT bail on a mere pid re-read
+  #     glitch here — that used to leak a detached holding session whose window 0
+  #     was still the bootstrap placeholder, which the reuse path would then trust
+  #     by name and attach you to a hung sleeper.)
+  #   • @csp_owner != our token → NOT ours (a swap, or configure didn't take). We
+  #     must NOT kill via this socket — it may now point at a replacement/foreign
+  #     server whose session we'd destroy. Bail and leave it untouched.
+  if [ "$(csp_tmux show-options -gv @csp_owner 2>/dev/null)" != "$tok" ]; then
     return 1
   fi
   # Now replace the placeholder with the real picker in the same window 0.
   csp_tmux respawn-window -k -t "=$CSP_TMUX_SESSION:menu" "$cmd" 2>/dev/null || {
-    csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null
+    csp_tmux_enter_cleanup "$srv_pid"             # only if still our instance
     return 1
   }
   csp_tmux_record_launch_pwd    # seed the launch dir for `n` (see helper)
   exec command tmux -L "$CSP_TMUX_SOCKET" attach-session -t "=$CSP_TMUX_SESSION"
-  csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null   # only if exec failed
+  csp_tmux_enter_cleanup "$srv_pid"   # only if exec failed AND still our instance
   return 1
 }
 
