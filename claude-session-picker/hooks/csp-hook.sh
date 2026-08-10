@@ -128,9 +128,17 @@ if [ "$state" = "ended" ]; then
     fi
     # else: record belonged to a newer instance → leave state too.
   else
-    # No residency record to protect (session ran outside tmux, or none written).
-    # Clearing the ●/✳ state is cosmetic and safe.
-    csp_clear_state "$id"
+    # No residency record to protect. Clearing the ●/✳ state is cosmetic — EXCEPT
+    # that "working" is ALSO a delete-blocking signal. On a clean SessionEnd this
+    # instance's own last state was "waiting" (Stop fires before SessionEnd), so a
+    # "working" on disk right now belongs to a NEWER same-id instance (e.g. a bare
+    # `n` that wrote "working" via the record-failure fallback) — clearing it could
+    # expose that live session to deletion. So we clear state only when it is NOT
+    # "working"; a stale "working" is left for the picker's reconciler (which shows
+    # it as ✳ once no process is running).
+    if [ "$(csp_read_state "$id")" != "working" ]; then
+      csp_clear_state "$id"
+    fi
   fi
   exit 0
 fi

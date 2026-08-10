@@ -170,11 +170,14 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   written 0600 in a 0700 dir via an mktemp temp (O_EXCL, unpredictable) + rename
   (symlink-safe on both the temp and the final path), and read back with a
   bounded, shape-validated, symlink-refusing reader. The fresh path closes the
-  check→create TOCTOU: after `new-session` it demands `list-sessions` SUCCEED and
-  return exactly our one session before stamping any global option (a failed/empty
-  query is not proof of a clean server), re-checks the server pid across
-  `configure_home`, and removes just our session (leaving a foreign server
-  untouched) otherwise. `csp_delete_would_hit_live` grew a transcript-mtime
+  check→create TOCTOU STRUCTURALLY: `new-session` and every global option (incl.
+  `@csp_owner`) run in ONE `tmux` invocation — a single server connection, so no
+  socket swap can slip between two sub-commands — gated by an in-queue
+  `if-shell -F '#{==:#{server_sessions},1}'` so that if `new-session` joined a
+  foreign server (≥2 sessions) NONE of the mutations run (we never stamp or
+  configure a server we don't own). The picker command is respawned into window 0
+  as a SEPARATE direct-argv call (never string-interpolated, so a spaced
+  install/$HOME path survives). `csp_delete_would_hit_live` grew a transcript-mtime
   backstop AND an ownership-independent **residency** signal recorded as `(socket,
   server-pid, pane)`; the probe is fail-closed (a transient tmux error never reads
   as death — it clears only on a confirmed-gone server pid or a same-instance
@@ -190,12 +193,23 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   bound to a reused socket owner, the fresh-path pid-swap-during-configure "bail
   without killing the replacement" guard, the tag-failure and record-failure
   fallbacks, `csp_write_state`/`csp_record_residency` reporting real failure, the
-  delete guard failing closed on an unhealthy state store, and instance-safe
-  `SessionEnd` teardown (matched on socket + server-pid + pane; a delayed
-  old-instance or outside-tmux end can't clear a newer record or its state). The
-  fresh-path identity re-check after `configure_home` is proven by the owner TOKEN
-  and a server-pid comparison. Each new assertion was mutation-verified (disable
-  the fix → the test fails). Test suite grew to 258.
+  delete guard failing closed on an unhealthy state store, instance-safe
+  `SessionEnd` teardown (matched on socket + server-pid + pane, via an atomic
+  claim/restore so a concurrent newer record is never clobbered; a delayed
+  old-instance or outside-tmux end can't clear a newer record or its `working`
+  state), the atomic create+configure landing correctly on a clean socket and
+  mutating NOTHING when it joins a foreign server, the fresh-path respawn
+  preserving a SPACE-containing command, and quote/backslash stripping from the
+  session name. Each new assertion was mutation-verified (disable the fix → the
+  test fails). Test suite grew to 261.
+
+  Known limitation (documented, not gated): if the state store suffers a
+  transient failure that drops ALL of a hooked session's writes AND fully recovers
+  before you delete it, an *idle* bare session in a tmux the picker doesn't own can
+  have no live signal at delete time (the health probe only sees the recovered
+  store). A running `--resume` process or a session in the picker's own tmux is
+  always protected regardless; the residual is the same class as the "install the
+  hooks" caveat.
 - New pure, unit-tested helpers in `lib/core.sh`: `csp_filter_indices`,
   `csp_next_attention`, `csp_count_attention`. A shared `csp_prompt_line` now
   backs both the delete confirmation and the filter query (one home for the

@@ -86,7 +86,12 @@ csp_write_state() {
   local id="$1" v="$2" f tmp
   f=$(csp_state_file "$id")
   mkdir -p "$CSP_STATE_DIR" 2>/dev/null || return 1
-  tmp="$f.$$.tmp"
+  chmod 700 "$CSP_STATE_DIR" 2>/dev/null || true
+  # Unpredictable, exclusively-created temp (O_EXCL) INSIDE the state dir — a
+  # predictable "$f.$$.tmp" opened via `>` would follow a pre-planted symlink and
+  # truncate its target. Then atomic rename into place (replaces, never follows, a
+  # symlink at the final path).
+  tmp=$(mktemp "$CSP_STATE_DIR/.state.XXXXXX" 2>/dev/null) || return 1
   { printf '%s\n' "$v" > "$tmp"; } 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null; return 1; }
   mv -f -- "$tmp" "$f" 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null; return 1; }
   return 0
@@ -111,7 +116,10 @@ csp_clear_state() {
 csp_state_store_healthy() {
   local probe rv
   mkdir -p "$CSP_STATE_DIR" 2>/dev/null || return 1
-  probe="$CSP_STATE_DIR/.health.$$"
+  chmod 700 "$CSP_STATE_DIR" 2>/dev/null || true
+  # Unpredictable, exclusively-created probe (mktemp = O_EXCL) so it can't follow a
+  # pre-planted symlink and truncate an arbitrary target.
+  probe=$(mktemp "$CSP_STATE_DIR/.health.XXXXXX" 2>/dev/null) || return 1
   { printf 'ok\n' > "$probe"; } 2>/dev/null || { rm -f -- "$probe" 2>/dev/null; return 1; }
   rv=$( { IFS= read -r rv < "$probe"; } 2>/dev/null && printf '%s' "$rv" )
   rm -f -- "$probe" 2>/dev/null
@@ -188,24 +196,38 @@ csp_clear_residency() {
 # CANNOT prove the event belongs to the current record → we do NOT clear (a stale
 # record self-heals later via the live probe, which is fail-closed). Best-effort.
 csp_clear_residency_if_matches() {
-  local id="$1" sock="$2" spid="${3:-}" pane="${4:-}" rec rsock rspid rpane
-  rec=$(csp_read_residency "$id")
-  [ -n "$rec" ] || return 0                        # nothing to clear
-  rsock=${rec%%$'\t'*}
-  rec=${rec#*$'\t'}
-  rspid=${rec%%$'\t'*}
-  rpane=${rec#*$'\t'}
-  [ "$rsock" = "$sock" ] || return 0               # different socket → not ours
-  # Require a server-pid match on BOTH sides — the only reuse-proof identity. If
-  # either is unknown, we can't prove the event belongs to this record → keep it.
-  case "$spid" in ''|*[!0-9]*) return 0 ;; esac
-  case "$rspid" in ''|*[!0-9]*) return 0 ;; esac
-  [ "$spid" = "$rspid" ] || return 0               # different instance → not ours
-  # Pane, when both know it, must match too.
-  if [ -n "$pane" ] && [ -n "$rpane" ] && [ "$pane" != "$rpane" ]; then
+  local id="$1" sock="$2" spid="${3:-}" pane="${4:-}"
+  local f claim rsock rspid rpane
+  case "$spid" in ''|*[!0-9]*) return 0 ;; esac    # no usable event pid → can't prove
+  f=$(csp_resident_file "$id")
+  [ -f "$f" ] && [ ! -L "$f" ] || return 0         # nothing to clear / never a symlink
+  # ATOMIC CLAIM: rename the record to a private name before inspecting it. This
+  # closes the compare-then-unlink race — after this rename the original path is
+  # free, so a concurrent NEWER hook that writes a fresh record recreates it, and
+  # we will only ever act on OUR claimed copy (never touch the original path
+  # again). If the claim rename fails (a concurrent claim/replace won), we simply
+  # stop — the other actor owns the decision. mktemp in the same dir gives a
+  # private, unpredictable claim path on the same filesystem (atomic rename).
+  claim=$(mktemp "$(dirname "$f")/.claim.XXXXXX" 2>/dev/null) || return 0
+  mv -- "$f" "$claim" 2>/dev/null || { rm -f -- "$claim" 2>/dev/null; return 0; }
+  # Inspect the CLAIMED copy. If it belongs to this instance, drop it (done — the
+  # original path stays free for any newer record). If NOT ours, restore it — but
+  # only if nothing newer has appeared at the original path meanwhile (don't clobber
+  # a newer record); if something is there, discard our stale claim.
+  { IFS= read -r rsock; IFS= read -r rspid; IFS= read -r rpane; } < "$claim" 2>/dev/null
+  : "${rsock:=}" "${rspid:=}" "${rpane:=}"
+  if [ "$rsock" = "$sock" ] && [ "$rspid" = "$spid" ] \
+     && { [ -z "$pane" ] || [ -z "$rpane" ] || [ "$pane" = "$rpane" ]; }; then
+    rm -f -- "$claim" 2>/dev/null                  # matched → cleared
     return 0
   fi
-  csp_clear_residency "$id"
+  # Not ours: put it back if the slot is still empty; else a newer record won.
+  if [ ! -e "$f" ]; then
+    mv -- "$claim" "$f" 2>/dev/null || rm -f -- "$claim" 2>/dev/null
+  else
+    rm -f -- "$claim" 2>/dev/null
+  fi
+  return 0
 }
 
 # csp_read_residency ID — print "SOCKET_PATH<TAB>SERVER_PID<TAB>PANE_ID" for a
@@ -282,13 +304,18 @@ csp_residency_is_live() {
   #   • EVERY line matches "<digits> %<digits>" exactly (no malformed line); and
   #   • all lines report the SAME server pid (a real server's panes all share its
   #     pid — a mix means the output is inconsistent/untrustworthy).
-  # Any violation → uncertain → stay live (fail closed).
-  nlines=$(printf '%s\n' "$out" | grep -c .)
+  # Any violation → uncertain → stay live (fail closed). We count EVERY line,
+  # including blank ones (`grep -c ''` matches all lines, unlike `grep -c .` which
+  # skips blanks and would let an embedded blank line slip past the "all lines
+  # well-formed" check). A single trailing newline from tmux was already stripped
+  # by the `$(...)` capture, so a non-empty listing has no spurious trailing blank.
+  [ -n "$out" ] || return 0                        # truly empty → not proof → live
+  nlines=$(printf '%s\n' "$out" | grep -c '')
   panes=$(printf '%s\n' "$out" | grep -E '^[0-9]+ %[0-9]+$')
-  nvalid=$(printf '%s\n' "$panes" | grep -c .)
-  [ "$nvalid" -ge 1 ] || return 0                  # nothing well-formed → live
-  [ "$nvalid" -eq "$nlines" ] || return 0          # some line was malformed → live
-  npids=$(printf '%s\n' "$panes" | awk '{print $1}' | sort -u | grep -c .)
+  nvalid=$(printf '%s\n' "$panes" | grep -c '')
+  [ -n "$panes" ] || return 0                      # nothing well-formed → live
+  [ "$nvalid" -eq "$nlines" ] || return 0          # a malformed OR blank line → live
+  npids=$(printf '%s\n' "$panes" | awk '{print $1}' | sort -u | grep -c '')
   [ "$npids" -eq 1 ] || return 0                   # inconsistent pids → live
   cur_pid=$(printf '%s\n' "$panes" | sed -n '1s/ .*//p')
   case "$cur_pid" in ''|*[!0-9]*) return 0 ;; esac # (belt-and-suspenders)

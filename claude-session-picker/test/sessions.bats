@@ -863,6 +863,45 @@ _dead_pid() {
   [ ! -f "$CSP_STATE_DIR/resident/sess-cond" ]
 }
 
+@test "residency: a non-matching claim RESTORES the record intact (atomic claim/restore)" {
+  mkdir -p "$CSP_STATE_DIR/resident"
+  . "$BATS_TEST_DIRNAME/../lib/core.sh"; . "$BATS_TEST_DIRNAME/../lib/sessions.sh"
+  _write_residency sess-restore "/tmp/A.sock" "111" "%1"
+  before=$(cat "$CSP_STATE_DIR/resident/sess-restore")
+  # A mismatching end (different pid) must leave the record byte-for-byte intact —
+  # the claim is renamed away, found not-ours, then renamed back.
+  csp_clear_residency_if_matches sess-restore "/tmp/A.sock" "999" "%1"
+  [ -f "$CSP_STATE_DIR/resident/sess-restore" ]
+  after=$(cat "$CSP_STATE_DIR/resident/sess-restore")
+  [ "$before" = "$after" ]
+  # And no stray .claim.* file leaked in the resident dir.
+  run bash -c "ls '$CSP_STATE_DIR/resident/'.claim.* 2>/dev/null | grep -c ."
+  [ "$output" = "0" ]
+}
+
+@test "residency: if a NEWER record appears at the slot during a non-matching claim, it is NOT clobbered" {
+  mkdir -p "$CSP_STATE_DIR/resident"
+  . "$BATS_TEST_DIRNAME/../lib/core.sh"; . "$BATS_TEST_DIRNAME/../lib/sessions.sh"
+  # Simulate the race: stub `mv` so that AFTER the claim-rename moves the old record
+  # away, a newer record is written to the original slot before the restore. The
+  # matcher must discard its stale claim rather than overwrite the newer record.
+  # We emulate by pre-seeding: the matcher renames f->claim (old), then finds not
+  # ours; we make a newer record appear at f before the restore check by wrapping.
+  _write_residency sess-race "/tmp/OLD.sock" "111" "%1"
+  # Run the matcher in a subshell where, right after it claims (file disappears),
+  # a concurrent writer drops a NEW record. We approximate with a background writer
+  # that waits for the slot to be empty then writes the new record.
+  f="$CSP_STATE_DIR/resident/sess-race"
+  ( while [ -e "$f" ]; do :; done; printf '%s\n%s\n%s\n' "/tmp/NEW.sock" "222" "%5" > "$f" ) &
+  writer=$!
+  csp_clear_residency_if_matches sess-race "/tmp/OLD.sock" "999" "%1"   # mismatch (pid 999)
+  wait "$writer" 2>/dev/null || true
+  # The NEWER record must be intact (not overwritten by the restored OLD one).
+  [ -f "$f" ]
+  line1=$(sed -n '1p' "$f")
+  [ "$line1" = "/tmp/NEW.sock" ]
+}
+
 @test "residency: csp_record_residency reports failure when the state dir is unwritable" {
   . "$BATS_TEST_DIRNAME/../lib/core.sh"; . "$BATS_TEST_DIRNAME/../lib/sessions.sh"
   # Point the state dir at a path that can't be created (under a regular file).

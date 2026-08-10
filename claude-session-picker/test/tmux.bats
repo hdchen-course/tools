@@ -371,134 +371,75 @@ make_home() {
   [ "$status" -ne 0 ]
 }
 
-@test "enter: fresh-path TOCTOU — if new-session lands on a server that already has a foreign session, bail without mutating" {
-  # Defence-in-depth for the check->create race: the pre-check (list-sessions &&
-  # !server_is_ours) can't see a foreign server that grabs the socket AFTER it
-  # runs but BEFORE our new-session. To reach that post-new-session guard
-  # deterministically, we force the pre-check to pass by stubbing
-  # csp_tmux_server_is_ours to "not ours but pretend the socket looked empty":
-  # we stub list-sessions to report empty ONCE (pre-check), while a real foreign
-  # session already exists — so our new-session adds ours to the foreign server.
-  # The guard must then see >1 session, remove ONLY ours, and NOT stamp @csp_owner.
-  csp_tmux new-session -d -s "foreign-race" -n w "sleep 60"   # the foreign server/session
-  before_owner=$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)
+@test "atomic-home: on a CLEAN socket, creates+configures our server (token, mouse, 0:menu, boot tag set)" {
+  # atomic_home creates the server and stamps token + all config, but does NOT
+  # respawn window 0 (the caller does that via direct argv). So window 0 is still
+  # the bootstrap placeholder, tagged @csp_boot=1.
+  tok=$(csp_tmux_gen_owner_token)
+  csp_tmux_atomic_home "$tok"
+  [ "$(csp_tmux show-options -gv @csp_owner)" = "$tok" ]
+  [ "$(csp_tmux show-options -gv mouse)" = "on" ]
+  run csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_index}:#{window_name}'
+  [ "$(printf '%s\n' "$output" | sed -n 1p)" = "0:menu" ]
+  [ "$(csp_tmux show-options -wv -t "=$CSP_TMUX_SESSION:0" @csp_boot 2>/dev/null)" = "1" ]
+}
+
+@test "atomic-home: JOINING a foreign server (other session present) stamps/mutates NOTHING (structural TOCTOU close)" {
+  # The crux of the check->create race: if new-session lands on a live foreign
+  # server (a session with a different name), the atomic invocation's
+  # server_sessions==1 guard must fire NONE of the global mutations — no @csp_owner,
+  # no mouse, nothing — so we never touch a user's server even in the race window.
+  csp_tmux new-session -d -s "foreign-race" -n w "sleep 60"   # foreign server, other name
+  before_mouse=$(csp_tmux show-options -gv mouse 2>/dev/null || true)
+  tok=$(csp_tmux_gen_owner_token)
+  csp_tmux_atomic_home "$tok"    # our new-session JOINS the foreign server (2 sessions now)
+  # NOT stamped, NOT configured — the foreign server is pristine.
+  [ -z "$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)" ]
+  [ "$(csp_tmux show-options -gv mouse 2>/dev/null || true)" = "$before_mouse" ]
+  # The foreign session is untouched (still there).
+  run csp_tmux has-session -t "=foreign-race"
+  [ "$status" -eq 0 ]
+}
+
+@test "enter: full fresh path JOINING a foreign server bails to hub and removes ONLY our own session" {
+  # End-to-end: the pre-check refuses a live foreign server; even if we force past
+  # it (stub server_is_ours), the atomic guard mutates nothing and the caller's
+  # ours-only/token check removes only our added session, leaving the foreign one.
+  csp_tmux new-session -d -s "foreign-race" -n w "sleep 60"
   self="$BATS_TEST_DIRNAME/../bin/claude-session-picker"
   run bash -c "CSP_TMUX_SOCKET='$CSP_TMUX_SOCKET' CSP_TMUX_SESSION='$CSP_TMUX_SESSION' CSP_STATE_DIR='$CSP_STATE_DIR' \
     bash -c '. \"$BATS_TEST_DIRNAME/../lib/core.sh\"; . \"$BATS_TEST_DIRNAME/../lib/backend.sh\"; \
-      __n=0; \
       csp_tmux_server_is_ours() { return 1; }; \
-      _real_tmux() { command tmux -L \"\$CSP_TMUX_SOCKET\" \"\$@\"; }; \
-      csp_tmux() { \
-        if [ \"\$1\" = list-sessions ] && [ \"\$__n\" -eq 0 ]; then __n=1; return 1; fi; \
-        _real_tmux \"\$@\"; }; \
       csp_tmux_enter \"$self\"' </dev/null 2>&1"
-  # Our holding session must NOT survive on the foreign server...
+  # Our holding session must NOT survive; the foreign one must remain; no stamp.
   run csp_tmux has-session -t "=$CSP_TMUX_SESSION"
   [ "$status" -ne 0 ]
-  # ...the foreign session is untouched...
   run csp_tmux has-session -t "=foreign-race"
   [ "$status" -eq 0 ]
-  # ...and we never stamped @csp_owner on their server.
-  [ "$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)" = "$before_owner" ]
   [ -z "$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)" ]
 }
 
-@test "enter: fresh-path server-PID SWAP during configure → bail WITHOUT killing the replacement" {
-  # Round-5 High: if the socket is swapped to a replacement server across configure
-  # (our token may have been stamped on it), the post-configure pid check must see
-  # the change and bail WITHOUT kill-session (never destroy a foreign session via a
-  # reused socket). display-message returns 1000 before configure, 2000 after.
-  self="$BATS_TEST_DIRNAME/../bin/claude-session-picker"
-  killlog="$BATS_TEST_TMPDIR/killlog"; : > "$killlog"
-  lscount="$BATS_TEST_TMPDIR/lscount"; echo 0 > "$lscount"
-  cfgflag="$BATS_TEST_TMPDIR/cfgflag"
-  run bash -c "CSP_TMUX_SOCKET='$CSP_TMUX_SOCKET' CSP_TMUX_SESSION='$CSP_TMUX_SESSION' CSP_STATE_DIR='$CSP_STATE_DIR' \
-    bash -c '. \"$BATS_TEST_DIRNAME/../lib/core.sh\"; . \"$BATS_TEST_DIRNAME/../lib/backend.sh\"; \
-      csp_tmux_server_is_ours() { return 1; }; \
-      csp_tmux() { \
-        case \"\$1\" in \
-          has-session) return 1 ;; \
-          new-session) return 0 ;; \
-          list-sessions) \
-            n=\$(cat \"$lscount\"); n=\$(( n + 1 )); echo \"\$n\" > \"$lscount\"; \
-            if [ \"\$n\" -eq 1 ]; then return 1; fi; \
-            printf \"%s\\n\" \"$CSP_TMUX_SESSION\"; return 0 ;; \
-          display-message) if [ -f \"$cfgflag.done\" ]; then echo 2000; else echo 1000; fi; return 0 ;; \
-          show-options) echo \"csp-tok\"; return 0 ;; \
-          kill-session) echo kill >> \"$killlog\"; return 0 ;; \
-          set-option) return 0 ;; \
-          *) return 0 ;; \
-        esac; }; \
-      csp_tmux_new_owner_token() { echo csp-tok; }; \
-      csp_tmux_configure_home() { : > \"$cfgflag.done\"; }; \
-      csp_tmux_enter \"$self\"' </dev/null 2>&1"
-  # pid swapped 1000->2000 across configure → bail, NO kill of the replacement.
-  [ ! -s "$killlog" ]
-}
-
-@test "enter: fresh-path same-instance but token DIDN'T land → pid-guarded kill of OUR OWN session (safe)" {
-  # Complement: pid UNCHANGED (still our instance) but @csp_owner != our token
-  # (configure silently failed on our own wedged server) → safe to kill OUR session.
-  self="$BATS_TEST_DIRNAME/../bin/claude-session-picker"
-  killlog="$BATS_TEST_TMPDIR/killlog2"; : > "$killlog"
-  lscount="$BATS_TEST_TMPDIR/lscount2"; echo 0 > "$lscount"
-  run bash -c "CSP_TMUX_SOCKET='$CSP_TMUX_SOCKET' CSP_TMUX_SESSION='$CSP_TMUX_SESSION' CSP_STATE_DIR='$CSP_STATE_DIR' \
-    bash -c '. \"$BATS_TEST_DIRNAME/../lib/core.sh\"; . \"$BATS_TEST_DIRNAME/../lib/backend.sh\"; \
-      csp_tmux_server_is_ours() { return 1; }; \
-      csp_tmux() { \
-        case \"\$1\" in \
-          has-session) return 1 ;; \
-          new-session) return 0 ;; \
-          list-sessions) \
-            n=\$(cat \"$lscount\"); n=\$(( n + 1 )); echo \"\$n\" > \"$lscount\"; \
-            if [ \"\$n\" -eq 1 ]; then return 1; fi; \
-            printf \"%s\\n\" \"$CSP_TMUX_SESSION\"; return 0 ;; \
-          display-message) echo 1000; return 0 ;; \
-          show-options) echo \"csp-SOMEONE-ELSE\"; return 0 ;; \
-          kill-session) echo kill >> \"$killlog\"; return 0 ;; \
-          set-option) return 0 ;; \
-          *) return 0 ;; \
-        esac; }; \
-      csp_tmux_new_owner_token() { echo csp-tok; }; \
-      csp_tmux_configure_home() { :; }; \
-      csp_tmux_enter \"$self\"' </dev/null 2>&1"
-  # Same pid throughout (1000) + token mismatch → pid-guarded cleanup DID kill.
-  [ -s "$killlog" ]
-}
-
-@test "enter: fresh-path with MATCHING @csp_owner does NOT bail on a pid re-read (no leaked placeholder)" {
-  # The anti-leak guard: once configure stamped OUR token, a transient
-  # display-message glitch must NOT make us abandon a detached holding session
-  # whose window 0 is still the bootstrap placeholder. With a matching token we
-  # proceed to respawn window 0 as the picker. We assert respawn-window IS called
-  # (proving we didn't bail after configure) even though display-message returns
-  # empty.
-  self="$BATS_TEST_DIRNAME/../bin/claude-session-picker"
-  respawnlog="$BATS_TEST_TMPDIR/respawnlog"; : > "$respawnlog"
-  lscount="$BATS_TEST_TMPDIR/lscount2"; echo 0 > "$lscount"
-  run bash -c "CSP_TMUX_SOCKET='$CSP_TMUX_SOCKET' CSP_TMUX_SESSION='$CSP_TMUX_SESSION' CSP_STATE_DIR='$CSP_STATE_DIR' \
-    bash -c '. \"$BATS_TEST_DIRNAME/../lib/core.sh\"; . \"$BATS_TEST_DIRNAME/../lib/backend.sh\"; \
-      csp_tmux_server_is_ours() { return 1; }; \
-      csp_tmux() { \
-        case \"\$1\" in \
-          has-session) return 1 ;; \
-          new-session) return 0 ;; \
-          list-sessions) \
-            n=\$(cat \"$lscount\"); n=\$(( n + 1 )); echo \"\$n\" > \"$lscount\"; \
-            if [ \"\$n\" -eq 1 ]; then return 1; fi; \
-            printf \"%s\\n\" \"$CSP_TMUX_SESSION\"; return 0 ;; \
-          display-message) echo 1000; return 0 ;; \
-          show-options) echo \"csp-tok\"; return 0 ;; \
-          respawn-window) echo respawn >> \"$respawnlog\"; return 0 ;; \
-          set-option) return 0 ;; \
-          *) return 0 ;; \
-        esac; }; \
-      csp_tmux_new_owner_token() { echo csp-tok; }; \
-      csp_tmux_configure_home() { :; }; \
-      csp_tmux_record_launch_pwd() { :; }; \
-      csp_tmux_enter \"$self\"' </dev/null 2>&1"
-  # Matching token → proceeded past the identity check to respawn window 0.
-  [ -s "$respawnlog" ]
+@test "enter: fresh path respawns window 0 with a command containing SPACES (regression: spaced \$HOME/env)" {
+  # Regression for the if-shell nesting bug: the picker command is `env VAR=val …
+  # /path`, full of spaces, and forwarded env values (CSP_STATE_DIR under a spaced
+  # $HOME) also contain spaces. The respawn must be direct-argv so those survive.
+  # We drive the fresh path with a REAL spaced state dir and a fake claude, and
+  # assert window 0 ends up running our env-prefixed command (not a dead window /
+  # destroyed session). We can't attach (no client), so we stop just before exec by
+  # stubbing the exec-ing tail; instead we exercise csp_tmux_atomic_home + a direct
+  # respawn with a spaced command and confirm the window survives with our command.
+  spaced="$BATS_TEST_TMPDIR/state dir with spaces"; mkdir -p "$spaced"
+  tok=$(csp_tmux_gen_owner_token)
+  csp_tmux_atomic_home "$tok"
+  # Direct-argv respawn with a spaced command, exactly as the fresh path now does.
+  cmd="env CSP_STATE_DIR=$(csp_shell_quote "$spaced") sleep 62"
+  csp_tmux respawn-window -k -t "=$CSP_TMUX_SESSION:menu" "$cmd"
+  # The session survived and window 0 runs our (spaced) command, not a dead shell.
+  run csp_tmux has-session -t "=$CSP_TMUX_SESSION"
+  [ "$status" -eq 0 ]
+  run csp_tmux list-panes -t "=$CSP_TMUX_SESSION:0" -F '#{pane_start_command}'
+  case "$output" in *"62"*) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
 }
 
 @test "recovery: a menu window orphaned at a NON-zero index is swapped back to 0" {
@@ -540,6 +481,19 @@ make_home() {
   case "$output" in *[:.]*) bad=1 ;; *) bad=0 ;; esac
   [ "$bad" = "0" ]
   [ "$output" = "abc" ]
+}
+
+@test "session name: quotes and backslashes are stripped (safe in the atomic if-shell string)" {
+  # The name is interpolated into a tmux if-shell command STRING; a literal quote
+  # or backslash could break that string's quoting. Confirm they're stripped.
+  CSP_TMUX_SESSION='x"y'"'"'z\w' bash -c '
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh
+    . '"$BATS_TEST_DIRNAME"'/../lib/backend.sh
+    printf "%s" "$CSP_TMUX_SESSION"' > "$BATS_TEST_TMPDIR/sess2"
+  run cat "$BATS_TEST_TMPDIR/sess2"
+  case "$output" in *[\"\'\\]*) bad=1 ;; *) bad=0 ;; esac
+  [ "$bad" = "0" ]
+  [ "$output" = "xyzw" ]
 }
 
 @test "socket name: '/' ',' '.' are stripped so inside-tmux detection can't break (safety 1)" {

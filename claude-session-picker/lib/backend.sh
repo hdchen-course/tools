@@ -30,8 +30,12 @@
 # session name containing those makes every `-t "=name:win"` target mis-parse
 # (has-session then always fails → we'd endlessly try to re-create it and hit
 # "duplicate session"). Stripping keeps targeting unambiguous; empty falls back.
+# We ALSO strip quotes, backslashes and control chars: the name is interpolated
+# into a tmux `if-shell` command STRING during atomic setup (csp_tmux_atomic_home),
+# where a `"`/`\`/newline could break that string's quoting. Defense-in-depth —
+# the outcome would be fail-closed anyway, but a clean name keeps it robust.
 CSP_TMUX_SESSION="${CSP_TMUX_SESSION:-claude-sessions}"
-CSP_TMUX_SESSION="$(printf '%s' "$CSP_TMUX_SESSION" | tr -d ':.')"
+CSP_TMUX_SESSION="$(printf '%s' "$CSP_TMUX_SESSION" | tr -d ':.'\''"\\[:cntrl:]')"
 [ -z "$CSP_TMUX_SESSION" ] && CSP_TMUX_SESSION="claude-sessions"
 
 # We run our tmux on a DEDICATED SOCKET (tmux -L "$CSP_TMUX_SOCKET"), completely
@@ -144,33 +148,45 @@ csp_tmux_owner_token() {
   printf '%s' "$v"
 }
 
-# csp_tmux_new_owner_token — generate a fresh random token and persist it as this
-# socket's owner token (called when we create a brand-new server). Prints the
-# token. Random bytes from /dev/urandom; a pid/RANDOM fallback keeps it working
-# on a machine without it (uniqueness, not cryptographic secrecy, is what we
-# need in the single-user local model).
-#
-# The write is HARDENED: dir 0700, file 0600, and atomic. The temp file is created
-# UNPREDICTABLY with mktemp INSIDE the 0700 dir (O_EXCL, so it can't follow a
-# pre-planted symlink — a predictable "$f.$$.tmp" opened via shell redirection
-# would). We then rename it into place, which REPLACES any pre-planted symlink at
-# the final path rather than following it. Best-effort — a failed persist just
-# means the next reader finds no token ("not ours" → hub).
-csp_tmux_new_owner_token() {
-  local tok f d tmp
+# csp_tmux_gen_owner_token — print a fresh random ownership token ("csp-<hex>")
+# WITHOUT touching disk. Random bytes from /dev/urandom; a pid/RANDOM fallback
+# keeps it working on a machine without it (uniqueness, not cryptographic secrecy,
+# is what the single-user local model needs). Kept to [A-Za-z0-9-] so the
+# read-back shape check accepts it.
+csp_tmux_gen_owner_token() {
+  local tok
   tok=$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')
   [ -n "$tok" ] || tok="$$${RANDOM:-0}${RANDOM:-0}$(date +%s 2>/dev/null || echo 0)"
-  # Keep the persisted token to [A-Za-z0-9-] so the read-back shape check accepts
-  # it (the fallback form above could contain other chars on an odd machine).
   tok=$(printf '%s' "$tok" | tr -cd 'A-Za-z0-9')
-  tok="csp-$tok"
+  printf 'csp-%s' "$tok"
+}
+
+# csp_tmux_persist_owner_token TOKEN — persist TOKEN as this socket's owner token.
+# HARDENED: dir 0700, file 0600, atomic. The temp is created UNPREDICTABLY with
+# mktemp INSIDE the 0700 dir (O_EXCL, so it can't follow a pre-planted symlink),
+# then renamed into place (REPLACES, never follows, a symlink at the final path).
+# Returns non-zero on write failure. Best-effort for the caller — a failed persist
+# just means the next reader finds no token ("not ours" → hub).
+csp_tmux_persist_owner_token() {
+  local tok="$1" f d tmp
   f=$(csp_tmux_owner_file); d=$(dirname "$f")
-  mkdir -p "$d" 2>/dev/null
+  mkdir -p "$d" 2>/dev/null || return 1
   chmod 700 "$d" 2>/dev/null || true
-  tmp=$(mktemp "$d/.owner.XXXXXX" 2>/dev/null) || { printf '%s' "$tok"; return 0; }
-  { printf '%s\n' "$tok" > "$tmp"; } 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null; printf '%s' "$tok"; return 0; }
+  tmp=$(mktemp "$d/.owner.XXXXXX" 2>/dev/null) || return 1
+  { printf '%s\n' "$tok" > "$tmp"; } 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null; return 1; }
   chmod 600 "$tmp" 2>/dev/null || true
-  mv -f -- "$tmp" "$f" 2>/dev/null || rm -f -- "$tmp" 2>/dev/null
+  mv -f -- "$tmp" "$f" 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
+# csp_tmux_new_owner_token — generate a fresh token AND persist it, printing it.
+# (Back-compat wrapper: gen + persist in one call. The fresh path uses gen and
+# persist separately so it can stamp the token into the atomic create invocation
+# before the owner-file path is resolvable.)
+csp_tmux_new_owner_token() {
+  local tok
+  tok=$(csp_tmux_gen_owner_token)
+  csp_tmux_persist_owner_token "$tok" 2>/dev/null || true
   printf '%s' "$tok"
 }
 
@@ -334,6 +350,59 @@ csp_tmux_configure_home() {
   csp_tmux set-option -g display-time 1500 2>/dev/null
 }
 
+# csp_tmux_atomic_home TOKEN CMD — create the holding server AND fully configure
+# AND respawn window 0 as the picker, in ONE tmux invocation (all commands run
+# against a SINGLE server connection). This is the structural fix for the
+# "configure-time socket swap mutates a replacement server" race: with separate
+# `tmux -L` invocations, a server killed between two set-options could be replaced
+# and the later options would hit the replacement. In one invocation there is no
+# such window — if our server dies mid-queue the connection drops and the rest of
+# the queue simply fails; nothing is redirected to another server.
+#
+# Sequence in the single queue:
+#   new-session -d (creates the server if the socket is free; on a live FOREIGN
+#     server with our exact session name it FAILS → whole invocation fails → bail;
+#     on a foreign server with OTHER names it JOINS, adding our session) →
+#   if-shell -F on server_sessions==1: this is the crux. It fires the ENTIRE
+#     configure block (stamp @csp_owner=TOKEN + @csp_boot + all global options)
+#     ONLY when ours is the sole session — i.e. a genuinely fresh server WE just
+#     created. If new-session JOINED a foreign server (≥2 sessions), the count is
+#     >1 and NONE of the mutations run: we never touch a foreign server's options
+#     or stamp our token on it. All server-side, in one connection, so no swap can
+#     slip between the count check and the mutations.
+# NOTE: the picker command ($cmd) is deliberately NOT part of this invocation. It
+# contains spaces and shell-quoting, and embedding it in the if-shell STRING would
+# subject it to a second tmux word-split that mangles any spaced path/env value
+# (breaking every fresh launch on a machine whose $HOME has a space). The caller
+# does the respawn separately as a DIRECT-ARGV `respawn-window` (no re-parse), after
+# re-verifying our token — see csp_tmux_enter. Only the token/config/count logic,
+# none of which needs $cmd, lives in the atomic block.
+# Returns tmux's exit status. Best-effort options (2>/dev/null on the whole call).
+csp_tmux_atomic_home() {
+  local tok="$1" boot='sh -c "while :; do sleep 2147483647; done"' cfg
+  # The configure block, run only when server_sessions==1. Semicolon-separated
+  # tmux commands inside a single if-shell command string. No $cmd interpolation.
+  cfg="set-option -g @csp_owner \"$tok\""
+  cfg="$cfg ; set-option -w -t \"=$CSP_TMUX_SESSION:menu\" @csp_boot 1"
+  cfg="$cfg ; set-option -g base-index 0"
+  cfg="$cfg ; set-option -g renumber-windows on"
+  cfg="$cfg ; set-option -g mouse on"
+  cfg="$cfg ; set-option -g status on"
+  cfg="$cfg ; set-option -g status-interval 2"
+  cfg="$cfg ; set-option -g status-justify left"
+  cfg="$cfg ; set-option -g status-left \"\""
+  cfg="$cfg ; set-option -g status-left-length 0"
+  cfg="$cfg ; set-option -g window-status-format \" #I #{=9:window_name} \""
+  cfg="$cfg ; set-option -g window-status-current-format \"#[reverse,bold] #I #{=9:window_name} #[default]\""
+  cfg="$cfg ; set-option -g status-right \" Ctrl-b 0=menu n/p=switch w=list d=detach \""
+  cfg="$cfg ; set-option -g status-right-length 44"
+  cfg="$cfg ; set-option -g display-time 1500"
+  csp_tmux \
+    new-session -d -s "$CSP_TMUX_SESSION" -n menu "$boot" \; \
+    if-shell -F '#{==:#{server_sessions},1}' "$cfg" \
+    2>/dev/null
+}
+
 # csp_tmux_enter_cleanup EXPECTED_PID — remove OUR holding session from the fresh
 # path, but ONLY if the server on this socket is still the same instance we created
 # (its pid equals EXPECTED_PID). On a reusable socket path a replacement server may
@@ -472,84 +541,52 @@ csp_tmux_enter() {
   # configure_home stamps that token as @csp_owner. Keying per-path means a
   # concurrent instance on a same-named socket at a DIFFERENT path writes a
   # DIFFERENT owner file and can't clobber this server's token.
-  local tok sessions srv_pid srv_pid2
-  csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu \
-    'sh -c "while :; do sleep 2147483647; done"' 2>/dev/null || return 1
-  # Tag the bootstrap window as a placeholder (@csp_boot=1). Window 0 is named
-  # "menu" from the moment it's created, but until we respawn it with the real
-  # picker it's just a sleeping shell. If a later launch finds a window 0 that is
-  # named "menu" YET still carries @csp_boot=1 (e.g. a holding session this fresh
-  # path leaked by bailing after create), the reuse path must respawn it into the
-  # picker rather than attach you to the hung sleeper. We clear the tag right after
-  # the real respawn below.
-  csp_tmux set-option -w -t "=$CSP_TMUX_SESSION:menu" '@csp_boot' 1 2>/dev/null
-  # CLOSE the check→create TOCTOU: new-session creates the SERVER when none exists,
-  # but if a foreign server won this socket between the list-sessions check above
-  # and this new-session, new-session would instead add OUR session to THEIR
-  # server. Before minting the token or running configure_home — the steps that
-  # stamp GLOBAL options / @csp_owner — demand POSITIVE proof this is a freshly
-  # created server that is ours alone: list-sessions must SUCCEED and its output
-  # must be EXACTLY one line equal to our session name. A failed/empty query (a
-  # transient tmux error) is NOT proof of a clean server, so we must NOT proceed
-  # on it — we remove only our own session (leaving any foreign one untouched; we
-  # have NOT mutated a global option yet) and fall back to hub.
-  # Capture the server pid as the VERY FIRST thing after create, so every later
-  # step (and every cleanup) can bind to THIS instance. On a reusable socket path a
-  # replacement server can appear underneath us; we must never trust or kill a
-  # server whose pid differs from this one. Without a numeric pid we can't bind
-  # identity → bail (pid-guarded cleanup is a no-op when pid is unknown, so nothing
-  # foreign is touched).
+  local tok sessions srv_pid
+  # Mint the token VALUE up front (random string; not yet persisted — the owner
+  # file is keyed on the resolved socket path, which only exists once the server
+  # is live, so we persist it after create). csp_tmux_gen_owner_token just returns
+  # a fresh "csp-<hex>" value without touching disk.
+  tok=$(csp_tmux_gen_owner_token)
+  [ -n "$tok" ] || return 1
+  # ATOMIC create + configure: one tmux invocation, so `new-session` and every
+  # global option (incl. @csp_owner=tok, @csp_boot) run against a SINGLE server
+  # connection, gated on server_sessions==1. A socket swap can't slip between two
+  # of our set-options; if new-session joined a foreign server nothing is stamped.
+  # The picker command is NOT part of this invocation (it has spaces/quoting that a
+  # second tmux word-split would mangle) — we respawn window 0 separately below via
+  # direct argv.
+  csp_tmux_atomic_home "$tok" || return 1
+  # Bind to THIS instance's pid for all later cleanup.
   srv_pid=$(csp_tmux display-message -p '#{pid}' 2>/dev/null)
   case "$srv_pid" in ''|*[!0-9]*) csp_tmux_enter_cleanup "$srv_pid"; return 1 ;; esac
-  # Demand POSITIVE proof this is a freshly created, ours-only server: list-sessions
-  # must SUCCEED and be EXACTLY our one session. A failed/empty query is not proof.
-  # ALL cleanup below is pid-guarded (csp_tmux_enter_cleanup only kills if the live
-  # pid still equals srv_pid) so we can never kill a session on a swapped-in server.
+  # POSITIVE proof this is a freshly created, ours-only server carrying OUR token:
+  #   • our @csp_owner must equal tok (new-session didn't join a foreign server, or
+  #     if it did, that server can't already carry our just-minted unguessable tok
+  #     — so a mismatch means "not our clean server" → bail); AND
+  #   • list-sessions must SUCCEED and be EXACTLY our one session (no foreign
+  #     sessions rode along). Either failing → pid-guarded cleanup + hub.
+  if [ "$(csp_tmux show-options -gv @csp_owner 2>/dev/null)" != "$tok" ]; then
+    csp_tmux_enter_cleanup "$srv_pid"; return 1
+  fi
   if sessions=$(csp_tmux list-sessions -F '#{session_name}' 2>/dev/null); then
-    :
+    [ "$sessions" = "$CSP_TMUX_SESSION" ] || { csp_tmux_enter_cleanup "$srv_pid"; return 1; }
   else
     csp_tmux_enter_cleanup "$srv_pid"; return 1
   fi
-  if [ "$sessions" != "$CSP_TMUX_SESSION" ]; then
+  # Persist the token to the owner file (path now resolvable) BEFORE launching the
+  # picker child, so the child's csp_inside_tmux — and the hook — see it's ours from
+  # the first moment. If this write fails the server still runs but won't be
+  # recognised (fail-closed to hub), which is acceptable.
+  csp_tmux_persist_owner_token "$tok"
+  # Respawn window 0 into the real picker via DIRECT ARGV (no string re-parse, so a
+  # spaced path/env value in $cmd is preserved), then clear the bootstrap tag. We
+  # re-verify our token first: only respawn a server we still own (never drive a
+  # replacement). A respawn failure → pid-guarded cleanup.
+  if [ "$(csp_tmux show-options -gv @csp_owner 2>/dev/null)" != "$tok" ]; then
     csp_tmux_enter_cleanup "$srv_pid"; return 1
   fi
-  tok=$(csp_tmux_new_owner_token)
-  [ -n "$tok" ] || { csp_tmux_enter_cleanup "$srv_pid"; return 1; }
-  # Re-verify the instance is STILL ours-only and unchanged IMMEDIATELY before the
-  # first global mutation, to shrink the check→configure window to near-zero. (The
-  # -L CLI can't hold one connection across ops, so a sub-op swap can't be made
-  # strictly impossible; this makes it vanishingly unlikely and, with the checks
-  # below, ensures we NEVER trust or clean up a swapped instance.)
-  srv_pid2=$(csp_tmux display-message -p '#{pid}' 2>/dev/null)
-  sessions=$(csp_tmux list-sessions -F '#{session_name}' 2>/dev/null)
-  if [ "$srv_pid" != "$srv_pid2" ] || [ "$sessions" != "$CSP_TMUX_SESSION" ]; then
-    csp_tmux_enter_cleanup "$srv_pid"              # only kills if still our instance
-    return 1
-  fi
-  csp_tmux_configure_home
-  # After configure, require BOTH proofs to proceed: the OWNER TOKEN landed AND the
-  # server pid is UNCHANGED.
-  #   • token == ours AND pid unchanged → definitively our instance → proceed.
-  #   • pid CHANGED → the socket was swapped across configure; configure may have
-  #     stamped our token onto a replacement. We must NOT drive it (respawn/attach)
-  #     and must NOT kill it (foreign) → bail, leaving it untouched. A leaked
-  #     detached holding session of OUR OWN can't mislead the next launch: the
-  #     reuse path re-verifies/respawns window 0 as the picker rather than trusting
-  #     its name (see the has-session branch), so a stale placeholder is replaced.
-  #   • token missing → configure didn't take on our instance → pid-guarded cleanup.
-  srv_pid2=$(csp_tmux display-message -p '#{pid}' 2>/dev/null)
-  if [ "$srv_pid" != "$srv_pid2" ]; then
-    return 1                                       # swapped mid-configure → don't touch
-  fi
-  if [ "$(csp_tmux show-options -gv @csp_owner 2>/dev/null)" != "$tok" ]; then
-    csp_tmux_enter_cleanup "$srv_pid"             # same instance, config failed → safe
-    return 1
-  fi
-  # Now replace the placeholder with the real picker in the same window 0, then
-  # clear the bootstrap tag — from here window 0 IS the picker.
   csp_tmux respawn-window -k -t "=$CSP_TMUX_SESSION:menu" "$cmd" 2>/dev/null || {
-    csp_tmux_enter_cleanup "$srv_pid"             # only if still our instance
-    return 1
+    csp_tmux_enter_cleanup "$srv_pid"; return 1
   }
   csp_tmux set-option -wu -t "=$CSP_TMUX_SESSION:menu" '@csp_boot' 2>/dev/null
   csp_tmux_record_launch_pwd    # seed the launch dir for `n` (see helper)
