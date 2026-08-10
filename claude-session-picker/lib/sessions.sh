@@ -105,32 +105,39 @@ csp_clear_state() {
 # session sits idle at a prompt. So the hook records, in OUR OWN state dir, that
 # this session is resident in a given ambient pane; the delete guard later blocks
 # while that pane is still alive (a read-only probe) and self-clears the record
-# once the pane is gone. The record is (socket_path, pane_id), both taken from the
-# hook's own $TMUX / $TMUX_PANE — we never touch the ambient server to learn them.
-# Files live in a `resident/` subdir so they can't collide with a session's state
-# file (which is named by the bare id).
+# only when it can POSITIVELY prove the pane/server is gone.
+#
+# The record is THREE lines: (socket_path, server_pid, pane_id), all taken from
+# the hook's own $TMUX / $TMUX_PANE — we never touch the ambient server to learn
+# them. The server_pid is essential: a Unix socket path can be reused by a NEW
+# tmux server after the old one dies (or even while it lives, if the socket file
+# is replaced), so a socket-path-only probe could read a DIFFERENT instance's
+# panes and wrongly clear a live record. Binding to the recorded server pid lets
+# us tell "same instance, pane really gone" (safe to clear) from "different
+# instance / can't reach it" (must stay live). Files live in a `resident/` subdir
+# so they can't collide with a session's state file (named by the bare id).
 csp_resident_file() {
   local id="$1" safe
   safe=$(printf '%s' "$id" | tr -c 'A-Za-z0-9._-' '_')
   printf '%s/resident/%s' "$CSP_STATE_DIR" "$safe"
 }
 
-# csp_record_residency ID SOCKET_PATH [PANE_ID] — record the residency
-# (best-effort, atomic temp+rename; the rename replaces any pre-planted symlink at
-# the path rather than following it, so it's symlink-safe). Never fails a caller.
-# SOCKET_PATH is required; PANE_ID is optional — if the hook's environment has
-# $TMUX set but no $TMUX_PANE (rare, but a process that scrubs TMUX_PANE while
-# keeping TMUX), we still record the socket alone so the delete guard can fall
-# back to "is that server still alive?" rather than losing all protection. The
-# second line is the pane id or empty.
+# csp_record_residency ID SOCKET_PATH [SERVER_PID] [PANE_ID] — record the
+# residency (best-effort). The write is atomic and symlink-safe: an unpredictable
+# temp is created with mktemp INSIDE the 0700 dir (O_EXCL, so it can't follow a
+# pre-planted symlink) and renamed into place. SOCKET_PATH is required; SERVER_PID
+# and PANE_ID are optional (empty lines if absent) so we still record something
+# useful when the hook's env lacks them. Never fails a caller.
 csp_record_residency() {
-  local id="$1" sock="$2" pane="${3:-}" f d tmp
+  local id="$1" sock="$2" spid="${3:-}" pane="${4:-}" f d tmp
   [ -n "$sock" ] || return 0
+  case "$spid" in *[!0-9]*) spid="" ;; esac      # pid must be all digits or empty
   f=$(csp_resident_file "$id"); d=$(dirname "$f")
   mkdir -p "$d" 2>/dev/null || return 0
   chmod 700 "$d" 2>/dev/null || true
-  tmp="$f.$$.tmp"
-  { printf '%s\n%s\n' "$sock" "$pane" > "$tmp"; } 2>/dev/null || return 0
+  tmp=$(mktemp "$d/.res.XXXXXX" 2>/dev/null) || return 0
+  { printf '%s\n%s\n%s\n' "$sock" "$spid" "$pane" > "$tmp"; } 2>/dev/null \
+    || { rm -f -- "$tmp" 2>/dev/null; return 0; }
   chmod 600 "$tmp" 2>/dev/null || true
   mv -f -- "$tmp" "$f" 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null; return 0; }
 }
@@ -142,52 +149,89 @@ csp_clear_residency() {
   rm -f -- "$f" 2>/dev/null || true
 }
 
-# csp_read_residency ID — print "SOCKET_PATH<TAB>PANE_ID" for a recorded
-# residency (PANE_ID may be empty → trailing tab then nothing), or nothing at all
-# if there's no usable record. Refuses to follow a symlink at the path (a planted
-# link could otherwise redirect the read). Bounded: only the first two lines.
+# csp_read_residency ID — print "SOCKET_PATH<TAB>SERVER_PID<TAB>PANE_ID" for a
+# recorded residency (PID/PANE may be empty), or nothing if there's no usable
+# record. Refuses to follow a symlink at the path (a planted link could otherwise
+# redirect the read). Bounded: only the first three lines.
 csp_read_residency() {
-  local f sock="" pane=""
+  local f sock="" spid="" pane=""
   f=$(csp_resident_file "$1")
   [ -f "$f" ] || return 0
   [ -L "$f" ] && return 0            # never follow a symlink here
-  { IFS= read -r sock; IFS= read -r pane; } < "$f" 2>/dev/null
-  [ -n "$sock" ] || return 0         # socket is mandatory; pane may be empty
-  printf '%s\t%s' "$sock" "$pane"
+  { IFS= read -r sock; IFS= read -r spid; IFS= read -r pane; } < "$f" 2>/dev/null
+  [ -n "$sock" ] || return 0         # socket is mandatory; pid/pane may be empty
+  # Backward-compat with the earlier 2-line (socket, pane) record: if the 2nd line
+  # isn't a numeric pid, treat it as the pane (moving it there only if we didn't
+  # also read a 3rd line), so a legacy record still probes the right pane rather
+  # than over-blocking. A well-formed 3-line record has an all-digits pid here.
+  case "$spid" in
+    *[!0-9]*) [ -z "$pane" ] && pane="$spid"; spid="" ;;   # non-numeric → not a pid
+  esac
+  printf '%s\t%s\t%s' "$sock" "$spid" "$pane"
 }
 
-# csp_residency_is_live ID — return 0 if this session has a residency record AND
-# its recorded pane is still open. This is a READ-ONLY probe: we query the ambient
-# server by its socket path with `tmux -S`, listing pane ids — we never set an
-# option or otherwise mutate it, so the "we never touch your tmux" promise holds
-# even though the server isn't ours. Self-cleaning: when we can positively see the
-# pane is gone (server responds, pane absent) or the server itself is gone (socket
-# unreachable), we delete the stale record and return non-zero so the transcript
-# becomes deletable again. If we CANNOT probe at all (no tmux binary), we fail
-# CLOSED — treat it as live and keep the record — because "can't tell" must not
-# green-light a delete.
+# csp_residency_is_live ID — return 0 if this session's recorded residency is
+# still live. FAIL CLOSED: we clear the record and return "dead" ONLY on POSITIVE
+# proof the session is gone; every uncertain/transient case keeps the record and
+# reports live, because deleting a live transcript is unrecoverable.
+#
+# READ-ONLY: we query the ambient server by its socket path with `tmux -S`,
+# listing "<server_pid> <pane_id>" per pane — never setting an option, so the
+# "we never touch your tmux" promise holds even for a server we don't own. We run
+# ONE query and branch on its exit status (no double-probe race):
+#   • query FAILS (nonzero): NOT proof of death — could be a transient tmux error.
+#     We only conclude "dead" if we recorded the server pid AND that exact process
+#     is gone (kill -0 fails). Otherwise stay live (fail closed).
+#   • query SUCCEEDS but the live server's pid DIFFERS from the one we recorded:
+#     the socket was reused by a NEW instance. Our session belonged to the OLD
+#     instance; if that pid is still alive we stay live (we just can't see its
+#     panes through this reused socket), else the old instance is gone → clear.
+#   • query SUCCEEDS, same instance: if we recorded a pane, clear only when that
+#     pane is positively absent; with no recorded pane, a live same-instance
+#     server counts as live.
+# If there's no tmux binary at all we cannot probe → fail closed (live).
 csp_residency_is_live() {
-  local id="$1" rec sock pane
+  local id="$1" rec sock spid pane out st cur_pid
   rec=$(csp_read_residency "$id")
   [ -n "$rec" ] || return 1
   sock=${rec%%$'\t'*}
+  rec=${rec#*$'\t'}
+  spid=${rec%%$'\t'*}
   pane=${rec#*$'\t'}
   command -v tmux >/dev/null 2>&1 || return 0     # can't probe → fail closed (live)
-  if ! command tmux -S "$sock" list-panes -a -F '#{pane_id}' >/dev/null 2>&1; then
-    # The server at that socket path is not reachable → it (and the session in it)
-    # is gone. Positive dead signal: clear the record and allow deletion.
-    csp_clear_residency "$id"
+
+  out=$(command tmux -S "$sock" list-panes -a -F '#{pid} #{pane_id}' 2>/dev/null)
+  st=$?
+  if [ "$st" -ne 0 ]; then
+    # Could not reach a server at this socket. NOT proof of death (transient tmux
+    # failure, EINTR, busy). Only positively dead if we know the server pid AND it
+    # is gone. Without a recorded pid we cannot prove death → stay live.
+    if [ -n "$spid" ] && ! kill -0 "$spid" 2>/dev/null; then
+      csp_clear_residency "$id"
+      return 1
+    fi
+    return 0
+  fi
+
+  # Server reachable. Confirm it's the SAME instance we recorded (socket reuse).
+  cur_pid=$(printf '%s\n' "$out" | sed -n '1s/ .*//p')
+  if [ -n "$spid" ] && [ -n "$cur_pid" ] && [ "$cur_pid" != "$spid" ]; then
+    # A DIFFERENT server now holds this socket path. Our recorded instance isn't
+    # this one; if it's still alive elsewhere, the session may still be running in
+    # it (we just can't enumerate its panes via the reused socket) → stay live.
+    if kill -0 "$spid" 2>/dev/null; then
+      return 0
+    fi
+    csp_clear_residency "$id"                      # old instance gone → allow
     return 1
   fi
-  # Server is reachable. If we have no recorded pane id (the hook's env had $TMUX
-  # but no $TMUX_PANE), we can't check a specific pane — but the server the session
-  # was living in is still up, so treat it as live rather than reopen the gap.
-  [ -n "$pane" ] || return 0
-  if command tmux -S "$sock" list-panes -a -F '#{pane_id}' 2>/dev/null \
-       | grep -qxF -- "$pane"; then
+
+  # Same instance (or no recorded pid to compare against — legacy record).
+  [ -n "$pane" ] || return 0                       # no pane recorded, server up → live
+  if printf '%s\n' "$out" | awk '{print $2}' | grep -qxF -- "$pane"; then
     return 0                                       # pane still open → live → block
   fi
-  csp_clear_residency "$id"                        # server up, pane closed → gone
+  csp_clear_residency "$id"                        # same instance, pane gone → ended
   return 1
 }
 

@@ -195,7 +195,11 @@ say "        \"command\": \"$(csp_hook_command working)\" } ] } ],"
 say '    "Stop": [ { "hooks": [ { "type": "command",'
 say "        \"command\": \"$(csp_hook_command waiting)\" } ] } ],"
 say '    "Notification": [ { "hooks": [ { "type": "command",'
-say "        \"command\": \"$(csp_hook_command waiting)\" } ] } ]"
+say "        \"command\": \"$(csp_hook_command waiting)\" } ] } ],"
+say '    "SessionEnd": [ { "hooks": [ { "type": "command",'
+say "        \"command\": \"$(csp_hook_command ended)\" } ] } ]"
 say '  }'
 say ""
 say "These only write a tiny local state file; nothing is sent anywhere."
+say "SessionEnd lets a session in a tmux the picker doesn't own be deleted once"
+say "you exit Claude (it clears that session's live-residency marker)."

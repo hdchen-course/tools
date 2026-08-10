@@ -272,16 +272,23 @@ Opening a session clears its `✳` (you've now looked at it).
 
 **Without any setup**, `●` simply means "a Claude process is running this
 session" and there's no `✳` — it still works, just with less detail. To get the
-full ●/✳ distinction, register two tiny **hooks** in your Claude Code
+full ●/✳ distinction, register these tiny **hooks** in your Claude Code
 `settings.json` (the installer prints the exact snippet with your paths):
 
 ```json
 "hooks": {
   "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": ".../hooks/csp-hook.sh working" } ] } ],
   "Stop":             [ { "hooks": [ { "type": "command", "command": ".../hooks/csp-hook.sh waiting" } ] } ],
-  "Notification":     [ { "hooks": [ { "type": "command", "command": ".../hooks/csp-hook.sh waiting" } ] } ]
+  "Notification":     [ { "hooks": [ { "type": "command", "command": ".../hooks/csp-hook.sh waiting" } ] } ],
+  "SessionEnd":       [ { "hooks": [ { "type": "command", "command": ".../hooks/csp-hook.sh ended" } ] } ]
 }
 ```
+
+The `SessionEnd` line is what lets a session running in a tmux the picker doesn't
+own (a leftover older-version server, or your own tmux) be deleted once you exit
+Claude: while such a session is live it's protected by a *residency* record, and
+`ended` tears that record down when Claude exits so a finished session doesn't
+stay un-deletable until you close the whole pane. It's optional but recommended.
 
 The hooks write a tiny local state file per session — **nothing is sent
 anywhere**. And because hooks don't always fire (a crashed or killed Claude

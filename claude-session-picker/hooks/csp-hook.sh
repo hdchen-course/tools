@@ -43,7 +43,10 @@ CSP_ROOT="$(cd "$(dirname "$csp_self")/.." && pwd)"
 . "$CSP_ROOT/lib/backend.sh" 2>/dev/null || true
 
 state="${1:-}"
-case "$state" in working|waiting) ;; *) exit 0 ;; esac   # only valid states
+# Valid states: working / waiting drive the ●/✳ marker; "ended" is wired to
+# Claude's SessionEnd hook and just tears down our per-session records (so a
+# residency marker can't outlive the Claude that created it — see below).
+case "$state" in working|waiting|ended) ;; *) exit 0 ;; esac
 
 # Read the hook payload from stdin and pull out the session id. Claude Code
 # sends JSON like {"session_id":"...","..."}. We reuse the same jq→python3→grep
@@ -84,6 +87,17 @@ case "$id" in
   ''|*[!A-Za-z0-9_-]*) exit 0 ;;
 esac
 
+# SessionEnd: Claude for this id has exited. Clear its state and its residency
+# record — residency tracks a PANE, but a pane in a foreign shell outlives the
+# Claude that ran in it (you drop back to the shell), so without this an ended
+# session's transcript would stay un-deletable until the whole pane/server closed.
+# SessionEnd fires in the same environment the session ran in, so the id matches.
+if [ "$state" = "ended" ]; then
+  csp_clear_state "$id"
+  command -v csp_clear_residency >/dev/null 2>&1 && csp_clear_residency "$id"
+  exit 0
+fi
+
 csp_write_state "$id" "$state"
 
 # If this Claude is running inside the PICKER'S OWN tmux (its dedicated socket),
@@ -113,13 +127,25 @@ csp_write_state "$id" "$state"
 #       after the mtime window elapsed.
 #   (c) not in tmux at all → nothing to do.
 if command -v tmux >/dev/null 2>&1 && command -v csp_inside_tmux >/dev/null 2>&1; then
+  # $TMUX is "<socket_path>,<server_pid>,<session_id>". Split off the socket path
+  # (before the 1st comma) and the server pid (between the 1st and 2nd commas).
+  # $TMUX_PANE is this pane's stable id (e.g. %3). All read-only from our own env.
+  csp_tmux_sock="${TMUX%%,*}"
+  csp_tmux_rest="${TMUX#*,}"; csp_tmux_spid="${csp_tmux_rest%%,*}"
+  case "$csp_tmux_spid" in *[!0-9]*) csp_tmux_spid="" ;; esac
   if csp_inside_tmux; then
-    tmux set-option -w '@csp_sid' "$id" >/dev/null 2>&1 || true
-    command -v csp_clear_residency >/dev/null 2>&1 && csp_clear_residency "$id"
+    # Our OWN server: tag the window. Clear the residency fallback ONLY if the tag
+    # actually succeeded — otherwise a bare session would be left with no tag AND
+    # no residency (deletable once idle). On tag failure, fall back to residency.
+    if tmux set-option -w '@csp_sid' "$id" >/dev/null 2>&1; then
+      command -v csp_clear_residency >/dev/null 2>&1 && csp_clear_residency "$id"
+    elif [ -n "${TMUX:-}" ] && command -v csp_record_residency >/dev/null 2>&1; then
+      csp_record_residency "$id" "$csp_tmux_sock" "$csp_tmux_spid" "${TMUX_PANE:-}"
+    fi
   elif [ -n "${TMUX:-}" ] && command -v csp_record_residency >/dev/null 2>&1; then
-    # $TMUX is "<socket_path>,<server_pid>,<session_id>"; the socket path is the
-    # part before the first comma. $TMUX_PANE is this pane's stable id (e.g. %3).
-    csp_record_residency "$id" "${TMUX%%,*}" "${TMUX_PANE:-}"
+    # A tmux we do NOT own: record residency so the delete guard protects this
+    # live session without our touching the foreign server.
+    csp_record_residency "$id" "$csp_tmux_sock" "$csp_tmux_spid" "${TMUX_PANE:-}"
   fi
 fi
 exit 0

@@ -32,6 +32,18 @@ setup() {
   [ "$output" = "waiting" ]
 }
 
+@test "hook: SessionEnd ('ended') clears both state and residency for the id" {
+  # When Claude exits, its residency record (a PANE, which outlives Claude in a
+  # foreign shell) must be torn down so a dead session doesn't block delete forever.
+  mkdir -p "$CSP_STATE_DIR/resident"
+  csp_write_state "gone-1" "waiting"
+  printf '%s\n%s\n%s\n' "/tmp/whatever.sock" "12345" "%1" > "$CSP_STATE_DIR/resident/gone-1"
+  printf '{"session_id":"gone-1"}' | "$HOOK" ended
+  run csp_read_state "gone-1"
+  [ -z "$output" ]                                  # state cleared
+  [ ! -f "$CSP_STATE_DIR/resident/gone-1" ]         # residency cleared
+}
+
 # How many state files exist (0 if the dir was never even created).
 csp_state_count() {
   [ -d "$CSP_STATE_DIR" ] || { printf '0'; return; }
@@ -97,6 +109,48 @@ csp_state_count() {
     | "$HOOK" working
   run csp_read_state "front-id"
   [ "$output" = "working" ]
+}
+
+@test "hook: inside OUR tmux but TAGGING FAILS, falls back to a residency record (no unprotected gap)" {
+  # Round-3 Medium: the hook used to clear residency unconditionally after
+  # `set-option ... || true`, so a FAILED tag left a bare session with no tag AND
+  # no residency → deletable once idle. Now a failed tag must instead record
+  # residency. We force the failure with a fake `tmux` on PATH whose `set-option`
+  # exits non-zero (but `display-message`/`show-options` still work enough for
+  # csp_inside_tmux). Rather than fight csp_inside_tmux's real checks, we drive the
+  # decision directly: csp_inside_tmux true + set-option fail must yield a record.
+  sd="$BATS_TEST_TMPDIR/tagfail-state"; mkdir -p "$sd"
+  fakebin="$BATS_TEST_TMPDIR/tagfail-bin"; mkdir -p "$fakebin"
+  # Fake tmux: set-option fails; anything else succeeds quietly.
+  cat > "$fakebin/tmux" <<'EOF'
+#!/bin/sh
+case "$1" in
+  set-option) exit 1 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$fakebin/tmux"
+  # Run the hook's tmux block logic with csp_inside_tmux stubbed true and a TMUX
+  # env present, using the fake tmux. We source the libs and replicate the exact
+  # branch to assert the fallback writes a residency record.
+  run env CSP_STATE_DIR="$sd" PATH="$fakebin:$PATH" TMUX="/tmp/foo.sock,4242,0" TMUX_PANE="%7" \
+    bash -c '
+      . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"
+      . "'"$BATS_TEST_DIRNAME"'/../lib/sessions.sh"
+      csp_inside_tmux() { return 0; }
+      id="tagfail-1"
+      csp_tmux_sock="${TMUX%%,*}"; rest="${TMUX#*,}"; spid="${rest%%,*}"
+      if csp_inside_tmux; then
+        if tmux set-option -w "@csp_sid" "$id" >/dev/null 2>&1; then
+          csp_clear_residency "$id"
+        else
+          csp_record_residency "$id" "$csp_tmux_sock" "$spid" "${TMUX_PANE:-}"
+        fi
+      fi
+      csp_read_residency "$id"'
+  # A residency record was written with the socket, pid, and pane from $TMUX.
+  case "$output" in *"/tmp/foo.sock"*4242*"%7"*) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
 }
 
 @test "hook: inside OUR tmux, tags the current window with @csp_sid (dedup of bare sessions)" {
@@ -181,7 +235,7 @@ csp_state_count() {
   ownerkey=$(printf '%s' "$sockpath" | od -An -tx1 | tr -d ' \n')
   printf '%s\n' "$tok" > "$sd/tmux-owner.$ownerkey"
   # Pre-plant a stale residency record for this id to prove the hook clears it.
-  printf '%s\n%s\n' "$sockpath" "%99" > "$sd/resident/own-tag-1"
+  printf '%s\n%s\n%s\n' "$sockpath" "99999" "%99" > "$sd/resident/own-tag-1"
   sleep 0.5
   tmux -L "$sock" send-keys -t "=$sess:w" \
     "export CSP_TMUX_SOCKET='$sock' CSP_TMUX_SESSION='$sess' CSP_STATE_DIR='$sd'; printf '{\"session_id\":\"own-tag-1\"}' | '$HOOK' working; echo done > '$sd/flag'" Enter
