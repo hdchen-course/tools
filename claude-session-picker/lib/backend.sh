@@ -419,6 +419,15 @@ csp_tmux_enter() {
       csp_tmux list-windows -t "=$CSP_TMUX_SESSION" -F '#{window_index}:#{window_name}' 2>/dev/null \
         | grep -qx '0:menu' || return 1
     fi
+    # Window 0 is named "menu", but a fresh-path launch that bailed after creating
+    # the bootstrap placeholder could have left a SLEEPING shell there (still
+    # tagged @csp_boot=1) rather than the running picker. Don't trust the name:
+    # if window 0 still carries the bootstrap tag, respawn it into the real picker
+    # so we never attach the user to a hung sleeper. Clear the tag on success.
+    if [ "$(csp_tmux show-options -wv -t "=$CSP_TMUX_SESSION:0" @csp_boot 2>/dev/null)" = "1" ]; then
+      csp_tmux respawn-window -k -t "=$CSP_TMUX_SESSION:0" "$cmd" 2>/dev/null || return 1
+      csp_tmux set-option -wu -t "=$CSP_TMUX_SESSION:0" '@csp_boot' 2>/dev/null
+    fi
     csp_tmux_record_launch_pwd    # so `n` follows where this client re-attached
     # exec the REAL tmux (a bare `exec csp_tmux` fails — exec can't run a shell
     # function). If exec somehow can't replace us, return non-zero so the caller
@@ -466,6 +475,14 @@ csp_tmux_enter() {
   local tok sessions srv_pid srv_pid2
   csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu \
     'sh -c "while :; do sleep 2147483647; done"' 2>/dev/null || return 1
+  # Tag the bootstrap window as a placeholder (@csp_boot=1). Window 0 is named
+  # "menu" from the moment it's created, but until we respawn it with the real
+  # picker it's just a sleeping shell. If a later launch finds a window 0 that is
+  # named "menu" YET still carries @csp_boot=1 (e.g. a holding session this fresh
+  # path leaked by bailing after create), the reuse path must respawn it into the
+  # picker rather than attach you to the hung sleeper. We clear the tag right after
+  # the real respawn below.
+  csp_tmux set-option -w -t "=$CSP_TMUX_SESSION:menu" '@csp_boot' 1 2>/dev/null
   # CLOSE the check→create TOCTOU: new-session creates the SERVER when none exists,
   # but if a foreign server won this socket between the list-sessions check above
   # and this new-session, new-session would instead add OUR session to THEIR
@@ -476,30 +493,33 @@ csp_tmux_enter() {
   # transient tmux error) is NOT proof of a clean server, so we must NOT proceed
   # on it — we remove only our own session (leaving any foreign one untouched; we
   # have NOT mutated a global option yet) and fall back to hub.
+  # Capture the server pid as the VERY FIRST thing after create, so every later
+  # step (and every cleanup) can bind to THIS instance. On a reusable socket path a
+  # replacement server can appear underneath us; we must never trust or kill a
+  # server whose pid differs from this one. Without a numeric pid we can't bind
+  # identity → bail (pid-guarded cleanup is a no-op when pid is unknown, so nothing
+  # foreign is touched).
+  srv_pid=$(csp_tmux display-message -p '#{pid}' 2>/dev/null)
+  case "$srv_pid" in ''|*[!0-9]*) csp_tmux_enter_cleanup "$srv_pid"; return 1 ;; esac
+  # Demand POSITIVE proof this is a freshly created, ours-only server: list-sessions
+  # must SUCCEED and be EXACTLY our one session. A failed/empty query is not proof.
+  # ALL cleanup below is pid-guarded (csp_tmux_enter_cleanup only kills if the live
+  # pid still equals srv_pid) so we can never kill a session on a swapped-in server.
   if sessions=$(csp_tmux list-sessions -F '#{session_name}' 2>/dev/null); then
     :
   else
-    # list-sessions FAILED — not proof of a clean, ours-only server. Bail.
-    csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null
-    return 1
+    csp_tmux_enter_cleanup "$srv_pid"; return 1
   fi
   if [ "$sessions" != "$CSP_TMUX_SESSION" ]; then
-    # Output isn't EXACTLY our one session → a foreign server, or extra sessions.
-    csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null
-    return 1
+    csp_tmux_enter_cleanup "$srv_pid"; return 1
   fi
-  # Remember the server pid so we can confirm every later step acts on the SAME
-  # instance (not one swapped in underneath us on this reusable socket path). We
-  # require a numeric pid up front — without it we can't bind identity, so bail.
-  srv_pid=$(csp_tmux display-message -p '#{pid}' 2>/dev/null)
-  case "$srv_pid" in ''|*[!0-9]*) csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null; return 1 ;; esac
   tok=$(csp_tmux_new_owner_token)
-  [ -n "$tok" ] || { csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null; return 1; }
+  [ -n "$tok" ] || { csp_tmux_enter_cleanup "$srv_pid"; return 1; }
   # Re-verify the instance is STILL ours-only and unchanged IMMEDIATELY before the
   # first global mutation, to shrink the check→configure window to near-zero. (The
   # -L CLI can't hold one connection across ops, so a sub-op swap can't be made
-  # strictly impossible; this makes it vanishingly unlikely and, combined with the
-  # post-check below, ensures we NEVER trust or clean up a swapped instance.)
+  # strictly impossible; this makes it vanishingly unlikely and, with the checks
+  # below, ensures we NEVER trust or clean up a swapped instance.)
   srv_pid2=$(csp_tmux display-message -p '#{pid}' 2>/dev/null)
   sessions=$(csp_tmux list-sessions -F '#{session_name}' 2>/dev/null)
   if [ "$srv_pid" != "$srv_pid2" ] || [ "$sessions" != "$CSP_TMUX_SESSION" ]; then
@@ -507,25 +527,31 @@ csp_tmux_enter() {
     return 1
   fi
   csp_tmux_configure_home
-  # Confirm identity by the OWNER TOKEN, which is the strongest signal we have: it
-  # is an unguessable per-instance value we just minted and only WE wrote, so a
-  # replacement/foreign server that grabbed this socket can never carry it.
-  #   • @csp_owner == our token → this IS our freshly-created instance. Proceed to
-  #     respawn window 0 as the picker. (We do NOT bail on a mere pid re-read
-  #     glitch here — that used to leak a detached holding session whose window 0
-  #     was still the bootstrap placeholder, which the reuse path would then trust
-  #     by name and attach you to a hung sleeper.)
-  #   • @csp_owner != our token → NOT ours (a swap, or configure didn't take). We
-  #     must NOT kill via this socket — it may now point at a replacement/foreign
-  #     server whose session we'd destroy. Bail and leave it untouched.
+  # After configure, require BOTH proofs to proceed: the OWNER TOKEN landed AND the
+  # server pid is UNCHANGED.
+  #   • token == ours AND pid unchanged → definitively our instance → proceed.
+  #   • pid CHANGED → the socket was swapped across configure; configure may have
+  #     stamped our token onto a replacement. We must NOT drive it (respawn/attach)
+  #     and must NOT kill it (foreign) → bail, leaving it untouched. A leaked
+  #     detached holding session of OUR OWN can't mislead the next launch: the
+  #     reuse path re-verifies/respawns window 0 as the picker rather than trusting
+  #     its name (see the has-session branch), so a stale placeholder is replaced.
+  #   • token missing → configure didn't take on our instance → pid-guarded cleanup.
+  srv_pid2=$(csp_tmux display-message -p '#{pid}' 2>/dev/null)
+  if [ "$srv_pid" != "$srv_pid2" ]; then
+    return 1                                       # swapped mid-configure → don't touch
+  fi
   if [ "$(csp_tmux show-options -gv @csp_owner 2>/dev/null)" != "$tok" ]; then
+    csp_tmux_enter_cleanup "$srv_pid"             # same instance, config failed → safe
     return 1
   fi
-  # Now replace the placeholder with the real picker in the same window 0.
+  # Now replace the placeholder with the real picker in the same window 0, then
+  # clear the bootstrap tag — from here window 0 IS the picker.
   csp_tmux respawn-window -k -t "=$CSP_TMUX_SESSION:menu" "$cmd" 2>/dev/null || {
     csp_tmux_enter_cleanup "$srv_pid"             # only if still our instance
     return 1
   }
+  csp_tmux set-option -wu -t "=$CSP_TMUX_SESSION:menu" '@csp_boot' 2>/dev/null
   csp_tmux_record_launch_pwd    # seed the launch dir for `n` (see helper)
   exec command tmux -L "$CSP_TMUX_SOCKET" attach-session -t "=$CSP_TMUX_SESSION"
   csp_tmux_enter_cleanup "$srv_pid"   # only if exec failed AND still our instance

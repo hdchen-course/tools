@@ -766,6 +766,44 @@ _dead_pid() {
   [ -f "$CSP_STATE_DIR/resident/sess-garbled" ]
 }
 
+@test "residency-live: MIXED valid+malformed output stays LIVE (round-5: don't trust a partial listing)" {
+  # Round-5 High: the guard used to grep OUT malformed lines and treat the rest as
+  # a complete listing — so a dropped/garbled line for our pane could clear a live
+  # record. A listing with ANY malformed line is untrustworthy → stay live. Here
+  # the recorded pane is %7; output has a good "4242 %0" and a truncated "4242 %".
+  mkdir -p "$CSP_STATE_DIR/resident"
+  # Record pid MATCHES the listing (4242) so the ONLY thing that can keep it live
+  # is the whole-output validation (else the different-instance branch would).
+  _write_residency sess-mixed "/tmp/whatever.sock" "4242" "%7"
+  fakebin="$BATS_TEST_TMPDIR/mixed-bin"; mkdir -p "$fakebin"
+  # A good line "4242 %0" and a truncated line "4242 %" (malformed). Use echo to
+  # avoid printf's % handling.
+  { echo '#!/bin/sh'; echo 'echo "4242 %0"'; echo 'echo "4242 %"'; echo 'exit 0'; } > "$fakebin/tmux"
+  chmod +x "$fakebin/tmux"
+  run env CSP_STATE_DIR="$CSP_STATE_DIR" PATH="$fakebin:$PATH" bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/sessions.sh"
+    csp_residency_is_live sess-mixed && echo LIVE || echo DEAD'
+  [ "$output" = "LIVE" ]
+  [ -f "$CSP_STATE_DIR/resident/sess-mixed" ]
+}
+
+@test "residency-live: INCONSISTENT pids across lines stays LIVE (round-5: untrustworthy listing)" {
+  # A valid-looking listing whose lines report DIFFERENT server pids is inconsistent
+  # (a real server's panes all share its pid) → untrustworthy → stay live. Recorded
+  # pane %7 is absent, but we must not clear on an inconsistent listing.
+  mkdir -p "$CSP_STATE_DIR/resident"
+  # Record pid 4242 matches the FIRST line; the listing mixes 4242 and 5555.
+  _write_residency sess-incpid "/tmp/whatever.sock" "4242" "%7"
+  fakebin="$BATS_TEST_TMPDIR/incpid-bin"; mkdir -p "$fakebin"
+  { echo '#!/bin/sh'; echo 'echo "4242 %0"'; echo 'echo "5555 %1"'; echo 'exit 0'; } > "$fakebin/tmux"
+  chmod +x "$fakebin/tmux"
+  run env CSP_STATE_DIR="$CSP_STATE_DIR" PATH="$fakebin:$PATH" bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/sessions.sh"
+    csp_residency_is_live sess-incpid && echo LIVE || echo DEAD'
+  [ "$output" = "LIVE" ]
+  [ -f "$CSP_STATE_DIR/resident/sess-incpid" ]
+}
+
 @test "residency-live: a VALID same-instance listing WITHOUT our pane clears (positive proof)" {
   # The complement: a well-formed listing from the SAME server pid that genuinely
   # lacks our pane is positive proof → clear + dead.
@@ -773,7 +811,7 @@ _dead_pid() {
   _write_residency sess-realgone "/tmp/whatever.sock" "4242" "%7"
   fakebin="$BATS_TEST_TMPDIR/realgone-bin"; mkdir -p "$fakebin"
   # Same pid (4242), but only pane %0 exists — %7 is gone.
-  printf '#!/bin/sh\necho "4242 %%0"\nexit 0\n' > "$fakebin/tmux"; chmod +x "$fakebin/tmux"
+  { echo '#!/bin/sh'; echo 'echo "4242 %0"'; echo 'exit 0'; } > "$fakebin/tmux"; chmod +x "$fakebin/tmux"
   run env CSP_STATE_DIR="$CSP_STATE_DIR" PATH="$fakebin:$PATH" bash -c '
     . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/sessions.sh"
     csp_residency_is_live sess-realgone && echo LIVE || echo DEAD'
@@ -781,14 +819,16 @@ _dead_pid() {
   [ ! -f "$CSP_STATE_DIR/resident/sess-realgone" ]  # cleared on positive proof
 }
 
-@test "residency-live: a LEGACY pidless record is UPGRADED to 3-line on a live probe" {
+@test "residency-live: a LEGACY pidless record stays LIVE but is NOT bound to the current socket owner" {
   command -v tmux >/dev/null 2>&1 || skip "tmux not installed"
-  # A legacy (socket, pane) record has no pid, so a later probe-failure could never
-  # prove death. On a live probe we upgrade it to 3-line with the observed pid.
+  # Round-5 High: a legacy (socket, pane) record has no pid. We must NOT derive its
+  # instance from whoever currently owns the (reusable) socket — that could be a
+  # REPLACEMENT server, and binding to it could later prove a false death. So a
+  # legacy record on a reachable server stays LIVE (fail closed) and is left
+  # pidless until a fresh hook writes a full 3-field record.
   sock="csp-upg-$$"
   tmux -L "$sock" new-session -d -s foreign -n w "sleep 30"
   sockpath=$(tmux -L "$sock" display-message -p '#{socket_path}')
-  spid=$(tmux -L "$sock" display-message -p '#{pid}')
   pane=$(tmux -L "$sock" display-message -p -t "=foreign:w" '#{pane_id}')
   mkdir -p "$CSP_STATE_DIR/resident"
   printf '%s\n%s\n' "$sockpath" "$pane" > "$CSP_STATE_DIR/resident/sess-upg"   # 2-line legacy
@@ -797,23 +837,29 @@ _dead_pid() {
     csp_residency_is_live sess-upg && echo LIVE || echo DEAD'
   tmux -L "$sock" kill-server 2>/dev/null || true
   [ "$output" = "LIVE" ]
-  # The record is now 3-line: line 2 is the numeric pid we observed.
+  # The record was NOT rewritten to bind a pid from the reusable socket owner.
   line2=$(sed -n '2p' "$CSP_STATE_DIR/resident/sess-upg")
-  [ "$line2" = "$spid" ]
+  [ -z "$line2" ] || [ "$line2" = "$pane" ]   # still 2-line (pane on line 2), no injected pid
 }
 
-@test "residency: csp_clear_residency_if_matches only clears a matching (socket,pane)" {
+@test "residency: csp_clear_residency_if_matches requires socket AND server-pid (AND pane) to match" {
   mkdir -p "$CSP_STATE_DIR/resident"
   . "$BATS_TEST_DIRNAME/../lib/core.sh"; . "$BATS_TEST_DIRNAME/../lib/sessions.sh"
   _write_residency sess-cond "/tmp/A.sock" "111" "%1"
   # Wrong socket → NOT cleared.
-  csp_clear_residency_if_matches sess-cond "/tmp/B.sock" "%1"
+  csp_clear_residency_if_matches sess-cond "/tmp/B.sock" "111" "%1"
   [ -f "$CSP_STATE_DIR/resident/sess-cond" ]
-  # Right socket, wrong pane → NOT cleared.
-  csp_clear_residency_if_matches sess-cond "/tmp/A.sock" "%9"
+  # Right socket, WRONG server pid (reuse of socket+pane after restart) → NOT cleared.
+  csp_clear_residency_if_matches sess-cond "/tmp/A.sock" "222" "%1"
   [ -f "$CSP_STATE_DIR/resident/sess-cond" ]
-  # Right socket + right pane → cleared.
-  csp_clear_residency_if_matches sess-cond "/tmp/A.sock" "%1"
+  # Right socket + right pid, wrong pane → NOT cleared.
+  csp_clear_residency_if_matches sess-cond "/tmp/A.sock" "111" "%9"
+  [ -f "$CSP_STATE_DIR/resident/sess-cond" ]
+  # Missing event pid → can't prove ownership → NOT cleared.
+  csp_clear_residency_if_matches sess-cond "/tmp/A.sock" "" "%1"
+  [ -f "$CSP_STATE_DIR/resident/sess-cond" ]
+  # Full match (socket + pid + pane) → cleared.
+  csp_clear_residency_if_matches sess-cond "/tmp/A.sock" "111" "%1"
   [ ! -f "$CSP_STATE_DIR/resident/sess-cond" ]
 }
 
@@ -825,6 +871,42 @@ _dead_pid() {
     . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/sessions.sh"
     csp_record_residency x /tmp/s.sock 1 %0 && echo OK || echo FAIL'
   [ "$output" = "FAIL" ]
+}
+
+@test "state: csp_write_state reports failure when the state dir cannot be created" {
+  . "$BATS_TEST_DIRNAME/../lib/core.sh"; . "$BATS_TEST_DIRNAME/../lib/sessions.sh"
+  blocker="$BATS_TEST_TMPDIR/wblocker"; : > "$blocker"
+  run env CSP_STATE_DIR="$blocker/state" bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/sessions.sh"
+    csp_write_state x working && echo OK || echo FAIL'
+  [ "$output" = "FAIL" ]
+}
+
+@test "state-store: csp_state_store_healthy is true for a normal dir, false when unwritable" {
+  . "$BATS_TEST_DIRNAME/../lib/core.sh"; . "$BATS_TEST_DIRNAME/../lib/sessions.sh"
+  run env CSP_STATE_DIR="$BATS_TEST_TMPDIR/healthy" bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/sessions.sh"
+    csp_state_store_healthy && echo HEALTHY || echo SICK'
+  [ "$output" = "HEALTHY" ]
+  blocker="$BATS_TEST_TMPDIR/sblocker"; : > "$blocker"
+  run env CSP_STATE_DIR="$blocker/state" bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/sessions.sh"
+    csp_state_store_healthy && echo HEALTHY || echo SICK'
+  [ "$output" = "SICK" ]
+}
+
+@test "delete-guard: an UNHEALTHY state store makes the guard fail closed (block)" {
+  . "$BATS_TEST_DIRNAME/../lib/core.sh"; . "$BATS_TEST_DIRNAME/../lib/sessions.sh"
+  # If the state store is unwritable/unreadable, the hook may have SILENTLY failed
+  # to record a live session, so a clean "no signal" is untrustworthy → block. No
+  # process, no window, no file: with a HEALTHY store this id would be deletable;
+  # with a sick store it must be treated as live.
+  blocker="$BATS_TEST_TMPDIR/dgblocker"; : > "$blocker"
+  result=$(CSP_SOURCED_FOR_TEST=1 CSP_STATE_DIR="$blocker/state" \
+    CSP_TMUX_SOCKET="csp-dgh-$$" CSP_TMUX_SESSION="csptest" bash -c '
+      . "'"$BATS_TEST_DIRNAME"'/../bin/claude-session-picker"
+      csp_delete_would_hit_live "no-signal-id" && echo LIVE || echo NOTLIVE')
+  [ "$result" = "LIVE" ]
 }
 
 @test "delete-guard: a FRESH transcript (recent mtime) is live even with no tmux/process (fail closed)" {

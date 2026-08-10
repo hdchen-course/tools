@@ -403,16 +403,45 @@ make_home() {
   [ -z "$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)" ]
 }
 
-@test "enter: fresh-path post-configure @csp_owner MISMATCH → bail WITHOUT killing the (possibly foreign) server" {
-  # Round-4: identity after configure is proven by the OWNER TOKEN, not the pid.
-  # If @csp_owner does NOT equal our freshly-minted token, the server on this
-  # socket is not the one we created (a swap, or configure didn't take) — we must
-  # NOT kill-session via it (it may be a replacement/foreign server whose session
-  # we'd destroy). We stub show-options to return a DIFFERENT owner and assert
-  # kill-session is never invoked.
+@test "enter: fresh-path server-PID SWAP during configure → bail WITHOUT killing the replacement" {
+  # Round-5 High: if the socket is swapped to a replacement server across configure
+  # (our token may have been stamped on it), the post-configure pid check must see
+  # the change and bail WITHOUT kill-session (never destroy a foreign session via a
+  # reused socket). display-message returns 1000 before configure, 2000 after.
   self="$BATS_TEST_DIRNAME/../bin/claude-session-picker"
   killlog="$BATS_TEST_TMPDIR/killlog"; : > "$killlog"
   lscount="$BATS_TEST_TMPDIR/lscount"; echo 0 > "$lscount"
+  cfgflag="$BATS_TEST_TMPDIR/cfgflag"
+  run bash -c "CSP_TMUX_SOCKET='$CSP_TMUX_SOCKET' CSP_TMUX_SESSION='$CSP_TMUX_SESSION' CSP_STATE_DIR='$CSP_STATE_DIR' \
+    bash -c '. \"$BATS_TEST_DIRNAME/../lib/core.sh\"; . \"$BATS_TEST_DIRNAME/../lib/backend.sh\"; \
+      csp_tmux_server_is_ours() { return 1; }; \
+      csp_tmux() { \
+        case \"\$1\" in \
+          has-session) return 1 ;; \
+          new-session) return 0 ;; \
+          list-sessions) \
+            n=\$(cat \"$lscount\"); n=\$(( n + 1 )); echo \"\$n\" > \"$lscount\"; \
+            if [ \"\$n\" -eq 1 ]; then return 1; fi; \
+            printf \"%s\\n\" \"$CSP_TMUX_SESSION\"; return 0 ;; \
+          display-message) if [ -f \"$cfgflag.done\" ]; then echo 2000; else echo 1000; fi; return 0 ;; \
+          show-options) echo \"csp-tok\"; return 0 ;; \
+          kill-session) echo kill >> \"$killlog\"; return 0 ;; \
+          set-option) return 0 ;; \
+          *) return 0 ;; \
+        esac; }; \
+      csp_tmux_new_owner_token() { echo csp-tok; }; \
+      csp_tmux_configure_home() { : > \"$cfgflag.done\"; }; \
+      csp_tmux_enter \"$self\"' </dev/null 2>&1"
+  # pid swapped 1000->2000 across configure → bail, NO kill of the replacement.
+  [ ! -s "$killlog" ]
+}
+
+@test "enter: fresh-path same-instance but token DIDN'T land → pid-guarded kill of OUR OWN session (safe)" {
+  # Complement: pid UNCHANGED (still our instance) but @csp_owner != our token
+  # (configure silently failed on our own wedged server) → safe to kill OUR session.
+  self="$BATS_TEST_DIRNAME/../bin/claude-session-picker"
+  killlog="$BATS_TEST_TMPDIR/killlog2"; : > "$killlog"
+  lscount="$BATS_TEST_TMPDIR/lscount2"; echo 0 > "$lscount"
   run bash -c "CSP_TMUX_SOCKET='$CSP_TMUX_SOCKET' CSP_TMUX_SESSION='$CSP_TMUX_SESSION' CSP_STATE_DIR='$CSP_STATE_DIR' \
     bash -c '. \"$BATS_TEST_DIRNAME/../lib/core.sh\"; . \"$BATS_TEST_DIRNAME/../lib/backend.sh\"; \
       csp_tmux_server_is_ours() { return 1; }; \
@@ -433,8 +462,8 @@ make_home() {
       csp_tmux_new_owner_token() { echo csp-tok; }; \
       csp_tmux_configure_home() { :; }; \
       csp_tmux_enter \"$self\"' </dev/null 2>&1"
-  # @csp_owner ('csp-SOMEONE-ELSE') != our token ('csp-tok') → bail, NO kill.
-  [ ! -s "$killlog" ]
+  # Same pid throughout (1000) + token mismatch → pid-guarded cleanup DID kill.
+  [ -s "$killlog" ]
 }
 
 @test "enter: fresh-path with MATCHING @csp_owner does NOT bail on a pid re-read (no leaked placeholder)" {

@@ -1086,6 +1086,13 @@ csp_delete_would_hit_live() {
     [ "$mtime" -eq 0 ] && return 0
     [ "$(( now - mtime ))" -lt "$CSP_LIVE_MTIME_WINDOW" ] && return 0
   fi
+  # Storage-health fail-closed: every signal above except the live-process/window
+  # scans reads from $CSP_STATE_DIR. If that store is unhealthy, the hook may have
+  # SILENTLY failed to record a live session (its "working"/residency write got
+  # dropped), so a clean "no signal" here is untrustworthy. Refuse rather than risk
+  # deleting a live transcript. (The process/window scans already ran above and
+  # said "not live"; this only adds caution for the store-backed signals.)
+  csp_state_store_healthy || return 0
   return 1
 }
 

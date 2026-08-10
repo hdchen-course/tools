@@ -32,17 +32,27 @@ setup() {
   [ "$output" = "waiting" ]
 }
 
-@test "hook: SessionEnd ('ended') outside tmux clears state and residency for the id" {
-  # When Claude exits, its residency record (a PANE, which outlives Claude in a
-  # foreign shell) must be torn down so a dead session doesn't block delete forever.
-  # With no $TMUX there's no instance to disambiguate, so a plain clear is correct.
+@test "hook: SessionEnd ('ended') with NO residency record clears the cosmetic state" {
+  # No residency record means nothing a newer tmux instance is protecting, so
+  # clearing the ●/✳ state is safe (and there's no residency to remove).
   mkdir -p "$CSP_STATE_DIR/resident"
   csp_write_state "gone-1" "waiting"
-  printf '%s\n%s\n%s\n' "/tmp/whatever.sock" "12345" "%1" > "$CSP_STATE_DIR/resident/gone-1"
   run env -u TMUX -u TMUX_PANE CSP_STATE_DIR="$CSP_STATE_DIR" bash -c "printf '{\"session_id\":\"gone-1\"}' | '$HOOK' ended"
   run csp_read_state "gone-1"
-  [ -z "$output" ]                                  # state cleared
-  [ ! -f "$CSP_STATE_DIR/resident/gone-1" ]         # residency cleared
+  [ -z "$output" ]                                  # state cleared (no record to guard)
+}
+
+@test "hook: SessionEnd OUTSIDE tmux with a residency record present does NOT clear it (can't prove instance)" {
+  # Round-5: a SessionEnd fired outside tmux (no $TMUX → no server pid) cannot prove
+  # it belongs to the recorded instance, so it must NOT clear the residency OR the
+  # state (both are delete-blocking). A newer instance's live record is preserved.
+  mkdir -p "$CSP_STATE_DIR/resident"
+  csp_write_state "keep-1" "working"
+  printf '%s\n%s\n%s\n' "/tmp/whatever.sock" "12345" "%1" > "$CSP_STATE_DIR/resident/keep-1"
+  run env -u TMUX -u TMUX_PANE CSP_STATE_DIR="$CSP_STATE_DIR" bash -c "printf '{\"session_id\":\"keep-1\"}' | '$HOOK' ended"
+  [ -f "$CSP_STATE_DIR/resident/keep-1" ]           # residency preserved
+  run csp_read_state "keep-1"
+  [ "$output" = "working" ]                         # state preserved too
 }
 
 @test "hook: a DELAYED SessionEnd from an OLD instance does NOT clear a NEWER instance's residency" {

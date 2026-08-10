@@ -45,23 +45,28 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   `$TMUX`/`$TMUX_PANE`, never touching that server) as `(socket, server-pid,
   pane)` in the picker's state dir, and delete blocks while that pane is open. The
   residency probe is strictly **fail-closed**: it clears a record only on
-  positive, VALIDATED proof of death — a well-formed `<pid> <pane>` listing from
-  the same server instance that genuinely lacks the pane, or the recorded server
-  pid confirmed gone. A transient tmux error, or a success with empty/garbled
-  output, is never read as "dead". It's bound to the server *instance* (socket +
-  pid), so a socket path reused by a new tmux server can't clear a record that
-  still belongs to the old, live one; a legacy pidless record is upgraded to the
-  instance-bound form on the next live probe. If tagging our own window fails, the
-  hook falls back to a residency record; if even that write fails, it falls back
-  to marking the session `working` — a storage failure over-blocks rather than
-  silently dropping the last protection. A `SessionEnd` hook (`csp-hook.sh ended`)
-  clears the record when Claude exits, and clears it *conditionally* — only when
-  the ended event's own `(socket, pane)` match the stored record — so a delayed
-  `SessionEnd` from an old instance can't wipe a newer same-id instance's
-  protection. With the hooks installed a live session is protected regardless of
-  idle time in *every* tmux arrangement; only without them does an idle bare `n`
-  session fall through to the one-minute mtime backstop. The refusal message says
-  whether it's actually running or just marked busy, and how to clear a stale flag.
+  positive, VALIDATED proof of death — the FULL `list-panes` output must be
+  well-formed (every line `<pid> %<pane>`, all sharing one server pid) and, from
+  the same instance we recorded, genuinely lack the pane; or the recorded server
+  pid is confirmed gone. A transient tmux error, an empty/garbled/partial listing,
+  or an inconsistent one is never read as "dead". It's bound to the server
+  *instance* (socket + pid), so a socket path reused by a new tmux server can't
+  clear a record that still belongs to the old, live one; a legacy pidless record
+  is never bound to a reused socket's current owner — it stays protected until a
+  fresh hook writes a full record. If tagging our own window fails, the hook falls
+  back to a residency record; if even that write fails, it falls back to marking
+  the session `working`, and the delete guard itself refuses whenever it can't
+  confirm the state store is writable/readable — so a storage failure over-blocks
+  rather than silently dropping the last protection. A `SessionEnd` hook
+  (`csp-hook.sh ended`) tears the record down when Claude exits, but only when the
+  ended event's `(socket, server-pid[, pane])` match the stored record — a socket
+  path and pane id are both reused after a server restart, so the server pid is the
+  reuse-proof key; a delayed `SessionEnd` from an old instance can't wipe a newer
+  same-id instance's protection (residency OR state). With the hooks installed a
+  live session is protected regardless of idle time in *every* tmux arrangement;
+  only without them does an idle bare `n` session fall through to the one-minute
+  mtime backstop. The refusal message says whether it's actually running or just
+  marked busy, and how to clear a stale flag.
 - **`n` sessions become dedupable.** With hooks installed, the hook tags its tmux
   window with the session id, so a later `Enter` on that session switches to the
   existing window instead of starting a second copy over the same transcript.
@@ -179,16 +184,18 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   server-is-ours, injective owner-file keying (+ collision guard), owner-file
   symlink/shape/permission hardening, socket-path binding, the fresh-path TOCTOU
   bail, residency block/self-clear across pane-closed / server-gone-pid /
-  transient-fail-pid-alive / socket-reuse / pane-less cases, probe-output
-  validation (exit-0-but-empty/malformed stays live), legacy pidless record
-  upgrade, the fresh-path TOCTOU pid-swap "bail without killing the replacement"
-  guard, the tag-failure and record-failure fallbacks, and conditional
-  `SessionEnd` teardown (a delayed old-instance end can't clear a newer record).
-  The fresh-path identity re-check after `configure_home` is proven by the owner
-  TOKEN (mismatch → bail without killing a possibly-foreign server; match → don't
-  bail on a pid glitch, so no bootstrap-placeholder holding session leaks). Each
-  new assertion was mutation-verified (disable the fix → the test fails). Test
-  suite grew to 251.
+  transient-fail-pid-alive / socket-reuse / pane-less cases, WHOLE-output probe
+  validation (empty / malformed / mixed-valid-plus-malformed / inconsistent-pid
+  listings all stay live), legacy pidless records staying protected without being
+  bound to a reused socket owner, the fresh-path pid-swap-during-configure "bail
+  without killing the replacement" guard, the tag-failure and record-failure
+  fallbacks, `csp_write_state`/`csp_record_residency` reporting real failure, the
+  delete guard failing closed on an unhealthy state store, and instance-safe
+  `SessionEnd` teardown (matched on socket + server-pid + pane; a delayed
+  old-instance or outside-tmux end can't clear a newer record or its state). The
+  fresh-path identity re-check after `configure_home` is proven by the owner TOKEN
+  and a server-pid comparison. Each new assertion was mutation-verified (disable
+  the fix → the test fails). Test suite grew to 258.
 - New pure, unit-tested helpers in `lib/core.sh`: `csp_filter_indices`,
   `csp_next_attention`, `csp_count_attention`. A shared `csp_prompt_line` now
   backs both the delete confirmation and the filter query (one home for the

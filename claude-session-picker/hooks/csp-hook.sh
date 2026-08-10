@@ -97,24 +97,40 @@ if [ -n "${TMUX:-}" ]; then
   case "$csp_tmux_spid" in *[!0-9]*) csp_tmux_spid="" ;; esac
 fi
 
-# SessionEnd: Claude for this id has exited. Clear its state and its residency
-# record — residency tracks a PANE, but a pane in a foreign shell outlives the
-# Claude that ran in it (you drop back to the shell), so without this an ended
-# session's transcript would stay un-deletable until the whole pane/server closed.
+# SessionEnd: Claude for this id has exited. We tear down its per-session records
+# (residency tracks a PANE, and a pane in a foreign shell outlives the Claude that
+# ran in it — you drop back to the shell — so without this an ended session's
+# transcript would stay un-deletable). But teardown must be INSTANCE-SAFE: a
+# DELAYED SessionEnd from an OLD instance must not wipe records a NEWER same-id
+# instance just wrote (both the residency AND the state="working" fallback are now
+# delete-blocking signals, so wiping either could expose a LIVE newer session).
 #
-# CONDITIONAL clear: a DELAYED SessionEnd from an OLD instance must not wipe a
-# record a NEWER same-id instance just wrote (e.g. `claude --continue` reusing the
-# id in a different pane). We clear the residency ONLY if it matches the socket
-# (and pane, when both known) this SessionEnd fired in. The ●/✳ state is a mere
-# hint, so clearing it unconditionally is fine.
+# Rule: clear ONLY what we can prove belongs to THIS ended instance.
+#   • If a residency record exists and does NOT match our (socket, server-pid,
+#     pane), a newer instance owns this id → clear NOTHING, leave it for them.
+#   • If it matches, or there is no residency record at all (nothing a newer tmux
+#     instance is protecting), it's safe to clear this id's state and residency.
+# server-pid is the reuse-proof key (socket path and %0 are reused after a restart)
+# — csp_clear_residency_if_matches enforces it; here we mirror that decision to
+# gate the state clear too.
 if [ "$state" = "ended" ]; then
-  csp_clear_state "$id"
-  if command -v csp_clear_residency_if_matches >/dev/null 2>&1 && [ -n "$csp_tmux_sock" ]; then
-    csp_clear_residency_if_matches "$id" "$csp_tmux_sock" "${TMUX_PANE:-}"
-  elif [ -z "${TMUX:-}" ] && command -v csp_clear_residency >/dev/null 2>&1; then
-    # Not in tmux at all → no instance to disambiguate against; a plain clear is
-    # correct (there's no foreign-pane residency to protect here).
-    csp_clear_residency "$id"
+  csp_ended_rec=""
+  command -v csp_read_residency >/dev/null 2>&1 && csp_ended_rec=$(csp_read_residency "$id")
+  if [ -n "$csp_ended_rec" ]; then
+    # A residency record exists. Only tear down if it provably matches this
+    # instance (socket + server-pid [+ pane]). csp_clear_residency_if_matches does
+    # the exact same check and clears the record; we clear state only if it did.
+    csp_ended_before=$(csp_read_residency "$id")
+    csp_clear_residency_if_matches "$id" "$csp_tmux_sock" "$csp_tmux_spid" "${TMUX_PANE:-}"
+    csp_ended_after=$(csp_read_residency "$id")
+    if [ -n "$csp_ended_before" ] && [ -z "$csp_ended_after" ]; then
+      csp_clear_state "$id"                        # record matched & was cleared → safe
+    fi
+    # else: record belonged to a newer instance → leave state too.
+  else
+    # No residency record to protect (session ran outside tmux, or none written).
+    # Clearing the ●/✳ state is cosmetic and safe.
+    csp_clear_state "$id"
   fi
   exit 0
 fi
