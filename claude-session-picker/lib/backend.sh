@@ -102,23 +102,45 @@ csp_tmux_available() {
 # `display-message -p '#{socket_path}'` (e.g. csp_inside_tmux) passes it so we
 # don't fork tmux again just to rebuild the same key — this matters on the hook's
 # per-prompt path. Empty/absent → we resolve it ourselves.
+#
+# The key is an INJECTIVE hex encoding of the full path, NOT a lossy character
+# substitution: `tr -c 'A-Za-z0-9._-' '_'` maps distinct paths to the same key
+# (e.g. /tmp/a/b and /tmp/a_b both → _tmp_a_b), which would let two real servers
+# share — and clobber — one owner file. Byte-wise hex is one-to-one, so every
+# distinct socket path gets its own file.
 csp_tmux_owner_file() {
   local key lpath="${1:-}"
   [ -n "$lpath" ] || lpath=$(command tmux -L "$CSP_TMUX_SOCKET" display-message -p '#{socket_path}' 2>/dev/null)
   [ -n "$lpath" ] || lpath="$CSP_TMUX_SOCKET"
-  key=$(printf '%s' "$lpath" | tr -c 'A-Za-z0-9._-' '_')
+  key=$(printf '%s' "$lpath" | od -An -tx1 2>/dev/null | tr -d ' \n')
+  # Fallback if od is somehow unavailable: lossy but still deterministic (only
+  # reached on a machine without od, where a path collision is a non-issue).
+  [ -n "$key" ] || key=$(printf '%s' "$lpath" | tr -c 'A-Za-z0-9._-' '_')
   printf '%s/tmux-owner.%s' "$CSP_STATE_DIR" "$key"
 }
 
 # csp_tmux_owner_token — print the persisted ownership token for this socket, or
-# nothing if none has been established yet. Bounded read; always returns 0.
+# nothing if none has been established yet. Always returns 0.
 # $1 (optional) is a pre-resolved socket path, forwarded to csp_tmux_owner_file.
+# We refuse to follow a symlink at the path (a planted link could otherwise
+# redirect the read) and read a BOUNDED amount — the token is a fixed-shape
+# "csp-<hex>" value, so a fixed cap can never be a hot-path latency hazard even if
+# the file were somehow replaced by a huge one.
 csp_tmux_owner_token() {
   local f v=""
   f=$(csp_tmux_owner_file "${1:-}")
-  if [ -f "$f" ]; then
-    { IFS= read -r v < "$f"; } 2>/dev/null
+  if [ -f "$f" ] && [ ! -L "$f" ]; then
+    { IFS= read -r -n 96 v < "$f"; } 2>/dev/null
   fi
+  v="${v%$'\r'}"
+  # Accept only the exact shape we write: "csp-" then one or more [A-Za-z0-9-].
+  # Anything else (tampered, truncated, garbage) reads as no token — i.e. "not
+  # ours", the safe answer.
+  case "$v" in
+    csp-*[!A-Za-z0-9-]*) v="" ;;   # has a disallowed char after the prefix
+    csp-?*) ;;                     # csp- + at least one valid char → keep
+    *) v="" ;;                     # missing prefix / empty
+  esac
   printf '%s' "$v"
 }
 
@@ -126,15 +148,27 @@ csp_tmux_owner_token() {
 # socket's owner token (called when we create a brand-new server). Prints the
 # token. Random bytes from /dev/urandom; a pid/RANDOM fallback keeps it working
 # on a machine without it (uniqueness, not cryptographic secrecy, is what we
-# need in the single-user local model). Best-effort write.
+# need in the single-user local model).
+#
+# The write is HARDENED: dir 0700, file 0600, and atomic (temp file + rename, so a
+# concurrent reader never sees a truncated token, and the rename REPLACES any
+# pre-planted symlink at the path rather than following it). Best-effort — a
+# failed persist just means the next reader finds no token ("not ours" → hub).
 csp_tmux_new_owner_token() {
-  local tok f
+  local tok f d tmp
   tok=$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')
-  [ -n "$tok" ] || tok="$$-${RANDOM:-0}-${RANDOM:-0}-$(date +%s 2>/dev/null || echo 0)"
+  [ -n "$tok" ] || tok="$$${RANDOM:-0}${RANDOM:-0}$(date +%s 2>/dev/null || echo 0)"
+  # Keep the persisted token to [A-Za-z0-9-] so the read-back shape check accepts
+  # it (the fallback form above could contain other chars on an odd machine).
+  tok=$(printf '%s' "$tok" | tr -cd 'A-Za-z0-9')
   tok="csp-$tok"
-  f=$(csp_tmux_owner_file)
-  mkdir -p "$(dirname "$f")" 2>/dev/null
-  { printf '%s\n' "$tok" > "$f"; } 2>/dev/null || true
+  f=$(csp_tmux_owner_file); d=$(dirname "$f")
+  mkdir -p "$d" 2>/dev/null
+  chmod 700 "$d" 2>/dev/null || true
+  tmp="$f.$$.tmp"
+  { printf '%s\n' "$tok" > "$tmp"; } 2>/dev/null || { printf '%s' "$tok"; return 0; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f -- "$tmp" "$f" 2>/dev/null || rm -f -- "$tmp" 2>/dev/null
   printf '%s' "$tok"
 }
 
@@ -415,20 +449,30 @@ csp_tmux_enter() {
   # configure_home stamps that token as @csp_owner. Keying per-path means a
   # concurrent instance on a same-named socket at a DIFFERENT path writes a
   # DIFFERENT owner file and can't clobber this server's token.
-  local tok
+  local tok others
   csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu \
     'sh -c "while :; do sleep 2147483647; done"' 2>/dev/null || return 1
+  # CLOSE the check→create TOCTOU: new-session creates the SERVER when none exists,
+  # but if a foreign server won this socket between the list-sessions check above
+  # and this new-session, new-session would instead add OUR session to THEIR
+  # server. A freshly-created server has EXACTLY our session and nothing else; a
+  # foreign server we accidentally joined still carries its own session(s). So
+  # before minting the token or running configure_home — the steps that would
+  # stamp GLOBAL options / @csp_owner on a server — verify ours is the ONLY
+  # session. If not, remove just our newly-added session (leaving theirs
+  # untouched; we have NOT mutated any global option yet) and fall back to hub.
+  others=$(csp_tmux list-sessions -F '#{session_name}' 2>/dev/null \
+             | grep -vxF -- "$CSP_TMUX_SESSION" | grep -c . )
+  if [ "${others:-0}" -ne 0 ]; then
+    csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null
+    return 1
+  fi
   tok=$(csp_tmux_new_owner_token)
   [ -n "$tok" ] || { csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null; return 1; }
   csp_tmux_configure_home
   # Confirm the token actually landed as @csp_owner before launching the picker;
   # if it didn't (a wedged server where set-option silently failed), tear down and
-  # fall back to hub rather than racing. (This can't fully close the tiny
-  # list-sessions→new-session TOCTOU — if a foreign server grabbed the socket in
-  # that window, new-session would attach to it and we'd stamp our token; but that
-  # race is between our own concurrent launches in practice, and DATA safety never
-  # depends on ownership: the delete guard's transcript-mtime backstop protects a
-  # live session regardless of which server the picker thinks it owns.)
+  # fall back to hub rather than racing.
   [ "$(csp_tmux show-options -gv @csp_owner 2>/dev/null)" = "$tok" ] || {
     csp_tmux kill-session -t "=$CSP_TMUX_SESSION" 2>/dev/null
     return 1

@@ -370,14 +370,16 @@ Nothing in the suite launches the real `claude` or touches your real `~/.claude`
   removes the selected session's transcript **after you confirm**; it never
   touches anything else. Delete **fails closed**: it refuses whenever it can't
   prove a session is dead — a live `claude --resume` process, an open tmux window
-  for the session, a `working` hook state, or a transcript file that was written
-  to within the last minute all block it. One case needs the **hooks** to be
-  fully covered: a session started with `n` that then sits idle at a prompt (so
-  it isn't writing its transcript). With the hooks installed, that session's tmux
-  window is tagged and stays protected no matter how long it idles; without them,
-  a bare idle `n` session can become deletable after a minute of no writes.
-  Installing the hooks (below) is recommended for exactly this reason; `--doctor`
-  tells you whether they're wired. Uninstalling leaves all your sessions untouched.
+  for the session, a `working` hook state, a live *residency* record (the session
+  is running in some tmux pane, even one the picker doesn't own), or a transcript
+  written to within the last minute all block it. With the **hooks** installed a
+  live session is protected regardless of how long it sits idle at a prompt, in
+  every tmux arrangement — inside the picker's own tmux, inside a server left over
+  from an older version, or inside your own unrelated tmux. Only *without* the
+  hooks can a bare `n` session that goes idle become deletable after a minute of
+  no writes. Installing the hooks (below) is recommended for exactly this reason;
+  `--doctor` tells you whether they're wired. Uninstalling leaves all your
+  sessions untouched.
 - **Your terminal is always restored** — the cursor and your `stty` settings are
   put back on every exit path (normal quit, `Ctrl-C`, `TERM`, or an unexpected
   error), via a trap installed *before* the terminal is ever put into raw mode.

@@ -99,8 +99,27 @@ csp_write_state "$id" "$state"
 # a @csp_sid option would pollute their session and could clobber a same-named
 # user option. Inside our own server the ambient $TMUX targets exactly this
 # window, so no -t guessing is needed. Best-effort, silent.
-if command -v tmux >/dev/null 2>&1 \
-   && command -v csp_inside_tmux >/dev/null 2>&1 && csp_inside_tmux; then
-  tmux set-option -w '@csp_sid' "$id" >/dev/null 2>&1 || true
+#
+# THREE cases, because delete safety must not hinge on whether we own the server:
+#   (a) inside our OWN server → tag the window with @csp_sid (dedup + delete
+#       guard's window signal), and drop any stale residency record (the tag now
+#       covers this session).
+#   (b) inside SOME tmux we do NOT own (a legacy/markerless server that survived
+#       an in-place upgrade, or the user's unrelated tmux) → we must NOT touch
+#       that server, but the session is still live. Record an ownership-INDEPENDENT
+#       residency marker in OUR OWN state dir, from our own read-only $TMUX /
+#       $TMUX_PANE, so the delete guard blocks while that pane is alive. This
+#       closes the data-loss gap where an untagged idle session went deletable
+#       after the mtime window elapsed.
+#   (c) not in tmux at all → nothing to do.
+if command -v tmux >/dev/null 2>&1 && command -v csp_inside_tmux >/dev/null 2>&1; then
+  if csp_inside_tmux; then
+    tmux set-option -w '@csp_sid' "$id" >/dev/null 2>&1 || true
+    command -v csp_clear_residency >/dev/null 2>&1 && csp_clear_residency "$id"
+  elif [ -n "${TMUX:-}" ] && command -v csp_record_residency >/dev/null 2>&1; then
+    # $TMUX is "<socket_path>,<server_pid>,<session_id>"; the socket path is the
+    # part before the first comma. $TMUX_PANE is this pane's stable id (e.g. %3).
+    csp_record_residency "$id" "${TMUX%%,*}" "${TMUX_PANE:-}"
+  fi
 fi
 exit 0

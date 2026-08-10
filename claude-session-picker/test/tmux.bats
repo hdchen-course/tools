@@ -230,24 +230,63 @@ make_home() {
   [ "$status" -eq 0 ]
 }
 
-@test "ownership: the owner file is keyed on the resolved socket PATH, not the bare name (no clobber)" {
+@test "ownership: the owner file is keyed on an INJECTIVE hex of the socket PATH (no clobber)" {
   # The review's Finding 2: keying the owner file on socket NAME alone let a second
   # instance on the SAME name but a DIFFERENT TMUX_TMPDIR (a distinct live server at
-  # a different socket PATH) clobber the first's token, orphaning the first live
-  # server's own recognition. The fix keys the file on the resolved socket path, so
-  # two servers at different paths land in different files. We assert the property
-  # directly: with a live server, the owner filename embeds the sanitised socket
-  # PATH (which is unique per server), NOT just the socket name.
+  # a different socket PATH) clobber the first's token. Follow-up: even keying on
+  # the path is unsafe if done with a LOSSY tr -c (distinct paths → same key). The
+  # fix uses a byte-wise hex encoding, which is one-to-one. We assert the filename
+  # is the hex of the resolved socket path.
   make_home
   path=$(command tmux -L "$CSP_TMUX_SOCKET" display-message -p '#{socket_path}')
   [ -n "$path" ]
-  pathkey=$(printf '%s' "$path" | tr -c 'A-Za-z0-9._-' '_')
+  pathkey=$(printf '%s' "$path" | od -An -tx1 | tr -d ' \n')
   file=$(csp_tmux_owner_file)
-  # The file is keyed on the full path (unique per server), not the socket name —
-  # so a same-named server at a different path can never resolve to this same file.
+  # The file is keyed on the injective hex of the full path (unique per server).
   [ "$file" = "$CSP_STATE_DIR/tmux-owner.$pathkey" ]
-  case "$file" in *"$pathkey"*) ok=1 ;; *) ok=0 ;; esac
+}
+
+@test "ownership: the owner-file key is INJECTIVE — collision-prone paths map to distinct files" {
+  # Directly guard against the lossy-key regression: /tmp/a/b and /tmp/a_b differ
+  # only by a char the old tr -c would fold to '_'. Their hex keys must differ.
+  keyAB=$(printf '%s' "/tmp/a/b" | od -An -tx1 | tr -d ' \n')
+  keyA_B=$(printf '%s' "/tmp/a_b" | od -An -tx1 | tr -d ' \n')
+  [ "$keyAB" != "$keyA_B" ]
+  # And csp_tmux_owner_file uses exactly this encoding for a given resolved path.
+  fileAB=$(csp_tmux_owner_file "/tmp/a/b")
+  fileA_B=$(csp_tmux_owner_file "/tmp/a_b")
+  [ "$fileAB" != "$fileA_B" ]
+}
+
+@test "ownership: owner-token read refuses a symlink at the path and validates shape" {
+  make_home
+  f=$(csp_tmux_owner_file)
+  # A valid token round-trips.
+  tok=$(csp_tmux_owner_token)
+  case "$tok" in csp-*) ok=1 ;; *) ok=0 ;; esac
   [ "$ok" = "1" ]
+  # Replace the owner file with a SYMLINK to a secret — the read must refuse to
+  # follow it and return nothing (so a planted link can't redirect the read).
+  printf 'csp-should-not-be-read\n' > "$BATS_TEST_TMPDIR/secret"
+  rm -f "$f"; ln -s "$BATS_TEST_TMPDIR/secret" "$f"
+  [ -z "$(csp_tmux_owner_token)" ]
+  # A garbage (wrong-shape) token reads as empty → "not ours", the safe answer.
+  rm -f "$f"; printf 'totally-not-a-token\n' > "$f"
+  [ -z "$(csp_tmux_owner_token)" ]
+  # A well-formed token with an injected disallowed char is also rejected.
+  printf 'csp-abc;rm -rf\n' > "$f"
+  [ -z "$(csp_tmux_owner_token)" ]
+}
+
+@test "ownership: new owner token is written 0600 in a 0700 dir (hardening)" {
+  make_home
+  f=$(csp_tmux_owner_file); d=$(dirname "$f")
+  # Perms are best-effort (chmod may be a no-op on odd filesystems), but on a
+  # normal box the file is 600 and the dir 700. Accept the hardened perms.
+  fmode=$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f" 2>/dev/null)
+  dmode=$(stat -f '%Lp' "$d" 2>/dev/null || stat -c '%a' "$d" 2>/dev/null)
+  [ "$fmode" = "600" ]
+  [ "$dmode" = "700" ]
 }
 
 @test "ownership: server_is_ours REJECTS a legacy/markerless server (no per-instance token)" {
@@ -330,6 +369,38 @@ make_home() {
   # And our holding session was NOT created on their server.
   run csp_tmux has-session -t "=$CSP_TMUX_SESSION"
   [ "$status" -ne 0 ]
+}
+
+@test "enter: fresh-path TOCTOU — if new-session lands on a server that already has a foreign session, bail without mutating" {
+  # Defence-in-depth for the check->create race: the pre-check (list-sessions &&
+  # !server_is_ours) can't see a foreign server that grabs the socket AFTER it
+  # runs but BEFORE our new-session. To reach that post-new-session guard
+  # deterministically, we force the pre-check to pass by stubbing
+  # csp_tmux_server_is_ours to "not ours but pretend the socket looked empty":
+  # we stub list-sessions to report empty ONCE (pre-check), while a real foreign
+  # session already exists — so our new-session adds ours to the foreign server.
+  # The guard must then see >1 session, remove ONLY ours, and NOT stamp @csp_owner.
+  csp_tmux new-session -d -s "foreign-race" -n w "sleep 60"   # the foreign server/session
+  before_owner=$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)
+  self="$BATS_TEST_DIRNAME/../bin/claude-session-picker"
+  run bash -c "CSP_TMUX_SOCKET='$CSP_TMUX_SOCKET' CSP_TMUX_SESSION='$CSP_TMUX_SESSION' CSP_STATE_DIR='$CSP_STATE_DIR' \
+    bash -c '. \"$BATS_TEST_DIRNAME/../lib/core.sh\"; . \"$BATS_TEST_DIRNAME/../lib/backend.sh\"; \
+      __n=0; \
+      csp_tmux_server_is_ours() { return 1; }; \
+      _real_tmux() { command tmux -L \"\$CSP_TMUX_SOCKET\" \"\$@\"; }; \
+      csp_tmux() { \
+        if [ \"\$1\" = list-sessions ] && [ \"\$__n\" -eq 0 ]; then __n=1; return 1; fi; \
+        _real_tmux \"\$@\"; }; \
+      csp_tmux_enter \"$self\"' </dev/null 2>&1"
+  # Our holding session must NOT survive on the foreign server...
+  run csp_tmux has-session -t "=$CSP_TMUX_SESSION"
+  [ "$status" -ne 0 ]
+  # ...the foreign session is untouched...
+  run csp_tmux has-session -t "=foreign-race"
+  [ "$status" -eq 0 ]
+  # ...and we never stamped @csp_owner on their server.
+  [ "$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)" = "$before_owner" ]
+  [ -z "$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)" ]
 }
 
 @test "recovery: a menu window orphaned at a NON-zero index is swapped back to 0" {

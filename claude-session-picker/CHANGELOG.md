@@ -35,16 +35,20 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
 - **Delete fails closed — it refuses whenever it can't prove a session is dead.**
   Liveness is re-evaluated at delete time and again after you confirm (closing a
   stale-snapshot gap), and it now blocks on any of: a live `claude --resume`
-  process, an open tmux window for the session, the hook `working` state, OR — the
-  backstop — a transcript that was written to within the last minute (a live
-  Claude keeps appending to its `.jsonl`). This backstop is ownership- and
-  topology-independent, so a live bare session started with `n` is protected even
-  when its tmux server isn't recognised as the picker's. An existing file whose
-  mtime can't be read is also treated as live. The one residual gap — a bare `n`
-  session left idle at a prompt with the hooks *not* installed — is closed by
-  installing the hooks (the window tag protects it regardless of idle time); the
-  README safety note and `--doctor` call this out. The refusal message says
-  whether it's actually running or just marked busy, and how to clear a stale flag.
+  process, an open tmux window tagged for the session, the hook `working` state, a
+  live **residency** record, OR — the backstop — a transcript written to within
+  the last minute (a live Claude keeps appending to its `.jsonl`; an existing file
+  whose mtime can't be read is also treated as live). The residency signal closes
+  the upgrade-path data-loss the review caught: a hooked session running in a tmux
+  server the picker can't tag — a legacy server that survived an in-place upgrade,
+  or your own unrelated tmux — is recorded (from the hook's own read-only
+  `$TMUX`/`$TMUX_PANE`, never touching that server) in the picker's state dir, and
+  delete blocks while that pane is still open, self-clearing once it closes. With
+  the hooks installed a live session is now protected regardless of idle time in
+  *every* tmux arrangement, not just the picker's own; only without the hooks does
+  an idle bare `n` session fall through to the one-minute mtime backstop. The
+  refusal message says whether it's actually running or just marked busy, and how
+  to clear a stale flag.
 - **`n` sessions become dedupable.** With hooks installed, the hook tags its tmux
   window with the session id, so a later `Enter` on that session switches to the
   existing window instead of starting a second copy over the same transcript.
@@ -139,19 +143,26 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   open-tmux-window delete guard, a delete confirm-race action test, installer
   control-char JSON validity, and an unrelated-tmux hook-isolation test.
 - tmux ownership is a per-instance random token (server-global `@csp_owner`)
-  persisted in an owner file keyed on the *resolved socket path*, generated fresh
-  when we create a server — not the socket name or a fixed marker. So a foreign or
-  legacy/markerless server is never mistaken for the picker's, the hook never tags
-  a window in it, and two instances on a same-named socket at different paths keep
-  distinct owner files (no token clobber). `csp_delete_would_hit_live` grew a
-  transcript-mtime backstop (block if written within `CSP_LIVE_MTIME_WINDOW`, or
-  if an existing file's mtime is unreadable) making delete fail closed
-  independently of tmux ownership. New/updated regression tests: token-based
-  server-is-ours (accept our token, reject legacy/markerless, reject a *different*
-  token, reject foreign), owner-file path-keying (no clobber), socket-path binding
-  in `csp_inside_tmux`, and delete-guard fresh/stale/no-file/unreadable-mtime
-  cases; the hook tests seed the path-keyed owner file. Each new assertion was
-  mutation-verified (disable the fix → the test fails). Test suite grew to 226.
+  persisted in an owner file keyed on an **injective hex** of the *resolved socket
+  path*, generated fresh when we create a server — not the socket name or a fixed
+  marker. So a foreign or legacy/markerless server is never mistaken for the
+  picker's, the hook never tags a window in it, and two servers on a same-named
+  socket at different paths keep distinct owner files (the earlier lossy `tr -c`
+  key could fold `/tmp/a/b` and `/tmp/a_b` together — fixed). The owner file is
+  written 0600 in a 0700 dir via a temp+rename (symlink-safe), and read back with
+  a bounded, shape-validated, symlink-refusing reader. The fresh path also closes
+  the check→create TOCTOU: after `new-session` it verifies ours is the only
+  session before stamping any global option, and removes just our session (leaving
+  a foreign server untouched) if not. `csp_delete_would_hit_live` grew a
+  transcript-mtime backstop AND an ownership-independent **residency** signal (the
+  hook records, in the picker's state dir, that a session lives in a tmux pane the
+  picker can't tag; delete blocks while that pane is open, self-clearing when it
+  closes). New/updated regression tests: token-based server-is-ours, injective
+  owner-file keying (+ collision guard), owner-file symlink/shape/permission
+  hardening, socket-path binding, the fresh-path TOCTOU bail, residency
+  block/self-clear (pane-closed, server-gone, and pane-less-but-server-live), and
+  delete-guard fresh/stale/no-file/unreadable-mtime. Each new assertion was
+  mutation-verified (disable the fix → the test fails). Test suite grew to 235.
 - New pure, unit-tested helpers in `lib/core.sh`: `csp_filter_indices`,
   `csp_next_attention`, `csp_count_attention`. A shared `csp_prompt_line` now
   backs both the delete confirmation and the filter query (one home for the

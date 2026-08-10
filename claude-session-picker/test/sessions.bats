@@ -616,6 +616,66 @@ _delete_guard() {  # $1 = id, $2 = file (optional)
   [ "$result" = "LIVE" ]
 }
 
+@test "delete-guard: a live RESIDENCY (session in an UNOWNED tmux pane) blocks deletion, idle-independent" {
+  command -v tmux >/dev/null 2>&1 || skip "tmux not installed"
+  mkdir -p "$CSP_STATE_DIR"
+  # The round-2 High finding: a bare session running in a legacy/foreign server we
+  # can't tag, idle at a prompt (stale mtime), with no @csp_sid tag and no
+  # "working" state. The hook records (socket,pane) in our state dir; the guard
+  # must block while that pane is open — regardless of ownership or idle time.
+  sock="csp-resid-$$"
+  tmux -L "$sock" new-session -d -s foreign -n w "sleep 30"
+  sockpath=$(tmux -L "$sock" display-message -p '#{socket_path}')
+  pane=$(tmux -L "$sock" display-message -p -t "=foreign:w" '#{pane_id}')
+  # Record residency by hand (as the hook would) — NO tag, NO state, stale/no file.
+  printf '%s\n%s\n' "$sockpath" "$pane" > "$CSP_STATE_DIR/resident/sess-resid" 2>/dev/null \
+    || { mkdir -p "$CSP_STATE_DIR/resident"; printf '%s\n%s\n' "$sockpath" "$pane" > "$CSP_STATE_DIR/resident/sess-resid"; }
+  result="$(_delete_guard sess-resid)"
+  tmux -L "$sock" kill-server 2>/dev/null || true
+  [ "$result" = "LIVE" ]
+}
+
+@test "delete-guard: a residency whose pane has CLOSED self-clears and becomes deletable" {
+  command -v tmux >/dev/null 2>&1 || skip "tmux not installed"
+  mkdir -p "$CSP_STATE_DIR/resident"
+  # Server is up but the recorded pane is gone (session ended) → positive dead
+  # signal: the guard clears the stale record and allows deletion.
+  sock="csp-resid2-$$"
+  tmux -L "$sock" new-session -d -s foreign -n w "sleep 30"
+  sockpath=$(tmux -L "$sock" display-message -p '#{socket_path}')
+  printf '%s\n%s\n' "$sockpath" "%9999" > "$CSP_STATE_DIR/resident/sess-gone"   # a pane id that doesn't exist
+  result="$(_delete_guard sess-gone)"
+  tmux -L "$sock" kill-server 2>/dev/null || true
+  [ "$result" = "NOTLIVE" ]
+  # The stale record was cleaned up by the probe.
+  [ ! -f "$CSP_STATE_DIR/resident/sess-gone" ]
+}
+
+@test "delete-guard: a residency with NO pane id but a live server still blocks (no reopened gap)" {
+  command -v tmux >/dev/null 2>&1 || skip "tmux not installed"
+  mkdir -p "$CSP_STATE_DIR/resident"
+  # If the hook had $TMUX but no $TMUX_PANE, only the socket is recorded (empty
+  # second line). As long as that server is reachable, the session is treated as
+  # live — we must NOT fall back to the mtime-only gap the High finding exploited.
+  sock="csp-resid3-$$"
+  tmux -L "$sock" new-session -d -s foreign -n w "sleep 30"
+  sockpath=$(tmux -L "$sock" display-message -p '#{socket_path}')
+  printf '%s\n\n' "$sockpath" > "$CSP_STATE_DIR/resident/sess-nopane"   # socket, empty pane
+  result="$(_delete_guard sess-nopane)"
+  tmux -L "$sock" kill-server 2>/dev/null || true
+  [ "$result" = "LIVE" ]
+}
+
+@test "delete-guard: a residency whose SERVER is gone self-clears and becomes deletable" {
+  command -v tmux >/dev/null 2>&1 || skip "tmux not installed"
+  mkdir -p "$CSP_STATE_DIR/resident"
+  # The socket path points at no live server at all → the session is gone. Allow
+  # deletion and clean the record. (Use a path with no server behind it.)
+  printf '%s\n%s\n' "$BATS_TEST_TMPDIR/no-such-tmux.sock" "%1" > "$CSP_STATE_DIR/resident/sess-dead"
+  [ "$(_delete_guard sess-dead)" = "NOTLIVE" ]
+  [ ! -f "$CSP_STATE_DIR/resident/sess-dead" ]
+}
+
 @test "delete-guard: a FRESH transcript (recent mtime) is live even with no tmux/process (fail closed)" {
   # The topology-independent backstop for the High data-loss finding: a live bare
   # session that the picker's tmux ownership no longer recognises still keeps

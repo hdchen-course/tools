@@ -1040,6 +1040,12 @@ CSP_LIVE_MTIME_WINDOW=60
 #   • a live `claude --resume <id>` process (csp_running_session_ids);
 #   • an OPEN tmux window tagged @csp_sid=<id> on OUR server (a bare `n` session
 #     the process scan can't see);
+#   • a live RESIDENCY record — the hook saw this session running in a tmux pane
+#     we don't own (a legacy server that survived an upgrade, or the user's own
+#     tmux) and recorded (socket,pane) in our state dir; a read-only probe says
+#     that pane is still open. Idle-INDEPENDENT and ownership-INDEPENDENT, so it
+#     closes the gap where an untagged bare session in an unrecognised server went
+#     deletable once the mtime window elapsed;
 #   • a hook state of "working"; and
 #   • THE FAIL-CLOSED BACKSTOP — FILE's mtime is within CSP_LIVE_MTIME_WINDOW.
 #     This is ownership- and topology-INDEPENDENT: it does not rely on the tmux
@@ -1050,14 +1056,14 @@ CSP_LIVE_MTIME_WINDOW=60
 #     deletable. If FILE exists but its mtime can't be read (stat coerces to 0),
 #     we ALSO block — an existing-but-unreadable file is exactly the "can't prove
 #     it's dead" case, so it fails closed rather than open.
-# RESIDUAL GAP (documented honestly, not a silent hole): a bare `n` session that
-# is idle at a prompt — Claude finished, so it isn't writing — has a stale mtime,
-# and if hooks are NOT installed it has no @csp_sid window tag and no "working"
-# state either, so after CSP_LIVE_MTIME_WINDOW it becomes deletable. Installing
-# the hooks closes this: the hook tags the window with @csp_sid the moment the
-# session runs, and that tag (signal 2) is idle-INDEPENDENT — it protects the
-# session no matter how long it sits at a prompt. The README's safety note spells
-# this out; --doctor warns when hooks aren't wired.
+# IDLE + HOOKS: a bare `n` session idle at a prompt isn't writing (stale mtime).
+# With the hooks installed it is still protected regardless of idle time, in EVERY
+# server topology: inside our own server by the @csp_sid window tag (signal 2);
+# inside a server we don't own (legacy-after-upgrade, or the user's own tmux) by
+# the residency signal above. Only with hooks NOT installed does an idle bare
+# session fall through to the mtime backstop alone and become deletable after
+# CSP_LIVE_MTIME_WINDOW — the README safety note says so and --doctor warns when
+# hooks aren't wired.
 # We still don't block on a lone stale "waiting" state (crashed/abandoned) — the
 # mtime backstop, not the state, is what distinguishes live from dead now.
 # Evaluated at call time (fresh scans + fresh stat).
@@ -1065,6 +1071,11 @@ csp_delete_would_hit_live() {
   local id="$1" file="${2:-}" state now mtime
   csp_is_live "$id" "$(csp_running_session_ids)" && return 0
   [ -n "$(csp_tmux_window_for_sid "$id")" ] && return 0
+  # Ownership-independent residency: a hooked session living in a tmux pane we
+  # don't own (legacy server after an upgrade, or the user's own tmux) is still
+  # live. The hook recorded (socket,pane); block while that pane is open. This is
+  # idle-independent, unlike the mtime backstop below.
+  csp_residency_is_live "$id" && return 0
   state=$(csp_read_state "$id")
   [ "$state" = "working" ] && return 0
   # Fail-closed mtime backstop: block if the transcript was written to within the
@@ -1132,8 +1143,9 @@ csp_action_delete() {
       return 0
     fi
     if csp_delete_session_file "$file"; then
-      # Forget any recorded ●/✳ state for the now-deleted session (no residue).
+      # Forget any recorded ●/✳ state and residency for the now-deleted session.
       csp_clear_state "$(csp_session_id_from_path "$file")"
+      csp_clear_residency "$(csp_session_id_from_path "$file")"
     else
       # Deleting is a "doing" action, so a failure is surfaced, not swallowed:
       # a permission error, read-only filesystem, or a lost race must not look

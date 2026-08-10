@@ -115,10 +115,10 @@ csp_state_count() {
   tok="csp-hooktag-token-$$"
   tmux -L "$sock" new-session -d -s "$sess" -n w
   tmux -L "$sock" set-option -g @csp_owner "$tok"
-  # Use $() to strip display-message's trailing newline BEFORE tr, exactly as
-  # csp_tmux_owner_file does (piping raw would turn the newline into a stray '_').
+  # The owner file is keyed on an injective HEX of the resolved socket path (same
+  # encoding csp_tmux_owner_file uses). Use $() to strip the trailing newline.
   sockpath=$(tmux -L "$sock" display-message -p '#{socket_path}')
-  ownerkey=$(printf '%s' "$sockpath" | tr -c 'A-Za-z0-9._-' '_')
+  ownerkey=$(printf '%s' "$sockpath" | od -An -tx1 | tr -d ' \n')
   printf '%s\n' "$tok" > "$sd/tmux-owner.$ownerkey"
   sleep 0.5
   tmux -L "$sock" send-keys -t "=$sess:w" \
@@ -154,7 +154,41 @@ csp_state_count() {
   [ "$output" = "working" ]
   # ...but the foreign window carries NO @csp_sid option.
   run tmux -L "$sock" show-options -w -t "=$sess:w" @csp_sid
-  tmux -L "$sock" kill-server 2>/dev/null || true
   case "$output" in *nope-99*) polluted=1 ;; *) polluted=0 ;; esac
   [ "$polluted" = "0" ]
+  # AND — the High-finding fix — the hook DID record an ownership-independent
+  # residency marker in OUR OWN state dir (from its read-only $TMUX/$TMUX_PANE),
+  # so the delete guard can protect this live-but-untaggable session. The recorded
+  # socket path must be this server's.
+  sockpath=$(tmux -L "$sock" display-message -p '#{socket_path}')
+  run env CSP_STATE_DIR="$sd" bash -c '. "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/sessions.sh"; csp_read_residency nope-99'
+  tmux -L "$sock" kill-server 2>/dev/null || true
+  [ -n "$output" ]
+  case "$output" in *"$sockpath"*) rec_ok=1 ;; *) rec_ok=0 ;; esac
+  [ "$rec_ok" = "1" ]
+}
+
+@test "hook: inside OUR own tmux, does NOT leave a residency record (tag covers it)" {
+  command -v tmux >/dev/null 2>&1 || skip "tmux not installed"
+  # Case (a): our own server. The @csp_sid tag protects the session, so no
+  # residency record should linger — and if a stale one existed it's cleared.
+  sock="csp-ownres-$$"; sess="claude-sessions"
+  sd="$BATS_TEST_TMPDIR/ownres-state"; mkdir -p "$sd/resident"
+  tok="csp-ownres-token-$$"
+  tmux -L "$sock" new-session -d -s "$sess" -n w
+  tmux -L "$sock" set-option -g @csp_owner "$tok"
+  sockpath=$(tmux -L "$sock" display-message -p '#{socket_path}')
+  ownerkey=$(printf '%s' "$sockpath" | od -An -tx1 | tr -d ' \n')
+  printf '%s\n' "$tok" > "$sd/tmux-owner.$ownerkey"
+  # Pre-plant a stale residency record for this id to prove the hook clears it.
+  printf '%s\n%s\n' "$sockpath" "%99" > "$sd/resident/own-tag-1"
+  sleep 0.5
+  tmux -L "$sock" send-keys -t "=$sess:w" \
+    "export CSP_TMUX_SOCKET='$sock' CSP_TMUX_SESSION='$sess' CSP_STATE_DIR='$sd'; printf '{\"session_id\":\"own-tag-1\"}' | '$HOOK' working; echo done > '$sd/flag'" Enter
+  local i; for i in $(seq 1 40); do [ -f "$sd/flag" ] && break; sleep 0.25; done
+  run tmux -L "$sock" show-options -w -t "=$sess:w" @csp_sid
+  tmux -L "$sock" kill-server 2>/dev/null || true
+  case "$output" in *own-tag-1*) tagged=1 ;; *) tagged=0 ;; esac
+  [ "$tagged" = "1" ]                       # window WAS tagged (our server)
+  [ ! -f "$sd/resident/own-tag-1" ]         # and the stale residency was cleared
 }
