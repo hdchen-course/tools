@@ -368,8 +368,16 @@ Nothing in the suite launches the real `claude` or touches your real `~/.claude`
   *read* `~/.claude` — none of them writes or deletes anything there. The one
   exception is the explicit **delete** action (`d`/`x`), which permanently
   removes the selected session's transcript **after you confirm**; it never
-  touches anything else, and never a session that is currently running.
-  Uninstalling leaves all your sessions untouched.
+  touches anything else. Delete **fails closed**: it refuses whenever it can't
+  prove a session is dead — a live `claude --resume` process, an open tmux window
+  for the session, a `working` hook state, or a transcript file that was written
+  to within the last minute all block it. One case needs the **hooks** to be
+  fully covered: a session started with `n` that then sits idle at a prompt (so
+  it isn't writing its transcript). With the hooks installed, that session's tmux
+  window is tagged and stays protected no matter how long it idles; without them,
+  a bare idle `n` session can become deletable after a minute of no writes.
+  Installing the hooks (below) is recommended for exactly this reason; `--doctor`
+  tells you whether they're wired. Uninstalling leaves all your sessions untouched.
 - **Your terminal is always restored** — the cursor and your `stty` settings are
   put back on every exit path (normal quit, `Ctrl-C`, `TERM`, or an unexpected
   error), via a trap installed *before* the terminal is ever put into raw mode.

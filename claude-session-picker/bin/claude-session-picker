@@ -1024,29 +1024,57 @@ csp_filter_prompt() {
   csp_retally_attention   # the visible set changed → refresh the urgency count
 }
 
-# csp_delete_would_hit_live ID — return 0 (true) if deleting session ID right now
-# would clobber a session that is actively in use. THREE signals so a bare
-# session started with `n` (no `claude --resume <id>` to match) is still caught:
+# How recently a transcript must have been written to count as "a live Claude is
+# using it" for the delete guard's fail-closed backstop (see below). Claude Code
+# appends to the .jsonl on every turn/tool step, so a session in active use has a
+# very fresh mtime; a crashed/abandoned one goes stale within seconds. 60s is a
+# comfortable margin over normal think/stream gaps without keeping a truly dead
+# session undeletable for long.
+CSP_LIVE_MTIME_WINDOW=60
+
+# csp_delete_would_hit_live ID [FILE] — return 0 (true) if deleting session ID
+# right now would clobber a session that is actively in use. It FAILS CLOSED:
+# when we cannot positively prove a session is dead, we treat it as live and
+# refuse, because deleting a live transcript is unrecoverable while refusing a
+# dead one is merely a minor annoyance. Signals, any of which blocks:
 #   • a live `claude --resume <id>` process (csp_running_session_ids);
-#   • an OPEN tmux window on our holding session tagged @csp_sid=<id> — this is
-#     the authoritative "a Claude has this transcript open" signal for a bare
-#     session: the window exists whether that Claude is mid-turn ("working") or
-#     waiting for input ("waiting"), so we block deletion in BOTH cases as long
-#     as the window is alive; and
-#   • a hook state of "working" — covers the case where the hook is installed but
-#     we're not running as the resident tmux menu (so there's no window to see).
-# We still do NOT block on a lone "waiting" hook state (no live window, no
-# process): that is exactly the crashed/stale case the reconciler shows as ✳,
-# and blocking it would make a dead session permanently undeletable. The tmux
-# window is what distinguishes a *live* waiting session (has a window → blocked)
-# from a *crashed* one (window gone → deletable).
-# Evaluated at call time (fresh process scan + fresh tmux query + fresh state).
+#   • an OPEN tmux window tagged @csp_sid=<id> on OUR server (a bare `n` session
+#     the process scan can't see);
+#   • a hook state of "working"; and
+#   • THE FAIL-CLOSED BACKSTOP — FILE's mtime is within CSP_LIVE_MTIME_WINDOW.
+#     This is ownership- and topology-INDEPENDENT: it does not rely on the tmux
+#     server being recognised as ours (which the earlier signals do), so it still
+#     protects a live bare session even when the holding server is a legacy one
+#     whose menu window crashed, or is otherwise unrecognisable. A live Claude is
+#     writing that file continuously; a crashed one's mtime is stale, so it stays
+#     deletable. If FILE exists but its mtime can't be read (stat coerces to 0),
+#     we ALSO block — an existing-but-unreadable file is exactly the "can't prove
+#     it's dead" case, so it fails closed rather than open.
+# RESIDUAL GAP (documented honestly, not a silent hole): a bare `n` session that
+# is idle at a prompt — Claude finished, so it isn't writing — has a stale mtime,
+# and if hooks are NOT installed it has no @csp_sid window tag and no "working"
+# state either, so after CSP_LIVE_MTIME_WINDOW it becomes deletable. Installing
+# the hooks closes this: the hook tags the window with @csp_sid the moment the
+# session runs, and that tag (signal 2) is idle-INDEPENDENT — it protects the
+# session no matter how long it sits at a prompt. The README's safety note spells
+# this out; --doctor warns when hooks aren't wired.
+# We still don't block on a lone stale "waiting" state (crashed/abandoned) — the
+# mtime backstop, not the state, is what distinguishes live from dead now.
+# Evaluated at call time (fresh scans + fresh stat).
 csp_delete_would_hit_live() {
-  local id="$1" state
+  local id="$1" file="${2:-}" state now mtime
   csp_is_live "$id" "$(csp_running_session_ids)" && return 0
   [ -n "$(csp_tmux_window_for_sid "$id")" ] && return 0
   state=$(csp_read_state "$id")
   [ "$state" = "working" ] && return 0
+  # Fail-closed mtime backstop: block if the transcript was written to within the
+  # window, OR if it exists but its mtime is unreadable (0 → can't prove dead).
+  if [ -n "$file" ] && [ -f "$file" ]; then
+    now=$(csp_now_epoch)
+    mtime=$(csp_file_mtime "$file")
+    [ "$mtime" -eq 0 ] && return 0
+    [ "$(( now - mtime ))" -lt "$CSP_LIVE_MTIME_WINDOW" ] && return 0
+  fi
   return 1
 }
 
@@ -1081,11 +1109,12 @@ csp_action_delete() {
   # from the last load: a session could have been resumed (by us in tmux, or by
   # another terminal) since then, and deleting a live session's transcript
   # mid-run is exactly what we promise not to do. csp_delete_would_hit_live does
-  # the fresh check via its three signals — a live `claude --resume <id>`
-  # process, an open tmux window tagged with this id, or the hook "working"
-  # state — which together also catch a bare session started with `n` (see its
-  # own comment for the full rationale). We re-run it after the confirmation too.
-  if csp_delete_would_hit_live "$id"; then
+  # the fresh check via its signals — a live `claude --resume <id>` process, an
+  # open tmux window tagged with this id, the hook "working" state, or the
+  # ownership-independent transcript-mtime backstop — and fails closed. We pass
+  # the transcript path so the mtime backstop can run, and re-run it after the
+  # confirmation too.
+  if csp_delete_would_hit_live "$id" "$file"; then
     csp_pause_notice "$(csp_delete_busy_notice "$id" "$title")"
     return 0
   fi
@@ -1097,7 +1126,7 @@ csp_action_delete() {
     # check-then-act pair; a resume that races between this check and the unlink
     # itself is a residual we accept (fully closing it needs a per-session lock
     # shared with resume — noted as a follow-up). Abort with a notice if now live.
-    if csp_delete_would_hit_live "$id"; then
+    if csp_delete_would_hit_live "$id" "$file"; then
       csp_pause_notice "$(printf '\n"%s" was just resumed — not deleting a running session.\nQuit that Claude first, then delete. Press Enter to continue…' "$title")"
       csp_load_sessions
       return 0

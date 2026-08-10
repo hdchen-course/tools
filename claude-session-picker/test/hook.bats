@@ -104,12 +104,22 @@ csp_state_count() {
   sock="csp-hooktag-$$"; sess="claude-sessions"
   sd="$BATS_TEST_TMPDIR/hooktag-state"; mkdir -p "$sd"
   # The window runs an interactive shell (so $TMUX is set) and we export
-  # CSP_TMUX_SOCKET + CSP_TMUX_SESSION to THIS server/session. We also stamp the
-  # @csp_owner marker (as csp_tmux_configure_home would), so csp_inside_tmux
-  # recognises it as OUR tmux (right socket, right session, marker present) and
-  # the hook tags the window. A flag file marks completion.
+  # CSP_TMUX_SOCKET + CSP_TMUX_SESSION + CSP_STATE_DIR to THIS server/session. We
+  # seed the per-instance ownership token in the owner file AND stamp the SAME
+  # value as @csp_owner (as csp_tmux_enter's fresh path + configure_home would),
+  # so csp_inside_tmux recognises it as OUR tmux (right socket, right session,
+  # token matches) and the hook tags the window. A flag file marks completion.
+  # The owner file is keyed on the RESOLVED socket PATH, so create the server
+  # first, then write the token to the path-keyed file (same tr-sanitize the
+  # helper uses).
+  tok="csp-hooktag-token-$$"
   tmux -L "$sock" new-session -d -s "$sess" -n w
-  tmux -L "$sock" set-option -g @csp_owner "claude-session-picker"
+  tmux -L "$sock" set-option -g @csp_owner "$tok"
+  # Use $() to strip display-message's trailing newline BEFORE tr, exactly as
+  # csp_tmux_owner_file does (piping raw would turn the newline into a stray '_').
+  sockpath=$(tmux -L "$sock" display-message -p '#{socket_path}')
+  ownerkey=$(printf '%s' "$sockpath" | tr -c 'A-Za-z0-9._-' '_')
+  printf '%s\n' "$tok" > "$sd/tmux-owner.$ownerkey"
   sleep 0.5
   tmux -L "$sock" send-keys -t "=$sess:w" \
     "export CSP_TMUX_SOCKET='$sock' CSP_TMUX_SESSION='$sess' CSP_STATE_DIR='$sd'; printf '{\"session_id\":\"tag-me-77\"}' | '$HOOK' working; echo done > '$sd/flag'" Enter
@@ -124,15 +134,16 @@ csp_state_count() {
   command -v tmux >/dev/null 2>&1 || skip "tmux not installed"
   # The strongest pollution case the review caught: the user's own tmux happens
   # to use a socket whose NAME equals our CSP_TMUX_SOCKET, but it's a different
-  # server that never got our @csp_owner marker. csp_inside_tmux must still say
-  # "not ours" (marker absent), so the hook leaves the window's options alone.
+  # server for which no per-instance token was ever established. csp_inside_tmux
+  # must still say "not ours" (no owner file / no matching token), so the hook
+  # leaves the window's options alone.
   sock="csp-foreign-$$"; sess="claude-sessions"
   sd="$BATS_TEST_TMPDIR/foreign-state"; mkdir -p "$sd"
-  # Same socket name AND same session name as ours, WITHOUT a menu window and
-  # WITHOUT the @csp_owner marker — a foreign server that only coincides in
-  # naming. Both the marker check and the legacy structural check (no menu
-  # window) fail, so it must be judged not ours.
-  tmux -L "$sock" new-session -d -s "$sess" -n w      # no @csp_owner, no menu window
+  # Same socket name AND same session name as ours, but NO owner file exists for
+  # this socket under CSP_STATE_DIR (so csp_tmux_owner_token is empty) — a foreign
+  # server that only coincides in naming. An empty token can never match, so it
+  # must be judged not ours even if it wore a menu window.
+  tmux -L "$sock" new-session -d -s "$sess" -n w      # no owner token, no menu window
   sleep 0.5
   tmux -L "$sock" send-keys -t "=$sess:w" \
     "export CSP_TMUX_SOCKET='$sock' CSP_TMUX_SESSION='$sess' CSP_STATE_DIR='$sd'; printf '{\"session_id\":\"nope-99\"}' | '$HOOK' working; echo done > '$sd/flag'" Enter

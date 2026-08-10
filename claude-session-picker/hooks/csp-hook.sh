@@ -92,12 +92,13 @@ csp_write_state "$id" "$state"
 # recognise — so a later Enter switches to this window instead of opening a
 # second copy, and lets the delete guard treat it as in-use.
 #
-# We gate on csp_inside_tmux (true only when $TMUX's socket basename is ours AND
-# the server carries our @csp_owner marker) so we NEVER touch a window in the
-# user's own, unrelated tmux — even one whose socket happens to share the
-# basename — where writing a @csp_sid option would pollute their session and
-# could clobber a same-named user option. Inside our own server the ambient $TMUX
-# targets exactly this window, so no -t guessing is needed. Best-effort, silent.
+# We gate on csp_inside_tmux (true only when the ambient server's RESOLVED socket
+# path matches ours, we're in our holding session, AND its @csp_owner equals our
+# persisted per-instance token) so we NEVER touch a window in the user's own,
+# unrelated tmux — even one whose socket happens to share the name — where writing
+# a @csp_sid option would pollute their session and could clobber a same-named
+# user option. Inside our own server the ambient $TMUX targets exactly this
+# window, so no -t guessing is needed. Best-effort, silent.
 if command -v tmux >/dev/null 2>&1 \
    && command -v csp_inside_tmux >/dev/null 2>&1 && csp_inside_tmux; then
   tmux set-option -w '@csp_sid' "$id" >/dev/null 2>&1 || true

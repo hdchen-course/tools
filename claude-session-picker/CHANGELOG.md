@@ -32,12 +32,19 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   without the picker taking on a fuzzy-finder dependency.
 
 ### Fixed
-- **Delete never removes a session that's in use, checked twice.** Liveness is
-  re-evaluated at delete time and again after you confirm (closing a stale-
-  snapshot gap), and it now also honours the hook `working` state — so a bare
-  session started with `n` (which has no `claude --resume <id>` to detect) is
-  protected too. The refusal message says whether it's actually running or just
-  marked busy, and how to clear a stale flag.
+- **Delete fails closed — it refuses whenever it can't prove a session is dead.**
+  Liveness is re-evaluated at delete time and again after you confirm (closing a
+  stale-snapshot gap), and it now blocks on any of: a live `claude --resume`
+  process, an open tmux window for the session, the hook `working` state, OR — the
+  backstop — a transcript that was written to within the last minute (a live
+  Claude keeps appending to its `.jsonl`). This backstop is ownership- and
+  topology-independent, so a live bare session started with `n` is protected even
+  when its tmux server isn't recognised as the picker's. An existing file whose
+  mtime can't be read is also treated as live. The one residual gap — a bare `n`
+  session left idle at a prompt with the hooks *not* installed — is closed by
+  installing the hooks (the window tag protects it regardless of idle time); the
+  README safety note and `--doctor` call this out. The refusal message says
+  whether it's actually running or just marked busy, and how to clear a stale flag.
 - **`n` sessions become dedupable.** With hooks installed, the hook tags its tmux
   window with the session id, so a later `Enter` on that session switches to the
   existing window instead of starting a second copy over the same transcript.
@@ -62,16 +69,22 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
 - **tmux: no duplicate concurrent resume.** Opening a session that already has a
   window switches to it instead of launching a second `claude --resume` over the
   same transcript. Each session window is tagged with its id (`@csp_sid`).
-- **tmux ownership is verified before we touch a server, and survives an
-  upgrade.** A server is treated as the picker's only if it carries our
-  `@csp_owner` marker OR is structurally ours (our holding session with a `menu`
-  window). This (a) recognises a server created by an *older* build that predates
-  the marker — so an in-place upgrade keeps tagging windows and guarding deletes;
-  (b) refuses to configure/claim a *foreign* tmux that merely shares the socket
-  name — we never mutate a user's server; and (c) on a fresh server sets the
-  marker on a bootstrap window *before* launching the picker, closing a startup
-  race where the picker could see itself as "not inside our tmux". `csp_inside_tmux`
-  also now requires the ambient session to be ours, not just the socket name.
+- **tmux ownership uses a per-instance identity bound to the actual socket, not a
+  name or window shape.** A server is treated as the picker's only if its
+  server-global `@csp_owner` equals an unguessable random token we generated and
+  persisted for that server (in an owner file keyed on the *resolved socket
+  path*). This replaces the earlier "socket name + a `menu` window" heuristic,
+  which could both false-positive (a user's tmux that happens to share the name
+  and have a `menu` window) and false-negative (our own server whose `menu` window
+  had crashed). Now: (a) a *foreign* or legacy/markerless server is never
+  configured, claimed, or tagged — we fall back to hub; (b) two picker instances
+  on the same socket name at *different* paths get distinct owner files and can't
+  clobber each other's token; and (c) on a fresh server the token is minted and
+  stamped on a bootstrap window *before* the picker launches, so `csp_inside_tmux`
+  is true immediately. `csp_inside_tmux` also binds the ambient `$TMUX` socket
+  path to the one our `tmux -L` resolves to, so a same-named socket at a different
+  path is never mistaken for ours. Data safety no longer depends on this
+  recognition at all — the delete backstop above is topology-independent.
 - **tmux: quitting is consistent after toggling to hub.** `q` now decides
   detach-vs-exit from whether you're physically inside the tmux menu, not the
   logical backend — so toggling to hub (`t`) while still in the menu no longer
@@ -125,14 +138,20 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   recovery, plus a status-bar right-block boundary (CSP_INNER-exact) case, an
   open-tmux-window delete guard, a delete confirm-race action test, installer
   control-char JSON validity, and an unrelated-tmux hook-isolation test.
-- tmux ownership is proven by a server-global `@csp_owner` marker, not just the
-  socket name — so a user's unrelated tmux whose socket happens to share the
-  basename (a different path) is never mistaken for the picker's, and the hook
-  never tags a window in it. Added same-basename-different-path and
-  real-tagged-window regression tests, plus a parameterized 0x01–0x1F JSON
-  round-trip, plus tmux ownership tests (marked server, legacy markerless server,
-  foreign-server refusal on BOTH the existing-session and fresh paths, and
-  no-foreign-mutation). Test suite grew to 220.
+- tmux ownership is a per-instance random token (server-global `@csp_owner`)
+  persisted in an owner file keyed on the *resolved socket path*, generated fresh
+  when we create a server — not the socket name or a fixed marker. So a foreign or
+  legacy/markerless server is never mistaken for the picker's, the hook never tags
+  a window in it, and two instances on a same-named socket at different paths keep
+  distinct owner files (no token clobber). `csp_delete_would_hit_live` grew a
+  transcript-mtime backstop (block if written within `CSP_LIVE_MTIME_WINDOW`, or
+  if an existing file's mtime is unreadable) making delete fail closed
+  independently of tmux ownership. New/updated regression tests: token-based
+  server-is-ours (accept our token, reject legacy/markerless, reject a *different*
+  token, reject foreign), owner-file path-keying (no clobber), socket-path binding
+  in `csp_inside_tmux`, and delete-guard fresh/stale/no-file/unreadable-mtime
+  cases; the hook tests seed the path-keyed owner file. Each new assertion was
+  mutation-verified (disable the fix → the test fails). Test suite grew to 226.
 - New pure, unit-tested helpers in `lib/core.sh`: `csp_filter_indices`,
   `csp_next_attention`, `csp_count_attention`. A shared `csp_prompt_line` now
   backs both the delete confirmation and the filter query (one home for the

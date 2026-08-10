@@ -18,6 +18,9 @@ setup() {
   # NEVER touch the user's real tmux server.
   export CSP_TMUX_SOCKET="csp-test-$$-${BATS_TEST_NUMBER:-0}"
   export CSP_TMUX_SESSION="csptest"
+  # Ownership tokens (and the ●/✳ state) live under here. Isolate per test so a
+  # token from one never leaks into another, and so we never touch the real one.
+  export CSP_STATE_DIR="$BATS_TEST_TMPDIR/state"
   # A fake claude on PATH so opening a session never launches the real one.
   FAKEBIN="$BATS_TEST_TMPDIR/bin"; mkdir -p "$FAKEBIN"
   printf '#!/bin/sh\nsleep 60\n' > "$FAKEBIN/claude"; chmod +x "$FAKEBIN/claude"
@@ -33,7 +36,13 @@ teardown() {
 # would, then configure it. We use a plain sleep for window 0 so we don't need
 # an interactive picker in these tests.
 make_home() {
+  # Match csp_tmux_enter's fresh-path ORDER: create the server first (so the owner
+  # file — keyed on the resolved socket PATH — lands under this server's key), THEN
+  # mint+persist the token, THEN configure_home stamps it as @csp_owner. Minting
+  # before the server exists would key the file on the socket NAME and leave
+  # configure_home stamping an empty owner, so server_is_ours would reject us.
   csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu "sleep 60"
+  csp_tmux_new_owner_token >/dev/null
   csp_tmux_configure_home
 }
 
@@ -147,10 +156,10 @@ make_home() {
   [ "$output" = "session" ]
 }
 
-@test "inside-tmux: OUR configured server (has the @csp_owner marker) is recognised" {
-  make_home    # creates the holding session AND runs csp_tmux_configure_home (sets @csp_owner)
-  # $TMUX points at our real socket path; the server carries the marker, so
-  # csp_inside_tmux (which queries the ambient server) returns true.
+@test "inside-tmux: OUR configured server (carries our per-instance token) is recognised" {
+  make_home    # mints the token, creates the holding session, stamps @csp_owner=token
+  # $TMUX points at our real socket path; the server's @csp_owner equals our
+  # persisted token, so csp_inside_tmux (which queries the ambient server) is true.
   sockpath=$(command tmux -L "$CSP_TMUX_SOCKET" display-message -p '#{socket_path}' 2>/dev/null)
   [ -n "$sockpath" ]
   TMUX="$sockpath,1,0" run csp_inside_tmux
@@ -163,14 +172,14 @@ make_home() {
   [ "$status" -ne 0 ]
 }
 
-@test "inside-tmux: a same-BASENAME socket at a different path is NOT ours (marker check)" {
+@test "inside-tmux: a same-BASENAME socket at a different path is NOT ours (path binding)" {
   # The regression the review caught: a user's unrelated tmux whose socket has
   # the same basename ("claude-sessions") but a different path must NOT be
-  # treated as ours — because it lacks our @csp_owner marker. A basename-only
-  # check would wrongly accept it (and the hook would then tag its window).
-  make_home    # our server exists with the marker, at ITS real path
-  # A fake TMUX with the same basename but a bogus/foreign path: the ambient
-  # server it names either doesn't exist or isn't ours → no marker → not ours.
+  # treated as ours. csp_inside_tmux binds the ambient socket path to the one our
+  # `tmux -L` resolves to, so a mismatching path fails before the token check.
+  make_home    # our server exists, at ITS real path, carrying our token
+  # A fake TMUX with the same basename but a bogus/foreign path: its socket path
+  # won't equal our -L resolved path → not ours.
   TMUX="/tmp/some-other-place/$CSP_TMUX_SOCKET,1,0" run csp_inside_tmux
   [ "$status" -ne 0 ]
 }
@@ -221,15 +230,50 @@ make_home() {
   [ "$status" -eq 0 ]
 }
 
-@test "ownership: server_is_ours accepts a LEGACY markerless server (upgrade path)" {
-  # Simulate a server created by an OLDER build: our holding session with a menu
-  # window, but NO @csp_owner (never set). It must still be recognised as ours so
-  # the hook keeps tagging and the delete guard's window signal keeps working
-  # across an in-place upgrade.
+@test "ownership: the owner file is keyed on the resolved socket PATH, not the bare name (no clobber)" {
+  # The review's Finding 2: keying the owner file on socket NAME alone let a second
+  # instance on the SAME name but a DIFFERENT TMUX_TMPDIR (a distinct live server at
+  # a different socket PATH) clobber the first's token, orphaning the first live
+  # server's own recognition. The fix keys the file on the resolved socket path, so
+  # two servers at different paths land in different files. We assert the property
+  # directly: with a live server, the owner filename embeds the sanitised socket
+  # PATH (which is unique per server), NOT just the socket name.
+  make_home
+  path=$(command tmux -L "$CSP_TMUX_SOCKET" display-message -p '#{socket_path}')
+  [ -n "$path" ]
+  pathkey=$(printf '%s' "$path" | tr -c 'A-Za-z0-9._-' '_')
+  file=$(csp_tmux_owner_file)
+  # The file is keyed on the full path (unique per server), not the socket name —
+  # so a same-named server at a different path can never resolve to this same file.
+  [ "$file" = "$CSP_STATE_DIR/tmux-owner.$pathkey" ]
+  case "$file" in *"$pathkey"*) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
+}
+
+@test "ownership: server_is_ours REJECTS a legacy/markerless server (no per-instance token)" {
+  # A server created by an OLDER build (or any server we didn't mint a token for):
+  # our holding session with a menu window, but NO @csp_owner. Under the identity
+  # redesign this is NOT adopted — name+window-shape is deliberately insufficient,
+  # because a foreign server can wear exactly that shape. We refuse and fall back
+  # to hub; data safety still holds via the delete guard's mtime backstop, so a
+  # live bare session in such a server is never wrongly deleted.
   csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu "sleep 60"   # no configure_home
   [ -z "$(csp_tmux show-options -gv @csp_owner 2>/dev/null)" ]        # confirm markerless
-  run csp_tmux_server_is_ours                                        # still ours by structure
-  [ "$status" -eq 0 ]
+  [ ! -f "$(csp_tmux_owner_file)" ]                                   # and no token established
+  run csp_tmux_server_is_ours
+  [ "$status" -ne 0 ]
+}
+
+@test "ownership: server_is_ours REJECTS a server whose @csp_owner is a DIFFERENT token" {
+  # The false-positive case the redesign closes: a server that carries SOME
+  # @csp_owner value that isn't OUR persisted token (a different picker instance,
+  # or a forged marker). The old fixed-string marker would have accepted any
+  # server stamped "claude-session-picker"; the per-instance token must not.
+  csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu "sleep 60"
+  csp_tmux_new_owner_token >/dev/null                          # our token (keyed on live path)
+  csp_tmux set-option -g @csp_owner "csp-some-other-instance"  # a foreign/forged token
+  run csp_tmux_server_is_ours
+  [ "$status" -ne 0 ]
 }
 
 @test "ownership: server_is_ours REJECTS a foreign server on the same socket" {
@@ -339,9 +383,9 @@ make_home() {
   run cat "$BATS_TEST_TMPDIR/sock"
   [ "$output" = "abcd" ]
   # And csp_inside_tmux parses the sanitized socket basename without breaking
-  # (no crash / no error) — it returns non-zero here because there's no real
-  # server carrying our @csp_owner marker, which is the correct "not ours"
-  # answer for a synthetic $TMUX.
+  # (no crash / no error) — it returns non-zero here because the synthetic $TMUX
+  # names no live server bound to our socket and no per-instance token matches,
+  # which is the correct "not ours" answer.
   run env CSP_TMUX_SOCKET=abcd TMUX="/private/tmp/tmux-0/abcd,1,0" bash -c '
     . '"$BATS_TEST_DIRNAME"'/../lib/core.sh
     . '"$BATS_TEST_DIRNAME"'/../lib/backend.sh

@@ -573,17 +573,19 @@ EOF
 }
 
 # csp_delete_would_hit_live lives in bin/ (wiring), so source that with the main
-# loop suppressed. Its THREE signals: a live --resume process, an open tmux
-# window tagged @csp_sid=<id> on our socket, or hook state "working". A lone
-# "waiting" hook state with NO live window/process stays deletable (that's the
-# crashed/idle case). We pass CSP_TMUX_SOCKET so the tmux query targets a
-# throwaway socket, never the user's real tmux.
-_delete_guard() {  # $1 = id
+# loop suppressed. Its signals: a live --resume process, an open tmux window
+# tagged @csp_sid=<id> on our socket, hook state "working", OR — the fail-closed
+# backstop — a transcript FILE whose mtime is within CSP_LIVE_MTIME_WINDOW (a
+# live Claude keeps writing its .jsonl). A lone "waiting" hook state with NO live
+# window/process AND a stale/absent file stays deletable (the crashed/idle case).
+# We pass CSP_TMUX_SOCKET so the tmux query targets a throwaway socket, never the
+# user's real tmux. $2 (optional) is the transcript file passed to the guard.
+_delete_guard() {  # $1 = id, $2 = file (optional)
   CSP_SOURCED_FOR_TEST=1 CSP_STATE_DIR="$CSP_STATE_DIR" \
   CSP_TMUX_SOCKET="${CSP_TMUX_SOCKET:-csp-dg-$$}" CSP_TMUX_SESSION="${CSP_TMUX_SESSION:-csptest}" \
   bash -c '
     . "'"$BATS_TEST_DIRNAME"'/../bin/claude-session-picker"
-    csp_delete_would_hit_live "'"$1"'" && echo LIVE || echo NOTLIVE'
+    csp_delete_would_hit_live "'"$1"'" "'"${2:-}"'" && echo LIVE || echo NOTLIVE'
 }
 
 @test "delete-guard: a session the hook marks 'working' is treated as live" {
@@ -611,6 +613,50 @@ _delete_guard() {  # $1 = id
   tmux -L "$CSP_TMUX_SOCKET" set-option -w -t "=$CSP_TMUX_SESSION:work" '@csp_sid' "sess-barewin"
   result="$(_delete_guard sess-barewin)"
   tmux -L "$CSP_TMUX_SOCKET" kill-server 2>/dev/null || true
+  [ "$result" = "LIVE" ]
+}
+
+@test "delete-guard: a FRESH transcript (recent mtime) is live even with no tmux/process (fail closed)" {
+  # The topology-independent backstop for the High data-loss finding: a live bare
+  # session that the picker's tmux ownership no longer recognises still keeps
+  # writing its .jsonl. A file touched now is within CSP_LIVE_MTIME_WINDOW, so the
+  # guard must refuse deletion even though there's NO tmux window and NO process.
+  mkdir -p "$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha"
+  fresh="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-fresh.jsonl"
+  printf '%s\n' '{"type":"user"}' > "$fresh"   # just written → recent mtime
+  [ "$(_delete_guard id-fresh "$fresh")" = "LIVE" ]
+}
+
+@test "delete-guard: a STALE transcript (old mtime) with no window/process is deletable" {
+  # The other side of the backstop: a crashed/finished session's .jsonl goes
+  # stale. With an mtime well past CSP_LIVE_MTIME_WINDOW and no live signal, it
+  # must remain deletable — the backstop must not pin every old session forever.
+  mkdir -p "$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha"
+  stale="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-stale.jsonl"
+  printf '%s\n' '{"type":"user"}' > "$stale"
+  touch -t 200001010000 "$stale"   # year 2000 → far outside the live window
+  [ "$(_delete_guard id-stale "$stale")" = "NOTLIVE" ]
+}
+
+@test "delete-guard: mtime backstop is skipped when no file is passed (back-compat)" {
+  # Callers that don't pass a file (older call sites / --list style) must not be
+  # broken: with no file arg and no other live signal, the guard says deletable.
+  [ "$(_delete_guard id-nofile)" = "NOTLIVE" ]
+}
+
+@test "delete-guard: an existing file whose mtime is UNREADABLE (0) fails closed (live)" {
+  # csp_file_mtime coerces an unreadable/non-numeric stat to 0. An existing file we
+  # can't stat is the textbook "can't prove it's dead" case, so the guard must
+  # block (treat as live) rather than let now-0 look like a huge, deletable age.
+  mkdir -p "$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha"
+  f="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-nomtime.jsonl"
+  printf '%s\n' '{"type":"user"}' > "$f"
+  # Force the mtime read to 0 by stubbing csp_file_mtime in the sourced context.
+  result=$(CSP_SOURCED_FOR_TEST=1 CSP_STATE_DIR="$CSP_STATE_DIR" \
+    CSP_TMUX_SOCKET="csp-nm-$$" CSP_TMUX_SESSION="csptest" bash -c '
+      . "'"$BATS_TEST_DIRNAME"'/../bin/claude-session-picker"
+      csp_file_mtime() { echo 0; }   # simulate an unreadable stat
+      csp_delete_would_hit_live "id-nomtime" "'"$f"'" && echo LIVE || echo NOTLIVE')
   [ "$result" = "LIVE" ]
 }
 
