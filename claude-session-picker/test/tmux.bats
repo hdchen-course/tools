@@ -384,6 +384,33 @@ make_home() {
   [ "$(csp_tmux show-options -wv -t "=$CSP_TMUX_SESSION:0" @csp_boot 2>/dev/null)" = "1" ]
 }
 
+@test "cleanup: with an EMPTY pid but our TOKEN present, tears down OUR own just-created server (no orphan)" {
+  # Edge case: a transient display-message pid-read failure (srv_pid empty)
+  # right after atomic_home used to make csp_tmux_enter_cleanup a no-op, orphaning
+  # the bootstrap session and (since the token isn't persisted yet) breaking future
+  # launches. The token — an unguessable value only we set — is a definitive
+  # ownership proof, so an empty pid + matching token must still clean up.
+  tok=$(csp_tmux_gen_owner_token)
+  csp_tmux_atomic_home "$tok"
+  run csp_tmux has-session -t "=$CSP_TMUX_SESSION"
+  [ "$status" -eq 0 ]
+  csp_tmux_enter_cleanup "" "$tok"          # empty pid, token matches → kill ours
+  run csp_tmux has-session -t "=$CSP_TMUX_SESSION"
+  [ "$status" -ne 0 ]                        # torn down, not orphaned
+}
+
+@test "cleanup: with an EMPTY pid and NO token match, leaves a foreign same-named server untouched" {
+  # The safety complement: a foreign server that merely shares the socket+session
+  # name but lacks our token must NOT be killed even on the empty-pid path — the
+  # token proof fails, so we leave it alone (strictly safer than an unconditional
+  # kill).
+  csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n w "sleep 60"   # foreign, no token
+  tok=$(csp_tmux_gen_owner_token)            # a token the foreign server never had
+  csp_tmux_enter_cleanup "" "$tok"           # empty pid + non-matching token → no-op
+  run csp_tmux has-session -t "=$CSP_TMUX_SESSION"
+  [ "$status" -eq 0 ]                        # foreign server survives
+}
+
 @test "atomic-home: JOINING a foreign server (other session present) stamps/mutates NOTHING (structural TOCTOU close)" {
   # The crux of the check->create race: if new-session lands on a live foreign
   # server (a session with a different name), the atomic invocation's

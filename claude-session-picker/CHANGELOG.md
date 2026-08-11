@@ -200,8 +200,13 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   state), the atomic create+configure landing correctly on a clean socket and
   mutating NOTHING when it joins a foreign server, the fresh-path respawn
   preserving a SPACE-containing command, and quote/backslash stripping from the
-  session name. Each new assertion was mutation-verified (disable the fix → the
-  test fails). Test suite grew to 261.
+  session name. `csp_tmux_enter_cleanup` now also accepts the ownership TOKEN as
+  proof: if a transient `display-message` pid read comes back empty right after
+  create, a token match still tears down our own just-created bootstrap session
+  (no orphan / no "every future launch falls to hub" breakage) while a foreign
+  same-named server — which can't carry our token — is still left untouched. Each
+  new assertion was mutation-verified (disable the fix → the test fails). Test
+  suite grew to 263.
 
   Known limitation (documented, not gated): if the state store suffers a
   transient failure that drops ALL of a hooked session's writes AND fully recovers
