@@ -32,6 +32,18 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   without the picker taking on a fuzzy-finder dependency.
 
 ### Fixed
+- **The cursor now follows the SESSION, not a screen position.** The list is
+  re-sorted by recency on every reload, so opening a session (which bumps it to
+  the top when you return) used to leave the cursor at its old row number —
+  silently highlighting a *different* session, so the next `d`/`Enter` acted on
+  the wrong one. The picker now remembers which session id you were on and
+  re-seeks it after a reload, so the highlight stays on the session you were
+  actually using. (The delete always deleted the highlighted, named row — but the
+  highlight could drift under you; this stops the drift.)
+- **The delete confirmation now names the project and age, not just the title.**
+  Many sessions share a title (or are `(untitled)`), so `Delete "(untitled)"?`
+  couldn't tell two rows apart; it now reads `Delete "(untitled)" — demo/alpha
+  (3d ago)?` so you always know exactly which session you're erasing.
 - **Delete fails closed — it refuses whenever it can't prove a session is dead.**
   Liveness is re-evaluated at delete time and again after you confirm (closing a
   stale-snapshot gap), and it now blocks on any of: a live `claude --resume`
@@ -216,7 +228,7 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   is never lost; the owner-token persist failure is now fail-closed; and the
   session name also strips `$`/backtick (it's interpolated into the atomic
   `if-shell` string). Each new assertion was mutation-verified (disable the fix →
-  the test fails). Test suite grew to 267.
+  the test fails). Test suite grew to 272 (added cursor-follows-session + confirm-discriminator coverage).
 
   Known limitations (documented, not gated): (1) if the state store suffers a
   transient failure that drops ALL of a hooked session's writes AND fully recovers

@@ -266,3 +266,51 @@ _setup_wide_statusbar() {
   [ "$ok" = "1" ]
   [ "$CSP_TEST_SB_W" -le "$CSP_INNER" ]
 }
+
+# --- cursor-follows-session (view_pos_of_id) --------------------------------
+# Regression for the "it grabbed the wrong session" report: the model is re-sorted
+# by mtime on every reload, so a cursor kept at a fixed POSITION lands on a
+# different session after opening/closing one. csp_view_pos_of_id lets the caller
+# re-seek the same session id after a reload so the highlight follows the session.
+_setup_id_model() {   # 3 sessions, ids s-a/s-b/s-c
+  csp_count=3
+  csp_ids=(s-a s-b s-c)
+  csp_titles=("alpha" "beta" "gamma"); csp_titles_full=("alpha" "beta" "gamma")
+  csp_projects=("p/a" "p/b" "p/c"); csp_fullprojects=(/t /t /t)
+  csp_files=(a.jsonl b.jsonl c.jsonl); csp_ages=("1m ago" "2m ago" "3m ago")
+  csp_states=("" "" ""); csp_markers=(" " " " " ")
+  CSP_FILTER=""; csp_rebuild_view
+}
+
+@test "view_pos_of_id: finds the view position of a session by id (no filter)" {
+  _setup_id_model
+  [ "$(csp_view_pos_of_id s-a)" = "0" ]
+  [ "$(csp_view_pos_of_id s-b)" = "1" ]
+  [ "$(csp_view_pos_of_id s-c)" = "2" ]
+}
+
+@test "view_pos_of_id: after a re-sort, the SAME id maps to its NEW position" {
+  _setup_id_model
+  # Simulate a reload that floated s-c to the top (mtime bump): rebuild the model
+  # in the new order and confirm the id now resolves to position 0, not its old 2.
+  csp_ids=(s-c s-a s-b)
+  csp_titles=("gamma" "alpha" "beta"); csp_titles_full=("gamma" "alpha" "beta")
+  csp_projects=("p/c" "p/a" "p/b"); csp_fullprojects=(/t /t /t)
+  csp_files=(c.jsonl a.jsonl b.jsonl); csp_ages=("1s ago" "1m ago" "2m ago")
+  csp_states=("" "" ""); csp_markers=(" " " " " ")
+  csp_rebuild_view
+  [ "$(csp_view_pos_of_id s-c)" = "0" ]      # was position 2, now 0 — cursor follows it
+  [ "$(csp_view_pos_of_id s-a)" = "1" ]
+}
+
+@test "view_pos_of_id: an id hidden by the active filter yields nothing" {
+  _setup_id_model
+  CSP_FILTER="alpha"; csp_rebuild_view       # only s-a visible
+  [ "$(csp_view_pos_of_id s-a)" = "0" ]
+  [ -z "$(csp_view_pos_of_id s-b)" ]         # filtered out → no position
+}
+
+@test "view_pos_of_id: an unknown id yields nothing (empty, not 0)" {
+  _setup_id_model
+  [ -z "$(csp_view_pos_of_id no-such-id)" ]
+}

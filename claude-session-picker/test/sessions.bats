@@ -1024,6 +1024,32 @@ _dead_pid() {
   [ "$result" = "LIVE" ]
 }
 
+@test "delete-action: the confirm prompt includes the project + age discriminator (not just the title)" {
+  # Many sessions share a title (or are "(untitled)"); the confirm must include the
+  # project path + age so the user can tell WHICH session they're deleting even if
+  # the cursor slid onto a same-titled neighbour. We capture the prompt string.
+  mkdir -p "$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha"
+  keep="$CSP_CLAUDE_DIR/projects/-Volumes-demo-alpha/id-desc.jsonl"
+  printf '%s\n' '{"type":"ai-title","aiTitle":"(untitled)"}' > "$keep"
+  run env CSP_SOURCED_FOR_TEST=1 CSP_CLAUDE_DIR="$CSP_CLAUDE_DIR" CSP_STATE_DIR="$CSP_STATE_DIR" \
+       CSP_TTY=/dev/null bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../bin/claude-session-picker"
+    csp_count=1; csp_ids=(id-desc); csp_titles=("(untitled)")
+    csp_projects=("demo/alpha"); csp_ages=("3d ago")
+    csp_files=("'"$keep"'"); csp_view=(0); csp_view_count=1
+    # Capture the confirm prompt, then decline (return 1) so nothing is deleted.
+    csp_confirm() { printf "PROMPT=[%s]\n" "$1"; return 1; }
+    csp_restore_terminal() { :; }; csp_enter_raw_mode() { :; }
+    csp_pause_notice() { :; }; csp_load_sessions() { :; }; csp_tty_print() { :; }; csp_tty_readline() { :; }
+    csp_delete_would_hit_live() { return 1; }   # not live → reach the confirm
+    csp_action_delete 0'
+  case "$output" in
+    *'(untitled)'*'demo/alpha'*'3d ago'*) ok=1 ;;
+    *) ok=0 ;;
+  esac
+  [ "$ok" = "1" ] || { echo "prompt was: $output"; false; }
+}
+
 @test "delete-action: a session that goes live DURING the confirm prompt is not unlinked" {
   # Action-level: the second (post-confirmation) liveness check must stop the
   # unlink even if the first check passed. We drive csp_action_delete with stubs:

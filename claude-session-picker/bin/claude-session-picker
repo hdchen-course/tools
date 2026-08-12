@@ -385,6 +385,24 @@ EOF
   return 0
 }
 
+# csp_view_pos_of_id ID — print the VIEW POSITION (0-based) of the row whose
+# session id equals ID, or nothing if that id isn't currently visible. Used to
+# keep the cursor ON THE SAME SESSION across a reload: the model is re-sorted by
+# mtime every load, so a cursor that stayed at a fixed POSITION would silently
+# point at a different session after opening/closing one (which bumps its mtime to
+# the top). Callers snapshot the id before the reload and re-seek it after, so the
+# highlight tracks the session the user was on, not a position that slid under it.
+csp_view_pos_of_id() {
+  local want="$1" p=0 mi
+  [ -n "$want" ] || return 0
+  while [ "$p" -lt "$csp_view_count" ]; do
+    mi="${csp_view[$p]}"
+    [ "${csp_ids[$mi]}" = "$want" ] && { printf '%s' "$p"; return 0; }
+    p=$(( p + 1 ))
+  done
+  return 0
+}
+
 # csp_markers_nl — print the markers of the CURRENTLY VISIBLE rows (view order),
 # one per line, for the pure csp_next_attention / csp_count_attention helpers.
 # Iterating the view (not the model) keeps the '*' jump and the urgency badge
@@ -1117,11 +1135,20 @@ csp_delete_busy_notice() {
 # session (one Claude is currently running) — killing its file mid-run would be
 # surprising; the user should quit that Claude first.
 csp_action_delete() {
-  local idx="$1" title file id
+  local idx="$1" title file id project age desc
   [ "$csp_count" -gt 0 ] || return 0
   title="${csp_titles[$idx]}"
   file="${csp_files[$idx]}"
   id="${csp_ids[$idx]}"
+  project="${csp_projects[$idx]:-}"
+  age="${csp_ages[$idx]:-}"
+  # Build a human discriminator for the confirm prompt. Many sessions share a
+  # title (or are "(untitled)"), so the title alone can't tell two rows apart —
+  # the project path + age make "which one am I deleting?" unambiguous even when
+  # the cursor slid onto a same-titled neighbour.
+  desc="\"$title\""
+  [ -n "$project" ] && desc="$desc — $project"
+  [ -n "$age" ] && desc="$desc ($age)"
 
   # Liveness check, re-evaluated NOW rather than trusting the cached csp_lives
   # from the last load: a session could have been resumed (by us in tmux, or by
@@ -1137,7 +1164,7 @@ csp_action_delete() {
     return 0
   fi
 
-  if csp_confirm "Delete session \"$title\"? This erases its history. [y/N] "; then
+  if csp_confirm "Delete session $desc? This erases its history. [y/N] "; then
     # Re-check liveness AFTER the confirmation prompt, immediately before we
     # unlink: the user may have taken seconds to answer, and the session could
     # have been resumed in another terminal in that window. This is the tight
@@ -1373,10 +1400,19 @@ csp_main() {
            mi="${csp_view[$selected]}"        # view position → model index
            # A tmux window name can't contain much; use the short project path.
            label="${csp_projects[$mi]}"
+           # Remember WHICH session we're opening. In hub mode csp_open returns here
+           # after you quit that Claude and reloads the list — which re-sorts by
+           # mtime, floating the just-used session to the top. Without this the
+           # cursor would stay at its old POSITION and silently land on a different
+           # session (the root of "it grabbed the wrong one"). We re-seek this id
+           # after the open so the highlight follows the session you were just in.
+           local opened_id="${csp_ids[$mi]}" pos
            # Opening a session means you've now looked at it, so clear any
            # "needs attention" (✳) state for it before handing off.
-           csp_clear_state "${csp_ids[$mi]}"
-           csp_open "${csp_ids[$mi]}" "${csp_fullprojects[$mi]}" "$label"
+           csp_clear_state "$opened_id"
+           csp_open "$opened_id" "${csp_fullprojects[$mi]}" "$label"
+           pos=$(csp_view_pos_of_id "$opened_id")
+           [ -n "$pos" ] && selected="$pos"
          fi ;;
       n) # Start a brand-new session. In hub mode that's simply $PWD; as the
          # resident tmux menu, use the directory the client actually re-attached
