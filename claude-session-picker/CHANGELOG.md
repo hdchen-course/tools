@@ -103,6 +103,26 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
 - **tmux: no duplicate concurrent resume.** Opening a session that already has a
   window switches to it instead of launching a second `claude --resume` over the
   same transcript. Each session window is tagged with its id (`@csp_sid`).
+- **Our tmux server ignores your `~/.tmux.conf` (runs with `-f /dev/null`).** The
+  dedicated-socket server now starts with no user config. This fixes a real
+  regression for anyone whose config set `exit-empty off`: the picker uses tmux's
+  built-in defaults to recognise a server it just created, and inheriting your
+  `exit-empty off` made it wrongly refuse to configure its own fresh server, so
+  the tmux backend failed to launch every time. It also makes "we never touch (or
+  inherit) your tmux" literally true — no keybindings, options, or hooks of yours
+  leak into our server.
+- **The internal tmux session name is allowlisted (`[A-Za-z0-9_-]`, capped).** The
+  name is re-parsed by tmux, so a value containing tmux format syntax like
+  `#{server_sessions}` or `${…}`/backticks would EXPAND on the second pass and
+  produce a wrong session name plus a half-configured server. An allowlist
+  forecloses every tmux metacharacter at once (replacing the previous
+  ever-growing denylist).
+- **The reuse-path configure never writes to a server it doesn't own.** Checking
+  ownership and applying options happen in one `if-shell` that reports its result
+  via `display-message` on the same connection — the earlier version pre-wrote a
+  sentinel option *before* the ownership check (touching a foreign server) and
+  read it back afterwards (which a socket swap could source from a different server
+  generation, a false success). The false branch now writes nothing at all.
 - **tmux ownership uses a per-instance identity bound to the actual socket, not a
   name or window shape.** A server is treated as the picker's only if its
   server-global `@csp_owner` equals an unguessable random token we generated and
@@ -228,7 +248,7 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   is never lost; the owner-token persist failure is now fail-closed; and the
   session name also strips `$`/backtick (it's interpolated into the atomic
   `if-shell` string). Each new assertion was mutation-verified (disable the fix →
-  the test fails). Test suite grew to 272 (added cursor-follows-session + confirm-discriminator coverage).
+  the test fails). Test suite grew to 275 (added cursor-follows-session, confirm-discriminator, -f/dev/null config isolation, session-name allowlist, and reuse-path no-foreign-mutation coverage).
 
   Known limitations (documented, not gated): (1) if the state store suffers a
   transient failure that drops ALL of a hooked session's writes AND fully recovers

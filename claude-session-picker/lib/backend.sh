@@ -26,20 +26,21 @@
 # one well-known name means re-running the picker re-attaches to the same place
 # instead of spawning duplicates.
 #
-# We STRIP ':' and '.' from it: tmux target syntax is "session:window.pane", so a
-# session name containing those makes every `-t "=name:win"` target mis-parse
-# (has-session then always fails → we'd endlessly try to re-create it and hit
-# "duplicate session"). Stripping keeps targeting unambiguous; empty falls back.
-# We ALSO strip quotes, backslashes, DOLLAR SIGNS, backticks and control chars:
-# the name is interpolated into a tmux `if-shell` command STRING during atomic
-# setup (csp_tmux_atomic_home), which tmux re-parses — a `"`/`\`/newline could
-# break the string's quoting, and a `$`/backtick triggers tmux format/shell
-# expansion that can leave a HALF-CONFIGURED server (the queue partly runs before
-# a target parse fails). Restricting to a safe set keeps the atomic block
-# all-or-nothing. Defense-in-depth: the outcome is fail-closed regardless, but a
-# clean name avoids the partial-server state entirely.
+# This is an INTERNAL tmux session name; it never needs arbitrary Unicode or
+# punctuation. We therefore ALLOWLIST a safe set ([A-Za-z0-9_-]) rather than chase
+# an ever-growing denylist. Why an allowlist matters here:
+#   • ':' and '.' are tmux target syntax ("session:window.pane") — a name with them
+#     mis-parses every `-t "=name:win"` target;
+#   • quotes/backslashes/newlines break the quoting of the `if-shell` command
+#     STRING the name is interpolated into during atomic setup;
+#   • '$', backtick, and — crucially — '#', '{', '}' trigger tmux FORMAT/shell
+#     expansion on tmux's second parse (e.g. a name `x#{server_sessions}y` becomes
+#     `x0y`), producing a wrong session name and a half-configured server.
+# An allowlist forecloses all of these (and any future tmux metachar) at once. Cap
+# the length so a pathological value can't bloat command lines; empty → default.
 CSP_TMUX_SESSION="${CSP_TMUX_SESSION:-claude-sessions}"
-CSP_TMUX_SESSION="$(printf '%s' "$CSP_TMUX_SESSION" | tr -d ':.'\''"\\$`[:cntrl:]')"
+CSP_TMUX_SESSION="$(printf '%s' "$CSP_TMUX_SESSION" | LC_ALL=C tr -cd 'A-Za-z0-9_-')"
+CSP_TMUX_SESSION="${CSP_TMUX_SESSION:0:64}"
 [ -z "$CSP_TMUX_SESSION" ] && CSP_TMUX_SESSION="claude-sessions"
 
 # We run our tmux on a DEDICATED SOCKET (tmux -L "$CSP_TMUX_SOCKET"), completely
@@ -65,9 +66,23 @@ CSP_TMUX_SOCKET="$(printf '%s' "$CSP_TMUX_SOCKET" | tr -d '/,.[:cntrl:]')"
 [ -z "$CSP_TMUX_SOCKET" ] && CSP_TMUX_SOCKET="claude-sessions"
 
 # csp_tmux — run tmux on our dedicated socket. Every tmux call in this file goes
-# through this wrapper so the socket is applied consistently in one place.
+# through this wrapper so the socket AND the config isolation are applied in one
+# place.
+#
+# `-f /dev/null`: our dedicated-socket server must NOT read the user's
+# ~/.tmux.conf. Two reasons:
+#   • CORRECTNESS — we rely on tmux's built-in defaults for our provenance check
+#     (a freshly-created server has `exit-empty on`; see csp_tmux_atomic_home). If
+#     the user's config set `exit-empty off`, our fresh server would inherit it and
+#     the guard would wrongly refuse to configure it, breaking the tmux backend on
+#     every launch. `-f /dev/null` pins the defaults so our own server is always
+#     recognisable regardless of the user's config.
+#   • ISOLATION — it makes "we never touch (or inherit) your tmux" literally true:
+#     no user keybindings, options, or hooks leak into our server.
+# `-f` only affects the invocation that CREATES the server; commands to an already
+# running server ignore it, so applying it uniformly here is correct and harmless.
 csp_tmux() {
-  command tmux -L "$CSP_TMUX_SOCKET" "$@"
+  command tmux -f /dev/null -L "$CSP_TMUX_SOCKET" "$@"
 }
 
 # csp_tmux_available — returns 0 if the tmux command exists, else 1.
@@ -118,7 +133,7 @@ csp_tmux_available() {
 # distinct socket path gets its own file.
 csp_tmux_owner_file() {
   local key lpath="${1:-}"
-  [ -n "$lpath" ] || lpath=$(command tmux -L "$CSP_TMUX_SOCKET" display-message -p '#{socket_path}' 2>/dev/null)
+  [ -n "$lpath" ] || lpath=$(command tmux -f /dev/null -L "$CSP_TMUX_SOCKET" display-message -p '#{socket_path}' 2>/dev/null)
   [ -n "$lpath" ] || lpath="$CSP_TMUX_SOCKET"
   key=$(printf '%s' "$lpath" | od -An -tx1 2>/dev/null | tr -d ' \n')
   # Fallback if od is somehow unavailable: lossy but still deterministic (only
@@ -220,7 +235,7 @@ csp_inside_tmux() {
   # guard's window lookup) targets another — a same-name socket under a different
   # TMUX_TMPDIR. Comparing the full resolved socket paths keeps identity and
   # routing on the same server.
-  lpath=$(command tmux -L "$CSP_TMUX_SOCKET" display-message -p '#{socket_path}' 2>/dev/null) || return 1
+  lpath=$(command tmux -f /dev/null -L "$CSP_TMUX_SOCKET" display-message -p '#{socket_path}' 2>/dev/null) || return 1
   [ -n "$lpath" ] && [ "$path" = "$lpath" ] || return 1
   # Must be inside our holding session (per-instance identity, not just socket).
   cur=$(command tmux display-message -p '#{session_name}' 2>/dev/null) || return 1
@@ -364,15 +379,20 @@ csp_tmux_configure_home() {
 # server is ours and was configured); non-zero otherwise so the caller falls back
 # to hub without having touched a foreign/replacement server.
 csp_tmux_configure_home_if_owned() {
-  local tok="$1" cfg
+  local tok="$1" cfg out
   [ -n "$tok" ] || return 1
-  # A sentinel we set INSIDE the guarded branch, then read back OUTSIDE, tells us
-  # whether the branch actually fired (tmux if-shell's own exit status doesn't
-  # reflect which branch ran). We clear it first so a stale value can't fool us.
-  csp_tmux set-option -g @csp_cfgok 0 2>/dev/null || return 1
-  cfg="$(csp_tmux_cfg_body) ; set-option -g @csp_cfgok 1"
-  csp_tmux if-shell -F "#{==:#{@csp_owner},$tok}" "$cfg" 2>/dev/null
-  [ "$(csp_tmux show-options -gv @csp_cfgok 2>/dev/null)" = "1" ]
+  # ONE invocation carries the whole decision AND its result — no cross-call state:
+  #   • TRUE branch: apply all options, then `display-message -p 1` (emit the
+  #     success marker to OUR captured stdout, from THIS server connection).
+  #   • FALSE branch: `display-message -p 0` and WRITE NOTHING — a foreign or
+  #     replacement server is never mutated (not even a sentinel option), so the
+  #     "we never touch a server we don't own" promise holds even here.
+  # We trust ONLY the stdout marker from this invocation, not any server option
+  # read back later (which a socket swap could source from a different server
+  # generation — the old sentinel bug). No match / empty output → not ours → fail.
+  cfg="$(csp_tmux_cfg_body) ; display-message -p 1"
+  out=$(csp_tmux if-shell -F "#{==:#{@csp_owner},$tok}" "$cfg" 'display-message -p 0' 2>/dev/null)
+  [ "$out" = "1" ]
 }
 
 # csp_tmux_atomic_home TOKEN CMD — create the holding server AND fully configure
@@ -563,7 +583,7 @@ csp_tmux_enter() {
     # exec the REAL tmux (a bare `exec csp_tmux` fails — exec can't run a shell
     # function). If exec somehow can't replace us, return non-zero so the caller
     # restores the terminal instead of falling through in a broken state.
-    exec command tmux -L "$CSP_TMUX_SOCKET" attach-session -t "=$CSP_TMUX_SESSION"
+    exec command tmux -f /dev/null -L "$CSP_TMUX_SOCKET" attach-session -t "=$CSP_TMUX_SESSION"
     return 1
   fi
 
@@ -654,7 +674,7 @@ csp_tmux_enter() {
   }
   csp_tmux set-option -wu -t "=$CSP_TMUX_SESSION:menu" '@csp_boot' 2>/dev/null
   csp_tmux_record_launch_pwd    # seed the launch dir for `n` (see helper)
-  exec command tmux -L "$CSP_TMUX_SOCKET" attach-session -t "=$CSP_TMUX_SESSION"
+  exec command tmux -f /dev/null -L "$CSP_TMUX_SOCKET" attach-session -t "=$CSP_TMUX_SESSION"
   csp_tmux_enter_cleanup "$srv_pid" "$tok"   # only if exec failed AND still our instance
   return 1
 }

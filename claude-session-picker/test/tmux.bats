@@ -317,13 +317,18 @@ make_home() {
   [ "$status" -eq 0 ]
   [ "$(csp_tmux show-options -gv mouse)" = "on" ]
   csp_tmux kill-server 2>/dev/null || true
-  # (b) foreign (different token) → NOT configured, mouse stays default off.
+  # (b) foreign (different token) → NOT configured, and NOTHING mutated at all —
+  # not even a sentinel option (F1: the old impl pre-wrote @csp_cfgok=0 before the
+  # ownership check). Snapshot ALL global options and assert byte-for-byte equal.
   csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu "sleep 60"
   csp_tmux set-option -g @csp_owner "csp-not-ours"
-  before_mouse=$(csp_tmux show-options -gv mouse 2>/dev/null || true)
+  before_all=$(csp_tmux show-options -g 2>/dev/null | sort)
   run csp_tmux_configure_home_if_owned "$(csp_tmux_gen_owner_token)"
   [ "$status" -ne 0 ]
-  [ "$(csp_tmux show-options -gv mouse 2>/dev/null || true)" = "$before_mouse" ]
+  after_all=$(csp_tmux show-options -g 2>/dev/null | sort)
+  [ "$before_all" = "$after_all" ]
+  # And specifically no @csp_cfgok sentinel leaked onto the foreign server.
+  [ -z "$(csp_tmux show-options -gv @csp_cfgok 2>/dev/null || true)" ]
 }
 
 @test "ownership: server_is_ours REJECTS a server whose @csp_owner is a DIFFERENT token" {
@@ -471,6 +476,33 @@ make_home() {
   [ "$(csp_tmux show-options -gv mouse 2>/dev/null || true)" = "$before_mouse" ]
 }
 
+@test "atomic-home: a fresh server is configured even when the user's ~/.tmux.conf sets exit-empty off (F2)" {
+  # F2 regression: our exit-empty==1 guard relies on tmux DEFAULTS. If our server
+  # read the user's ~/.tmux.conf with `exit-empty off`, our own fresh server would
+  # inherit off and the guard would wrongly refuse to configure it — breaking the
+  # tmux backend for anyone who sets that. `csp_tmux` runs `-f /dev/null`, so our
+  # server ignores the user config and always has exit-empty on. Build a HOME with
+  # a hostile tmux.conf and confirm a fresh atomic-home still configures.
+  uhome="$BATS_TEST_TMPDIR/uhome"; mkdir -p "$uhome"
+  printf 'set-option -g exit-empty off\nset-option -g mouse off\n' > "$uhome/.tmux.conf"
+  run env HOME="$uhome" CSP_TMUX_SOCKET="$CSP_TMUX_SOCKET" CSP_TMUX_SESSION="$CSP_TMUX_SESSION" \
+    CSP_STATE_DIR="$CSP_STATE_DIR" bash -c '
+      . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/backend.sh"
+      tok=$(csp_tmux_gen_owner_token)
+      csp_tmux_atomic_home "$tok"
+      printf "owner=[%s] mouse=[%s] ee=[%s]\n" \
+        "$(csp_tmux show-options -gv @csp_owner 2>/dev/null)" \
+        "$(csp_tmux show-options -gv mouse 2>/dev/null)" \
+        "$(csp_tmux show-options -gv exit-empty 2>/dev/null)"'
+  # Our server ignored the user config: exit-empty on, mouse configured on, owner set.
+  case "$output" in *"ee=[on]"*) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ] || { echo "got: $output"; false; }
+  case "$output" in *"mouse=[on]"*) ok2=1 ;; *) ok2=0 ;; esac
+  [ "$ok2" = "1" ]
+  case "$output" in *"owner=[csp-"*) ok3=1 ;; *) ok3=0 ;; esac
+  [ "$ok3" = "1" ]
+}
+
 @test "enter: full fresh path JOINING a foreign server bails to hub and removes ONLY our own session" {
   # End-to-end: the pre-check refuses a live foreign server; even if we force past
   # it (stub server_is_ours), the atomic guard mutates nothing and the caller's
@@ -564,6 +596,38 @@ make_home() {
   case "$output" in *[\"\'\\]*) bad=1 ;; *) bad=0 ;; esac
   [ "$bad" = "0" ]
   [ "$output" = "xyzw" ]
+}
+
+@test "session name: allowlist strips tmux FORMAT metachars (#{...}, \$, backtick, ;)" {
+  # F3: the name is re-parsed by tmux, so tmux format syntax like #{server_sessions}
+  # would EXPAND on the second pass (→ a wrong session name + half-configured
+  # server). An allowlist ([A-Za-z0-9_-]) forecloses every tmux metachar at once.
+  # Each hostile input must sanitize to exactly its allowlisted characters.
+  _sess_sanitized() {   # $1 raw → prints sanitized CSP_TMUX_SESSION
+    CSP_TMUX_SESSION="$1" bash -c '
+      . '"$BATS_TEST_DIRNAME"'/../lib/core.sh
+      . '"$BATS_TEST_DIRNAME"'/../lib/backend.sh
+      printf "%s" "$CSP_TMUX_SESSION"'
+  }
+  [ "$(_sess_sanitized 'x#{server_sessions}y')" = "xserver_sessionsy" ]
+  [ "$(_sess_sanitized 'x${HOME}y')" = "xHOMEy" ]
+  [ "$(_sess_sanitized 'x`id`y')" = "xidy" ]
+  [ "$(_sess_sanitized 'x;y')" = "xy" ]
+  [ "$(_sess_sanitized 'a:b.c')" = "abc" ]
+  # And the result NEVER contains a tmux metachar.
+  local s
+  for raw in 'x#{server_sessions}y' 'x${HOME}y' 'x`id`y' 'a:b.c' 'x"y' 'x\w'; do
+    s=$(_sess_sanitized "$raw")
+    case "$s" in *['#{}$`:.;"'\'\\]*) echo "LEAK: [$raw]->[$s]"; false ;; esac
+  done
+}
+
+@test "session name: an all-metachar name falls back to the default (never empty)" {
+  out=$(CSP_TMUX_SESSION='#{}$`:."' bash -c '
+    . '"$BATS_TEST_DIRNAME"'/../lib/core.sh
+    . '"$BATS_TEST_DIRNAME"'/../lib/backend.sh
+    printf "%s" "$CSP_TMUX_SESSION"')
+  [ "$out" = "claude-sessions" ]
 }
 
 @test "socket name: '/' ',' '.' are stripped so inside-tmux detection can't break (safety 1)" {
