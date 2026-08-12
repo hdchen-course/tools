@@ -303,6 +303,29 @@ make_home() {
   [ "$status" -ne 0 ]
 }
 
+@test "reuse-path: configure_home_if_owned mutates ONLY a token-matching server, atomically" {
+  # Round-7 High (reuse check->configure race): ownership check and the global
+  # set-options now run in ONE tmux invocation gated on @csp_owner==token, so a
+  # socket swap can't slip between "it's ours" and the mutations. Verify: our own
+  # server (token matches) is configured; a foreign server (no/other token) is left
+  # untouched, and the call reports failure so the caller bails to hub.
+  # (a) ours → configured.
+  csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu "sleep 60"
+  tok=$(csp_tmux_new_owner_token)
+  csp_tmux set-option -g @csp_owner "$tok"
+  run csp_tmux_configure_home_if_owned "$tok"
+  [ "$status" -eq 0 ]
+  [ "$(csp_tmux show-options -gv mouse)" = "on" ]
+  csp_tmux kill-server 2>/dev/null || true
+  # (b) foreign (different token) → NOT configured, mouse stays default off.
+  csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu "sleep 60"
+  csp_tmux set-option -g @csp_owner "csp-not-ours"
+  before_mouse=$(csp_tmux show-options -gv mouse 2>/dev/null || true)
+  run csp_tmux_configure_home_if_owned "$(csp_tmux_gen_owner_token)"
+  [ "$status" -ne 0 ]
+  [ "$(csp_tmux show-options -gv mouse 2>/dev/null || true)" = "$before_mouse" ]
+}
+
 @test "ownership: server_is_ours REJECTS a server whose @csp_owner is a DIFFERENT token" {
   # The false-positive case the redesign closes: a server that carries SOME
   # @csp_owner value that isn't OUR persisted token (a different picker instance,
@@ -426,6 +449,26 @@ make_home() {
   # The foreign session is untouched (still there).
   run csp_tmux has-session -t "=foreign-race"
   [ "$status" -eq 0 ]
+}
+
+@test "atomic-home: JOINING a foreign ZERO-session server (exit-empty off) stamps/mutates NOTHING" {
+  # Round-7 High: a foreign server whose only session was killed can stay alive if
+  # the user set `exit-empty off`. new-session then JOINS it, leaving server_sessions
+  # ==1 (ours) — which alone would misidentify it as a fresh server we created. The
+  # exit-empty==1 half of the guard rejects it: our own fresh server has exit-empty
+  # on (default), a survived 0-session foreign server necessarily has it off.
+  csp_tmux new-session -d -s "foreign-z" -n w "sleep 60"
+  csp_tmux set-option -g exit-empty off 2>/dev/null
+  before_mouse=$(csp_tmux show-options -gv mouse 2>/dev/null || true)
+  csp_tmux kill-session -t "foreign-z" 2>/dev/null       # 0 sessions, server still alive
+  # Precondition: server alive, 0 sessions.
+  run csp_tmux list-sessions
+  [ "$status" -eq 0 ]
+  tok=$(csp_tmux_gen_owner_token)
+  csp_tmux_atomic_home "$tok"    # our new-session JOINS the surviving foreign server
+  # The foreign server must NOT be configured or stamped.
+  [ -z "$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)" ]
+  [ "$(csp_tmux show-options -gv mouse 2>/dev/null || true)" = "$before_mouse" ]
 }
 
 @test "enter: full fresh path JOINING a foreign server bails to hub and removes ONLY our own session" {

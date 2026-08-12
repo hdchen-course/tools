@@ -119,26 +119,25 @@ if [ "$state" = "ended" ]; then
   if [ -n "$csp_ended_rec" ]; then
     # A residency record exists. Only tear down if it provably matches this
     # instance (socket + server-pid [+ pane]). csp_clear_residency_if_matches does
-    # the exact same check and clears the record; we clear state only if it did.
+    # the exact same check and clears the record; we clear state only if it did —
+    # and even then, atomically (never wipe a "working" a newer instance wrote).
     csp_ended_before=$(csp_read_residency "$id")
     csp_clear_residency_if_matches "$id" "$csp_tmux_sock" "$csp_tmux_spid" "${TMUX_PANE:-}"
     csp_ended_after=$(csp_read_residency "$id")
     if [ -n "$csp_ended_before" ] && [ -z "$csp_ended_after" ]; then
-      csp_clear_state "$id"                        # record matched & was cleared → safe
+      csp_clear_state_unless_working "$id"         # record matched & was cleared
     fi
     # else: record belonged to a newer instance → leave state too.
   else
     # No residency record to protect. Clearing the ●/✳ state is cosmetic — EXCEPT
     # that "working" is ALSO a delete-blocking signal. On a clean SessionEnd this
     # instance's own last state was "waiting" (Stop fires before SessionEnd), so a
-    # "working" on disk right now belongs to a NEWER same-id instance (e.g. a bare
-    # `n` that wrote "working" via the record-failure fallback) — clearing it could
-    # expose that live session to deletion. So we clear state only when it is NOT
-    # "working"; a stale "working" is left for the picker's reconciler (which shows
-    # it as ✳ once no process is running).
-    if [ "$(csp_read_state "$id")" != "working" ]; then
-      csp_clear_state "$id"
-    fi
+    # "working" on disk belongs to a NEWER same-id instance (e.g. a bare `n` that
+    # wrote "working" via the record-failure fallback) — clearing it could expose
+    # that live session to deletion. csp_clear_state_unless_working clears ONLY when
+    # the value isn't "working", and does so ATOMICALLY (claim + restore-if-working)
+    # so a "working" written concurrently between our read and clear is never lost.
+    csp_clear_state_unless_working "$id"
   fi
   exit 0
 fi

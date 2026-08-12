@@ -204,17 +204,34 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   proof: if a transient `display-message` pid read comes back empty right after
   create, a token match still tears down our own just-created bootstrap session
   (no orphan / no "every future launch falls to hub" breakage) while a foreign
-  same-named server — which can't carry our token — is still left untouched. Each
-  new assertion was mutation-verified (disable the fix → the test fails). Test
-  suite grew to 263.
+  same-named server — which can't carry our token — is still left untouched.
+  Further hardening: the atomic create+configure now ALSO gates on
+  `#{exit-empty}==1`, so a foreign server whose last session was killed but which
+  survives via `exit-empty off` (server_sessions would read 1 = ours) is no longer
+  mistaken for a fresh server and configured; the reuse path checks ownership AND
+  applies its global options in ONE token-gated `if-shell` invocation (no
+  check→configure swap window); the residency claim/restore and the SessionEnd
+  state clear both use an atomic `ln` (no-clobber) restore and only ever drop a
+  non-`working` state, so a concurrent newer record/`working` written mid-decision
+  is never lost; the owner-token persist failure is now fail-closed; and the
+  session name also strips `$`/backtick (it's interpolated into the atomic
+  `if-shell` string). Each new assertion was mutation-verified (disable the fix →
+  the test fails). Test suite grew to 267.
 
-  Known limitation (documented, not gated): if the state store suffers a
+  Known limitations (documented, not gated): (1) if the state store suffers a
   transient failure that drops ALL of a hooked session's writes AND fully recovers
   before you delete it, an *idle* bare session in a tmux the picker doesn't own can
-  have no live signal at delete time (the health probe only sees the recovered
-  store). A running `--resume` process or a session in the picker's own tmux is
-  always protected regardless; the residual is the same class as the "install the
-  hooks" caveat.
+  have no live signal at delete time. (2) The destructive tmux ops that MUST take a
+  spaced command as direct argv (`respawn-window -k`, and `kill-session` cleanup)
+  are separate `tmux -L` invocations from their ownership check, so an adversary
+  able to destroy and recreate a server on the picker's *exact dedicated socket*
+  within a sub-millisecond window could, in principle, have the op land on a
+  replacement — there is no tmux primitive to make "verify token AND run a
+  direct-argv command" a single connection. On the single-user local machine this
+  requires racing your own picker; and in every case DATA safety (a live
+  transcript is never deleted) is upheld by the ownership-independent delete guard.
+  A running `--resume` process or a session in the picker's own tmux is always
+  protected regardless.
 - New pure, unit-tested helpers in `lib/core.sh`: `csp_filter_indices`,
   `csp_next_attention`, `csp_count_attention`. A shared `csp_prompt_line` now
   backs both the delete confirmation and the filter query (one home for the

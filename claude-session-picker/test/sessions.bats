@@ -902,6 +902,38 @@ _dead_pid() {
   [ "$line1" = "/tmp/NEW.sock" ]
 }
 
+@test "state: csp_clear_state_unless_working keeps a 'working' value but clears others" {
+  . "$BATS_TEST_DIRNAME/../lib/core.sh"; . "$BATS_TEST_DIRNAME/../lib/sessions.sh"
+  # "working" is a delete-blocking signal that may belong to a newer instance →
+  # must NOT be cleared. "waiting" (or any non-working) is cosmetic → cleared.
+  csp_write_state keepw working
+  csp_clear_state_unless_working keepw
+  run csp_read_state keepw
+  [ "$output" = "working" ]                         # preserved
+  csp_write_state dropw waiting
+  csp_clear_state_unless_working dropw
+  run csp_read_state dropw
+  [ -z "$output" ]                                  # cleared
+}
+
+@test "state: csp_clear_state_unless_working does not clobber a NEWER record written during the claim" {
+  . "$BATS_TEST_DIRNAME/../lib/core.sh"; . "$BATS_TEST_DIRNAME/../lib/sessions.sh"
+  # Race: an old SessionEnd clears a non-working state, but a newer instance writes
+  # "working" to the slot meanwhile. The atomic claim/restore (ln, no-clobber) must
+  # leave the newer "working" intact. We approximate: seed "waiting", and have a
+  # background writer drop "working" the instant the slot goes empty.
+  f=$(csp_state_file racew)
+  csp_write_state racew waiting
+  ( while [ -e "$f" ]; do :; done; printf 'working\n' > "$f" ) &
+  writer=$!
+  csp_clear_state_unless_working racew
+  wait "$writer" 2>/dev/null || true
+  # The newer "working" must survive (either our claim saw waiting and dropped it,
+  # then the writer created working; or ln refused to clobber it).
+  run csp_read_state racew
+  [ "$output" = "working" ]
+}
+
 @test "residency: csp_record_residency reports failure when the state dir is unwritable" {
   . "$BATS_TEST_DIRNAME/../lib/core.sh"; . "$BATS_TEST_DIRNAME/../lib/sessions.sh"
   # Point the state dir at a path that can't be created (under a regular file).

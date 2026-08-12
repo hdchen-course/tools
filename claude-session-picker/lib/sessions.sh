@@ -105,6 +105,32 @@ csp_clear_state() {
   rm -f -- "$f" 2>/dev/null || true
 }
 
+# csp_clear_state_unless_working ID — clear the state file UNLESS it currently
+# holds "working" (a delete-blocking signal that may belong to a NEWER same-id
+# instance). Used by SessionEnd, where a plain read-then-clear has a race: an old
+# event reads "waiting", a new instance writes "working", the old event then
+# clears the live "working". We close it ATOMICALLY: rename the state file to a
+# private claim, inspect the claim, and if it is "working" restore it (via `ln`,
+# which never clobbers a newer record the slot may already hold); otherwise drop
+# it. So a "working" written concurrently is never lost. Best-effort.
+csp_clear_state_unless_working() {
+  local f claim v=""
+  f=$(csp_state_file "$1")
+  [ -f "$f" ] && [ ! -L "$f" ] || return 0
+  claim=$(mktemp "$CSP_STATE_DIR/.sclaim.XXXXXX" 2>/dev/null) || return 0
+  mv -- "$f" "$claim" 2>/dev/null || { rm -f -- "$claim" 2>/dev/null; return 0; }
+  { IFS= read -r -n 16 v < "$claim"; } 2>/dev/null
+  v="${v%$'\r'}"
+  if [ "$v" = "working" ]; then
+    # It's a live signal — put it back without clobbering any newer record.
+    ln -- "$claim" "$f" 2>/dev/null
+    rm -f -- "$claim" 2>/dev/null
+  else
+    rm -f -- "$claim" 2>/dev/null                  # not working → safe to drop
+  fi
+  return 0
+}
+
 # csp_state_store_healthy — return 0 if the state store can be written AND read
 # back. The delete guard uses this to FAIL CLOSED: the hook's delete-blocking
 # signals (residency, "working" state) all live in $CSP_STATE_DIR, so if that
@@ -221,11 +247,15 @@ csp_clear_residency_if_matches() {
     rm -f -- "$claim" 2>/dev/null                  # matched → cleared
     return 0
   fi
-  # Not ours: put it back if the slot is still empty; else a newer record won.
-  if [ ! -e "$f" ]; then
-    mv -- "$claim" "$f" 2>/dev/null || rm -f -- "$claim" 2>/dev/null
+  # Not ours: put it back — but NEVER clobber a newer record that a concurrent hook
+  # may have written to the slot since we claimed it. `ln` (hardlink) is ATOMIC and
+  # FAILS if the target already exists (no check-then-move race, unlike `[ ! -e ] &&
+  # mv`): so if the slot is empty the restore succeeds; if a newer record is there,
+  # ln fails and we simply drop our stale claim, leaving the newer record intact.
+  if ln -- "$claim" "$f" 2>/dev/null; then
+    rm -f -- "$claim" 2>/dev/null                  # restored (link made); drop the temp name
   else
-    rm -f -- "$claim" 2>/dev/null
+    rm -f -- "$claim" 2>/dev/null                  # a newer record won the slot → discard ours
   fi
   return 0
 }
