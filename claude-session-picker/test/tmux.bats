@@ -293,24 +293,51 @@ make_home() {
   [ -z "$(csp_tmux_owner_token)" ]
 }
 
-@test "ownership: owner-token read is BOUNDED — a huge no-newline file returns fast (real function)" {
-  # Regression: csp_tmux_read_token_file must use a bounded `read -n`, not plain
-  # `read -r` (which slurps the WHOLE first line before the length check, hanging
-  # startup on a corrupt owner file). We drive the REAL function against a large
-  # regular file (16 MiB, no newline) and require it to return quickly. With the
-  # bounded read this is ~instant; with plain `read -r` it reads all 16 MiB (and a
-  # 32 MiB file hung >120s in the reviewer's repro) — a watchdog fails it.
+# _run_reader_with_watchdog FILE — run csp_tmux_read_token_file on FILE in the
+# background; if it doesn't finish within 10s, KILL it (and confirm no reader
+# process lingers) and record a failure. Writes the reader's output to $rd_out and
+# sets $rd_timedout=1 on timeout. A real watchdog, so a hang fails the test
+# promptly instead of stalling on the outer CI timeout.
+_run_reader_with_watchdog() {
+  local file="$1" out; out="$BATS_TEST_TMPDIR/rd.out"; : > "$out"
+  ( csp_tmux_read_token_file "$file" > "$out" ) &
+  local rpid=$!
+  rd_timedout=0
+  local i=0
+  while kill -0 "$rpid" 2>/dev/null; do
+    i=$(( i + 1 ))
+    [ "$i" -ge 100 ] && { rd_timedout=1; kill -9 "$rpid" 2>/dev/null; break; }
+    sleep 0.1
+  done
+  wait "$rpid" 2>/dev/null || true
+  rd_out=$(cat "$out" 2>/dev/null)
+}
+
+@test "ownership: owner-token read is BOUNDED — huge ASCII no-newline file (real fn + watchdog)" {
+  # Regression: csp_tmux_read_token_file must be bounded (size-check + capped read),
+  # not an unbounded slurp that hangs startup on a corrupt owner file. Drive the
+  # REAL function via a watchdog that KILLS a hung reader (rather than waiting on
+  # the CI timeout) so the plain-`read -r` regression fails fast and leaves no
+  # process behind. 16 MiB, no newline.
   make_home
-  f=$(csp_tmux_owner_file)
-  rm -f "$f"
-  { printf 'csp-'; head -c 16000000 /dev/zero | tr '\0' x; } > "$f"   # 16 MiB, NO newline
-  start=$SECONDS
-  v=$(csp_tmux_read_token_file "$f")     # THE REAL FUNCTION
-  elapsed=$(( SECONDS - start ))
-  # Bounded → returns in well under the time an unbounded 16 MiB slurp would take,
-  # and the over-length line is rejected (empty), never truncated into a token.
-  [ "$elapsed" -lt 5 ] || { echo "read took ${elapsed}s (unbounded regression)"; false; }
-  [ -z "$v" ]
+  f=$(csp_tmux_owner_file); rm -f "$f"
+  { printf 'csp-'; head -c 16000000 /dev/zero | tr '\0' x; } > "$f"
+  _run_reader_with_watchdog "$f"
+  [ "$rd_timedout" -eq 0 ] || { echo "reader hung (unbounded regression)"; false; }
+  [ -z "$rd_out" ]                       # over-size → rejected, never a token
+}
+
+@test "ownership: owner-token read is BOUNDED — huge NUL-heavy file (Bash 4.3+ NUL-skip, real fn + watchdog)" {
+  # Bash 4.3+ SKIPS NUL bytes without counting them toward `read -n`, so a
+  # NUL-heavy file could be scanned to EOF even with `-n 96` — the size-check
+  # (stat before read) is what actually bounds it cross-platform. 64 MiB of raw
+  # NUL: the size-check must reject it WITHOUT reading, on any bash.
+  make_home
+  f=$(csp_tmux_owner_file); rm -f "$f"
+  head -c 67108864 /dev/zero > "$f"      # 64 MiB of NUL bytes
+  _run_reader_with_watchdog "$f"
+  [ "$rd_timedout" -eq 0 ] || { echo "reader hung on NUL file (NUL-skip regression)"; false; }
+  [ -z "$rd_out" ]
 }
 
 @test "ownership: new owner token is written 0600 in a 0700 dir (hardening)" {

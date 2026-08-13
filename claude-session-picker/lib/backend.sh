@@ -146,19 +146,23 @@ csp_tmux_owner_file() {
 # Prints the token if the file holds our exact shape ("csp-"+[A-Za-z0-9-]), else
 # nothing. Symlink-refusing; bounded read; rejects an over-long first line.
 csp_tmux_read_token_file() {
-  local f="$1" v=""
+  local f="$1" v="" size
   [ -f "$f" ] && [ ! -L "$f" ] || return 0
-  # BOUNDED read: `read -r -n 96` stops after 96 bytes, so a corrupt/huge owner
-  # file (e.g. a 32 MiB line with no newline) can NEVER stall startup — only 96
-  # bytes are ever pulled into the shell. This is the tool's actual runtime shell:
-  # bin/claude-session-picker is `#!/usr/bin/env bash` and lib/*.sh are sourced
-  # into it, so `read -n` behaves per bash (verified on macOS system bash 3.2:
-  # reads a valid token, and truncates a 4 MiB line to 96 bytes in ~0.01s). (An
-  # earlier switch to plain `read -r` was made under a mistaken "bash 3.2 read -n
-  # returns empty" belief that was actually a zsh test artifact — plain read -r is
-  # UNBOUNDED and slurps the whole first line, a startup-hang regression, so we're
-  # back to the bounded form.) `|| true` because read returns non-zero at EOF/cap.
-  # LC_ALL=C so the 96-byte cap and length check are byte-exact.
+  # BOUNDED by a SIZE CHECK FIRST, before reading any content. `read -r -n 96`
+  # alone is NOT a reliable byte bound across our whole support range (Bash 3.2+
+  # incl. Linux): Bash 4.3+ SKIPS NUL bytes without counting them toward -n, so a
+  # NUL-heavy file could still be scanned to EOF and stall startup. A real token
+  # file is ~37 bytes; anything over 96 bytes is definitively not ours, so we stat
+  # the size and refuse WITHOUT reading a single byte of content. (Cross-platform:
+  # BSD `stat -f %z`, then GNU `stat -c %s`.) A same-user replacement race between
+  # the stat and the read is an accepted residual on this single-user local model;
+  # our own writes use atomic rename and never grow a file in place.
+  size=$(stat -f '%z' "$f" 2>/dev/null) || size=$(stat -c '%s' "$f" 2>/dev/null) || return 0
+  case "$size" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$size" -le 96 ] || return 0
+  # Now the file is provably ≤96 bytes, so this read is inherently bounded on ANY
+  # bash. `|| true` because read returns non-zero at EOF/cap; LC_ALL=C keeps the
+  # cap and the length check below byte-exact.
   { LC_ALL=C IFS= read -r -n 96 v < "$f" || true; } 2>/dev/null
   v="${v%$'\r'}"
   # Reject an over-long line outright (don't truncate — truncating a huge line to
