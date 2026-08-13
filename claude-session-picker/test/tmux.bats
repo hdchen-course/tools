@@ -293,6 +293,59 @@ make_home() {
   [ -z "$(csp_tmux_owner_token)" ]
 }
 
+@test "ownership: owner-token read honours the size boundary (accept ≤ cap, reject over)" {
+  # The size-check refuses anything over 96 bytes before reading; the value cap
+  # then rejects anything over 64 chars. Drive csp_tmux_read_token_file directly
+  # across the boundaries the reviewer verified. Token "csp-" is 4 chars, so a
+  # 64-char token is "csp-" + 60; a 65-char one is +61 (rejected by the ≤64 cap).
+  make_home
+  f=$(csp_tmux_owner_file)
+  _tok_of_len() { printf 'csp-'; head -c "$(( $1 - 4 ))" /dev/zero | tr '\0' a; }
+  # 64 chars total → accepted.
+  _tok_of_len 64 > "$f"; [ "$(csp_tmux_read_token_file "$f")" = "$(_tok_of_len 64)" ]
+  # 65 chars → rejected by the value-length cap (still ≤96 bytes, so it IS read).
+  _tok_of_len 65 > "$f"; [ -z "$(csp_tmux_read_token_file "$f")" ]
+  # 96 bytes → rejected by the value cap (well over 64).
+  _tok_of_len 96 > "$f"; [ -z "$(csp_tmux_read_token_file "$f")" ]
+  # 97 bytes → rejected by the SIZE check (never read).
+  _tok_of_len 97 > "$f"; [ -z "$(csp_tmux_read_token_file "$f")" ]
+}
+
+@test "ownership: owner-token read fails closed when stat can't size the file" {
+  # If neither stat dialect can report a size, we must NOT read the content (a
+  # corrupt/huge file would otherwise slip through) — return empty. Simulate by
+  # stubbing `stat` to always fail for this test's subshell.
+  make_home
+  f=$(csp_tmux_owner_file)
+  printf 'csp-validlooking\n' > "$f"       # a normal, valid token on disk
+  run env CSP_STATE_DIR="$CSP_STATE_DIR" bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/backend.sh"
+    stat() { return 1; }                    # both dialects fail
+    csp_tmux_read_token_file "'"$f"'"'
+  [ -z "$output" ]                          # fail-closed: no token when size unknown
+}
+
+@test "ownership: owner-token read works via the GNU stat fallback path" {
+  # Force the BSD `stat -f` form to fail so the GNU `stat -c` fallback is taken;
+  # a valid small token must still round-trip through that branch. We emulate the
+  # GNU `-c '%s'` form (this box's real stat is BSD and lacks `-c`), reporting the
+  # true byte size via wc, so the test exercises the fallback branch on any OS.
+  make_home
+  f=$(csp_tmux_owner_file)
+  printf 'csp-gnu12345\n' > "$f"
+  run env CSP_STATE_DIR="$CSP_STATE_DIR" bash -c '
+    . "'"$BATS_TEST_DIRNAME"'/../lib/core.sh"; . "'"$BATS_TEST_DIRNAME"'/../lib/backend.sh"
+    stat() {
+      case "$1" in
+        -f) return 1 ;;                                  # BSD form disabled
+        -c) exec 2>/dev/null; wc -c < "$3" | tr -d " " ;; # emulate GNU %s (bytes)
+        *)  command stat "$@" ;;
+      esac
+    }
+    csp_tmux_read_token_file "'"$f"'"'
+  [ "$output" = "csp-gnu12345" ]
+}
+
 # _run_reader_with_watchdog FILE — run csp_tmux_read_token_file on FILE in the
 # background; if it doesn't finish within 10s, KILL it (and confirm no reader
 # process lingers) and record a failure. Writes the reader's output to $rd_out and

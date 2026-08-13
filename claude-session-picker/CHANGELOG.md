@@ -264,7 +264,7 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   is never lost; the owner-token persist failure is now fail-closed; and the
   session name also strips `$`/backtick (it's interpolated into the atomic
   `if-shell` string). Each new assertion was mutation-verified (disable the fix →
-  the test fails). Test suite grew to 280 (added cursor-follows-session, confirm-discriminator, -f/dev/null config isolation, session-name allowlist, reuse-path no-foreign-mutation, stale-owned-server recovery, owner-token round-trip, and bounded owner-token read coverage — including a NUL-heavy file and a real killing watchdog).
+  the test fails). Test suite grew to 283 (added cursor-follows-session, confirm-discriminator, -f/dev/null config isolation, session-name allowlist, reuse-path no-foreign-mutation, stale-owned-server recovery, and bounded owner-token read coverage — size boundary, BSD/GNU stat fallback, stat-fail fail-closed, NUL-heavy file, and a real killing watchdog).
 
   Known limitations (documented, not gated): (1) if the state store suffers a
   transient failure that drops ALL of a hooked session's writes AND fully recovers
