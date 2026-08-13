@@ -114,8 +114,8 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   all in one tmux invocation. A *foreign* zero-session server (no matching token)
   is still never adopted. The owner-token reader also gained a name-keyed fallback
   so it can still read our token from a zero-session server that can't report its
-  socket path, and uses a portable `read -r` (not `read -r -n`, which misbehaves
-  under some shells).
+  socket path, and reads with a BOUNDED `read -r -n 96` so a corrupt/huge owner
+  file (e.g. a many-MiB line with no newline) can never stall startup.
 - **Our tmux server ignores your `~/.tmux.conf` (runs with `-f /dev/null`).** The
   dedicated-socket server now starts with no user config. This fixes a real
   regression for anyone whose config set `exit-empty off`: the picker uses tmux's
@@ -261,7 +261,7 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   is never lost; the owner-token persist failure is now fail-closed; and the
   session name also strips `$`/backtick (it's interpolated into the atomic
   `if-shell` string). Each new assertion was mutation-verified (disable the fix →
-  the test fails). Test suite grew to 278 (added cursor-follows-session, confirm-discriminator, -f/dev/null config isolation, session-name allowlist, reuse-path no-foreign-mutation, stale-owned-server recovery, and owner-token round-trip coverage).
+  the test fails). Test suite grew to 278 (added cursor-follows-session, confirm-discriminator, -f/dev/null config isolation, session-name allowlist, reuse-path no-foreign-mutation, stale-owned-server recovery, owner-token round-trip, and bounded owner-token read coverage).
 
   Known limitations (documented, not gated): (1) if the state store suffers a
   transient failure that drops ALL of a hooked session's writes AND fully recovers

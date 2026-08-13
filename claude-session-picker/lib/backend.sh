@@ -142,28 +142,28 @@ csp_tmux_owner_file() {
   printf '%s/tmux-owner.%s' "$CSP_STATE_DIR" "$key"
 }
 
-# csp_tmux_owner_token — print the persisted ownership token for this socket, or
-# nothing if none has been established yet. Always returns 0.
-# $1 (optional) is a pre-resolved socket path, forwarded to csp_tmux_owner_file.
-# We refuse to follow a symlink at the path (a planted link could otherwise
-# redirect the read) and read a BOUNDED amount — the token is a fixed-shape
-# "csp-<hex>" value, so a fixed cap can never be a hot-path latency hazard even if
-# the file were somehow replaced by a huge one.
 # csp_tmux_read_token_file FILE — read+validate a token from one owner file.
 # Prints the token if the file holds our exact shape ("csp-"+[A-Za-z0-9-]), else
-# nothing. Symlink-refusing; rejects an over-long first line.
+# nothing. Symlink-refusing; bounded read; rejects an over-long first line.
 csp_tmux_read_token_file() {
   local f="$1" v=""
   [ -f "$f" ] && [ ! -L "$f" ] || return 0
-  # Read the FIRST LINE with a plain `read -r`. We deliberately do NOT use
-  # `read -n <N>`: on bash 3.2 (macOS system bash, our target) `read -r -n N`
-  # inside a redirected group returns EMPTY, which silently broke ownership
-  # recognition entirely. Plain `read -r` stops at the first newline (bounded to
-  # one line for our newline-terminated token).
-  { IFS= read -r v < "$f"; } 2>/dev/null
+  # BOUNDED read: `read -r -n 96` stops after 96 bytes, so a corrupt/huge owner
+  # file (e.g. a 32 MiB line with no newline) can NEVER stall startup — only 96
+  # bytes are ever pulled into the shell. This is the tool's actual runtime shell:
+  # bin/claude-session-picker is `#!/usr/bin/env bash` and lib/*.sh are sourced
+  # into it, so `read -n` behaves per bash (verified on macOS system bash 3.2:
+  # reads a valid token, and truncates a 4 MiB line to 96 bytes in ~0.01s). (An
+  # earlier switch to plain `read -r` was made under a mistaken "bash 3.2 read -n
+  # returns empty" belief that was actually a zsh test artifact — plain read -r is
+  # UNBOUNDED and slurps the whole first line, a startup-hang regression, so we're
+  # back to the bounded form.) `|| true` because read returns non-zero at EOF/cap.
+  # LC_ALL=C so the 96-byte cap and length check are byte-exact.
+  { LC_ALL=C IFS= read -r -n 96 v < "$f" || true; } 2>/dev/null
   v="${v%$'\r'}"
   # Reject an over-long line outright (don't truncate — truncating a huge line to
-  # N valid chars could forge a plausible token). Our token is "csp-"+32 hex = 36.
+  # N valid chars could forge a plausible token). Our token is "csp-"+32 hex = 36;
+  # 96 read minus a possible CR leaves headroom, and >64 is definitively bogus.
   [ "${#v}" -le 64 ] || v=""
   case "$v" in
     csp-*[!A-Za-z0-9-]*) v="" ;;   # disallowed char after the prefix

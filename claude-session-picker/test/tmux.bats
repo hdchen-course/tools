@@ -280,21 +280,37 @@ make_home() {
   [ -z "$(csp_tmux_owner_token)" ]
 }
 
-@test "ownership: owner-token round-trips a real token (plain read -r, portable)" {
-  # The reader uses plain `read -r` (stops at the first newline) rather than
-  # `read -r -n N`, which is not portable across shells (it returns EMPTY under
-  # some, e.g. zsh) and could silently break ownership recognition. Write a token
-  # by hand under BOTH keys and confirm it reads back exactly.
+@test "ownership: owner-token round-trips a real token and reads it back exactly" {
+  # A valid token written by hand under BOTH keys reads back unchanged.
   make_home
   tok="csp-$(printf 'abc123def456')"
   printf '%s\n' "$tok" > "$(csp_tmux_owner_file)"
   printf '%s\n' "$tok" > "$(csp_tmux_owner_file_namekey)"
   [ "$(csp_tmux_owner_token)" = "$tok" ]
-  # A 100k single-line junk file is rejected by the length cap (not truncated into
-  # a plausible token).
+  # A large single-line junk file is rejected by the length cap.
   { printf 'csp-'; head -c 100000 /dev/zero | tr '\0' x; printf '\n'; } > "$(csp_tmux_owner_file)"
   { printf 'csp-'; head -c 100000 /dev/zero | tr '\0' x; printf '\n'; } > "$(csp_tmux_owner_file_namekey)"
   [ -z "$(csp_tmux_owner_token)" ]
+}
+
+@test "ownership: owner-token read is BOUNDED — a huge no-newline file returns fast (real function)" {
+  # Regression: csp_tmux_read_token_file must use a bounded `read -n`, not plain
+  # `read -r` (which slurps the WHOLE first line before the length check, hanging
+  # startup on a corrupt owner file). We drive the REAL function against a large
+  # regular file (16 MiB, no newline) and require it to return quickly. With the
+  # bounded read this is ~instant; with plain `read -r` it reads all 16 MiB (and a
+  # 32 MiB file hung >120s in the reviewer's repro) — a watchdog fails it.
+  make_home
+  f=$(csp_tmux_owner_file)
+  rm -f "$f"
+  { printf 'csp-'; head -c 16000000 /dev/zero | tr '\0' x; } > "$f"   # 16 MiB, NO newline
+  start=$SECONDS
+  v=$(csp_tmux_read_token_file "$f")     # THE REAL FUNCTION
+  elapsed=$(( SECONDS - start ))
+  # Bounded → returns in well under the time an unbounded 16 MiB slurp would take,
+  # and the over-length line is rejected (empty), never truncated into a token.
+  [ "$elapsed" -lt 5 ] || { echo "read took ${elapsed}s (unbounded regression)"; false; }
+  [ -z "$v" ]
 }
 
 @test "ownership: new owner token is written 0600 in a 0700 dir (hardening)" {
