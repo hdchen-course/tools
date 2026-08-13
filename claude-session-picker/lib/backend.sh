@@ -149,21 +149,49 @@ csp_tmux_owner_file() {
 # redirect the read) and read a BOUNDED amount — the token is a fixed-shape
 # "csp-<hex>" value, so a fixed cap can never be a hot-path latency hazard even if
 # the file were somehow replaced by a huge one.
-csp_tmux_owner_token() {
-  local f v=""
-  f=$(csp_tmux_owner_file "${1:-}")
-  if [ -f "$f" ] && [ ! -L "$f" ]; then
-    { IFS= read -r -n 96 v < "$f"; } 2>/dev/null
-  fi
+# csp_tmux_read_token_file FILE — read+validate a token from one owner file.
+# Prints the token if the file holds our exact shape ("csp-"+[A-Za-z0-9-]), else
+# nothing. Symlink-refusing; rejects an over-long first line.
+csp_tmux_read_token_file() {
+  local f="$1" v=""
+  [ -f "$f" ] && [ ! -L "$f" ] || return 0
+  # Read the FIRST LINE with a plain `read -r`. We deliberately do NOT use
+  # `read -n <N>`: on bash 3.2 (macOS system bash, our target) `read -r -n N`
+  # inside a redirected group returns EMPTY, which silently broke ownership
+  # recognition entirely. Plain `read -r` stops at the first newline (bounded to
+  # one line for our newline-terminated token).
+  { IFS= read -r v < "$f"; } 2>/dev/null
   v="${v%$'\r'}"
-  # Accept only the exact shape we write: "csp-" then one or more [A-Za-z0-9-].
-  # Anything else (tampered, truncated, garbage) reads as no token — i.e. "not
-  # ours", the safe answer.
+  # Reject an over-long line outright (don't truncate — truncating a huge line to
+  # N valid chars could forge a plausible token). Our token is "csp-"+32 hex = 36.
+  [ "${#v}" -le 64 ] || v=""
   case "$v" in
-    csp-*[!A-Za-z0-9-]*) v="" ;;   # has a disallowed char after the prefix
-    csp-?*) ;;                     # csp- + at least one valid char → keep
+    csp-*[!A-Za-z0-9-]*) v="" ;;   # disallowed char after the prefix
+    csp-?*) ;;                     # csp- + ≥1 valid char → keep
     *) v="" ;;                     # missing prefix / empty
   esac
+  printf '%s' "$v"
+}
+
+# csp_tmux_owner_token — print the persisted ownership token for this socket, or
+# nothing if none has been established yet. Always returns 0.
+# $1 (optional) is a pre-resolved socket path, forwarded to csp_tmux_owner_file.
+#
+# We try the RESOLVED-PATH-keyed file first, then fall back to the NAME-keyed file.
+# The fallback matters for RECOVERY: a stale server we owned that is now at 0
+# sessions can't report its `socket_path` (display-message returns empty), so
+# csp_tmux_owner_file resolves to the NAME key — but the token may have been
+# written under the PATH key when the server was live. Trying both lets us still
+# recognise (and recover) our own stale server. Both keys are per-user under the
+# 0700 state dir, so this widens recognition, not exposure.
+csp_tmux_owner_token() {
+  local pathkey_file namekey_file v
+  pathkey_file=$(csp_tmux_owner_file "${1:-}")
+  v=$(csp_tmux_read_token_file "$pathkey_file")
+  if [ -z "$v" ]; then
+    namekey_file=$(csp_tmux_owner_file_namekey)
+    [ "$namekey_file" != "$pathkey_file" ] && v=$(csp_tmux_read_token_file "$namekey_file")
+  fi
   printf '%s' "$v"
 }
 
@@ -180,22 +208,45 @@ csp_tmux_gen_owner_token() {
   printf 'csp-%s' "$tok"
 }
 
+# csp_tmux_owner_file_namekey — the NAME-keyed owner file (hex of the socket NAME,
+# not the resolved path). This is the key a 0-session server resolves to (its
+# socket_path can't be read), so we ALSO write it here for recovery — see
+# csp_tmux_owner_token's fallback. On the normal single-socket-name setup the
+# name key is stable across a server's whole life, path or not.
+csp_tmux_owner_file_namekey() {
+  printf '%s/tmux-owner.%s' "$CSP_STATE_DIR" \
+    "$(printf '%s' "$CSP_TMUX_SOCKET" | od -An -tx1 2>/dev/null | tr -d ' \n')"
+}
+
 # csp_tmux_persist_owner_token TOKEN — persist TOKEN as this socket's owner token.
 # HARDENED: dir 0700, file 0600, atomic. The temp is created UNPREDICTABLY with
 # mktemp INSIDE the 0700 dir (O_EXCL, so it can't follow a pre-planted symlink),
 # then renamed into place (REPLACES, never follows, a symlink at the final path).
-# Returns non-zero on write failure. Best-effort for the caller — a failed persist
-# just means the next reader finds no token ("not ours" → hub).
+# Returns non-zero if the PRIMARY (path-keyed) write fails. Best-effort for the
+# caller — a failed persist just means the next reader finds no token.
+#
+# We write TWO copies: the PATH-keyed file (primary — distinguishes same-named
+# servers under different TMUX_TMPDIRs, see csp_tmux_owner_file) AND the NAME-keyed
+# file (so a later launch can still read our token when the server is at 0 sessions
+# and can't report its socket_path). Both live under the 0700 state dir.
 csp_tmux_persist_owner_token() {
-  local tok="$1" f d tmp
-  f=$(csp_tmux_owner_file); d=$(dirname "$f")
-  mkdir -p "$d" 2>/dev/null || return 1
-  chmod 700 "$d" 2>/dev/null || true
-  tmp=$(mktemp "$d/.owner.XXXXXX" 2>/dev/null) || return 1
-  { printf '%s\n' "$tok" > "$tmp"; } 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null; return 1; }
-  chmod 600 "$tmp" 2>/dev/null || true
-  mv -f -- "$tmp" "$f" 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null; return 1; }
-  return 0
+  local tok="$1" rv=0
+  _csp_persist_one() {   # $1 = target file
+    local f="$1" d tmp
+    d=$(dirname "$f")
+    mkdir -p "$d" 2>/dev/null || return 1
+    chmod 700 "$d" 2>/dev/null || true
+    tmp=$(mktemp "$d/.owner.XXXXXX" 2>/dev/null) || return 1
+    { printf '%s\n' "$tok" > "$tmp"; } 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$f" 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null; return 1; }
+    return 0
+  }
+  _csp_persist_one "$(csp_tmux_owner_file)" || rv=1   # primary (path-keyed)
+  # Best-effort secondary (name-keyed); don't fail the caller if only this misses.
+  local nk; nk=$(csp_tmux_owner_file_namekey)
+  [ "$nk" = "$(csp_tmux_owner_file)" ] || _csp_persist_one "$nk"
+  return "$rv"
 }
 
 # csp_tmux_new_owner_token — generate a fresh token AND persist it, printing it.
@@ -445,27 +496,42 @@ csp_tmux_cfg_body() {
 }
 
 csp_tmux_atomic_home() {
-  local tok="$1" boot='sh -c "while :; do sleep 2147483647; done"' cfg
-  # The configure block, run only when server_sessions==1. Semicolon-separated
-  # tmux commands inside a single if-shell command string. No $cmd interpolation.
+  local tok="$1" prior="${2:-}" boot='sh -c "while :; do sleep 2147483647; done"' cfg guard
+  # The configure block, run only when the guard fires. Semicolon-separated tmux
+  # commands inside a single if-shell command string. No $cmd interpolation.
+  # We also NORMALISE exit-empty back to on: when we RECOVER a stale owned server
+  # that had exit-empty off (inherited long ago from the user's config, before we
+  # switched to -f /dev/null), setting it on makes the server behave like a fresh
+  # one and keeps the exit-empty==1 branch of the guard true on the next launch.
   cfg="set-option -g @csp_owner \"$tok\""
+  cfg="$cfg ; set-option -g exit-empty on"
   cfg="$cfg ; set-option -w -t \"=$CSP_TMUX_SESSION:menu\" @csp_boot 1"
   cfg="$cfg ; $(csp_tmux_cfg_body)"
-  # GUARD (both conditions, in-queue): only configure a server we genuinely just
-  # created.
+  # GUARD (in-queue, so no socket swap can slip between the check and the config):
+  #   server_sessions==1  AND  (exit-empty==1  OR  @csp_owner==prior-token)
+  #
   #   • server_sessions==1 → ours is the sole session (new-session didn't join a
-  #     foreign server that had other sessions); AND
-  #   • exit-empty==1 (on) → this is a DEFAULT-configured fresh server. A foreign
-  #     0-session server can only still be alive if the user set `exit-empty off`
-  #     (else tmux exits when its last session dies), so exit-empty==0 positively
-  #     identifies a foreign server we joined after its sessions were gone —
-  #     server_sessions would read 1 (ours) but we must NOT touch it. Requiring
-  #     exit-empty==1 rejects that case. (Our own fresh server has the built-in
-  #     default on/1 at this point — we set base-index/etc. but never exit-empty.)
-  #     The `#{exit-empty}` format expands to 1/0, not on/off.
+  #     foreign server that already had other sessions). ALWAYS required.
+  #   • exit-empty==1 → a genuinely fresh server WE just created (tmux default on;
+  #     we start with -f /dev/null so the user's config can't turn it off on us).
+  #   • @csp_owner==prior-token → RECOVERY of a stale server WE previously owned:
+  #     a 0-session server can only still be alive with exit-empty off, which an
+  #     OLD build inherited from the user's ~/.tmux.conf. Such a server carries our
+  #     PERSISTED prior token, so it's provably ours to reconfigure and re-adopt
+  #     (we rotate it to the new token in cfg). Without this, an upgraded user with
+  #     a surviving 0-session owned server would fail to launch on EVERY attempt
+  #     (exit-empty==0, so the old single-condition guard never fired).
+  # A FOREIGN 0-session server has neither exit-empty==1 nor our prior token, so it
+  # is still correctly rejected and never mutated. The prior token is unguessable,
+  # so this cannot be spoofed by an unrelated server.
+  if [ -n "$prior" ]; then
+    guard="#{&&:#{==:#{server_sessions},1},#{||:#{==:#{exit-empty},1},#{==:#{@csp_owner},$prior}}}"
+  else
+    guard='#{&&:#{==:#{server_sessions},1},#{==:#{exit-empty},1}}'
+  fi
   csp_tmux \
     new-session -d -s "$CSP_TMUX_SESSION" -n menu "$boot" \; \
-    if-shell -F '#{&&:#{==:#{server_sessions},1},#{==:#{exit-empty},1}}' "$cfg" \
+    if-shell -F "$guard" "$cfg" \
     2>/dev/null
 }
 
@@ -623,8 +689,14 @@ csp_tmux_enter() {
   # configure_home stamps that token as @csp_owner. Keying per-path means a
   # concurrent instance on a same-named socket at a DIFFERENT path writes a
   # DIFFERENT owner file and can't clobber this server's token.
-  local tok sessions srv_pid
-  # Mint the token VALUE up front (random string; not yet persisted — the owner
+  local tok prior sessions srv_pid
+  # Read any PERSISTED prior token BEFORE minting a new one. If a stale server we
+  # previously owned is still alive at 0 sessions (exit-empty off, inherited by an
+  # old build from the user's config), it carries this token as @csp_owner — the
+  # atomic guard uses it to recognise and RECOVER that server rather than looping
+  # on failure forever. Empty for a truly fresh socket, which is fine.
+  prior=$(csp_tmux_owner_token)
+  # Mint the NEW token VALUE up front (random string; not yet persisted — the owner
   # file is keyed on the resolved socket path, which only exists once the server
   # is live, so we persist it after create). csp_tmux_gen_owner_token just returns
   # a fresh "csp-<hex>" value without touching disk.
@@ -632,12 +704,12 @@ csp_tmux_enter() {
   [ -n "$tok" ] || return 1
   # ATOMIC create + configure: one tmux invocation, so `new-session` and every
   # global option (incl. @csp_owner=tok, @csp_boot) run against a SINGLE server
-  # connection, gated on server_sessions==1. A socket swap can't slip between two
-  # of our set-options; if new-session joined a foreign server nothing is stamped.
-  # The picker command is NOT part of this invocation (it has spaces/quoting that a
-  # second tmux word-split would mangle) — we respawn window 0 separately below via
-  # direct argv.
-  csp_tmux_atomic_home "$tok" || return 1
+  # connection, gated on server_sessions==1 AND (fresh OR our prior token). A
+  # socket swap can't slip between the check and the mutations; if new-session
+  # joined a FOREIGN server nothing is stamped. The picker command is NOT part of
+  # this invocation (it has spaces/quoting that a second tmux word-split would
+  # mangle) — we respawn window 0 separately below via direct argv.
+  csp_tmux_atomic_home "$tok" "$prior" || return 1
   # Bind to THIS instance's pid for all later cleanup.
   srv_pid=$(csp_tmux display-message -p '#{pid}' 2>/dev/null)
   case "$srv_pid" in ''|*[!0-9]*) csp_tmux_enter_cleanup "$srv_pid" "$tok"; return 1 ;; esac

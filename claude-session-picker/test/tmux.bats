@@ -258,23 +258,42 @@ make_home() {
   [ "$fileAB" != "$fileA_B" ]
 }
 
-@test "ownership: owner-token read refuses a symlink at the path and validates shape" {
+@test "ownership: owner-token read refuses a symlink and validates shape (both keyed files)" {
   make_home
-  f=$(csp_tmux_owner_file)
-  # A valid token round-trips.
+  f=$(csp_tmux_owner_file)              # path-keyed file
+  nk=$(csp_tmux_owner_file_namekey)     # name-keyed file (dual-key persist writes both)
+  # A valid token round-trips (this also guards the bash-3.2 `read -r -n` bug: the
+  # reader uses plain `read -r`, so a real token is actually returned, not empty).
   tok=$(csp_tmux_owner_token)
   case "$tok" in csp-*) ok=1 ;; *) ok=0 ;; esac
   [ "$ok" = "1" ]
-  # Replace the owner file with a SYMLINK to a secret — the read must refuse to
-  # follow it and return nothing (so a planted link can't redirect the read).
+  # Replace BOTH keyed files with SYMLINKs to a secret — the read must refuse to
+  # follow either and return nothing (a planted link can't redirect the read).
   printf 'csp-should-not-be-read\n' > "$BATS_TEST_TMPDIR/secret"
-  rm -f "$f"; ln -s "$BATS_TEST_TMPDIR/secret" "$f"
+  rm -f "$f" "$nk"; ln -s "$BATS_TEST_TMPDIR/secret" "$f"; ln -s "$BATS_TEST_TMPDIR/secret" "$nk"
   [ -z "$(csp_tmux_owner_token)" ]
   # A garbage (wrong-shape) token reads as empty → "not ours", the safe answer.
-  rm -f "$f"; printf 'totally-not-a-token\n' > "$f"
+  rm -f "$f" "$nk"; printf 'totally-not-a-token\n' > "$f"; printf 'totally-not-a-token\n' > "$nk"
   [ -z "$(csp_tmux_owner_token)" ]
   # A well-formed token with an injected disallowed char is also rejected.
-  printf 'csp-abc;rm -rf\n' > "$f"
+  printf 'csp-abc;rm -rf\n' > "$f"; printf 'csp-abc;rm -rf\n' > "$nk"
+  [ -z "$(csp_tmux_owner_token)" ]
+}
+
+@test "ownership: owner-token round-trips a real token (plain read -r, portable)" {
+  # The reader uses plain `read -r` (stops at the first newline) rather than
+  # `read -r -n N`, which is not portable across shells (it returns EMPTY under
+  # some, e.g. zsh) and could silently break ownership recognition. Write a token
+  # by hand under BOTH keys and confirm it reads back exactly.
+  make_home
+  tok="csp-$(printf 'abc123def456')"
+  printf '%s\n' "$tok" > "$(csp_tmux_owner_file)"
+  printf '%s\n' "$tok" > "$(csp_tmux_owner_file_namekey)"
+  [ "$(csp_tmux_owner_token)" = "$tok" ]
+  # A 100k single-line junk file is rejected by the length cap (not truncated into
+  # a plausible token).
+  { printf 'csp-'; head -c 100000 /dev/zero | tr '\0' x; printf '\n'; } > "$(csp_tmux_owner_file)"
+  { printf 'csp-'; head -c 100000 /dev/zero | tr '\0' x; printf '\n'; } > "$(csp_tmux_owner_file_namekey)"
   [ -z "$(csp_tmux_owner_token)" ]
 }
 
@@ -473,6 +492,41 @@ make_home() {
   csp_tmux_atomic_home "$tok"    # our new-session JOINS the surviving foreign server
   # The foreign server must NOT be configured or stamped.
   [ -z "$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)" ]
+  [ "$(csp_tmux show-options -gv mouse 2>/dev/null || true)" = "$before_mouse" ]
+}
+
+@test "atomic-home: RECOVERS a stale OWNED 0-session server (exit-empty off + our prior token)" {
+  # Round-9 fix: a server WE previously owned can survive at 0 sessions if an OLD
+  # build inherited exit-empty off from the user's config. atomic_home given the
+  # PRIOR token must recognise it (server_sessions==1 AND @csp_owner==prior),
+  # reconfigure it, rotate the owner to the new token, and normalise exit-empty on.
+  # Without this the upgraded user would fail to launch on every attempt.
+  csp_tmux new-session -d -s "$CSP_TMUX_SESSION" -n menu "sleep 60"
+  csp_tmux set-option -g exit-empty off 2>/dev/null
+  prior="csp-priorowned-$$"
+  csp_tmux set-option -g @csp_owner "$prior" 2>/dev/null
+  csp_tmux kill-session -t "$CSP_TMUX_SESSION" 2>/dev/null    # → stale owned 0-session
+  run csp_tmux list-sessions; [ "$status" -eq 0 ]            # still alive
+  newtok=$(csp_tmux_gen_owner_token)
+  csp_tmux_atomic_home "$newtok" "$prior"
+  # Recovered: owner rotated to the NEW token, exit-empty normalised on, configured.
+  [ "$(csp_tmux show-options -gv @csp_owner)" = "$newtok" ]
+  [ "$(csp_tmux show-options -gv exit-empty)" = "on" ]
+  [ "$(csp_tmux show-options -gv mouse)" = "on" ]
+}
+
+@test "atomic-home: a foreign 0-session server is NOT recovered even when a prior token is supplied" {
+  # The recovery branch must fire ONLY for OUR prior token. A foreign 0-session
+  # server carries a different (or no) @csp_owner, so passing our prior token must
+  # still leave it untouched — recovery can't be used to adopt someone else's tmux.
+  csp_tmux new-session -d -s "foreign-z2" -n w "sleep 60"
+  csp_tmux set-option -g exit-empty off 2>/dev/null
+  csp_tmux set-option -g @csp_owner "csp-someone-else" 2>/dev/null   # NOT our token
+  before_mouse=$(csp_tmux show-options -gv mouse 2>/dev/null || true)
+  csp_tmux kill-session -t "foreign-z2" 2>/dev/null
+  csp_tmux_atomic_home "$(csp_tmux_gen_owner_token)" "csp-our-prior-not-matching"
+  # Untouched: still the foreign owner, mouse unchanged (never configured).
+  [ "$(csp_tmux show-options -gv @csp_owner 2>/dev/null || true)" = "csp-someone-else" ]
   [ "$(csp_tmux show-options -gv mouse 2>/dev/null || true)" = "$before_mouse" ]
 }
 

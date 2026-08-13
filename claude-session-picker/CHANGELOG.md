@@ -103,6 +103,19 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
 - **tmux: no duplicate concurrent resume.** Opening a session that already has a
   window switches to it instead of launching a second `claude --resume` over the
   same transcript. Each session window is tagged with its id (`@csp_sid`).
+- **A stale picker-owned tmux server is recovered, not stuck.** If an *older*
+  build left a server we own alive at zero sessions (it had inherited
+  `exit-empty off` from your `~/.tmux.conf` before we switched to `-f /dev/null`),
+  upgrading used to fail to launch on **every** attempt: the fresh-path guard
+  required `exit-empty on`, which that server no longer had, so it looped
+  forever. The atomic setup now also accepts a server whose `@csp_owner` matches
+  our **persisted prior token** (provably ours) — it reconfigures it, rotates the
+  owner to a fresh token, and normalises `exit-empty on` so it behaves like new,
+  all in one tmux invocation. A *foreign* zero-session server (no matching token)
+  is still never adopted. The owner-token reader also gained a name-keyed fallback
+  so it can still read our token from a zero-session server that can't report its
+  socket path, and uses a portable `read -r` (not `read -r -n`, which misbehaves
+  under some shells).
 - **Our tmux server ignores your `~/.tmux.conf` (runs with `-f /dev/null`).** The
   dedicated-socket server now starts with no user config. This fixes a real
   regression for anyone whose config set `exit-empty off`: the picker uses tmux's
@@ -248,7 +261,7 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   is never lost; the owner-token persist failure is now fail-closed; and the
   session name also strips `$`/backtick (it's interpolated into the atomic
   `if-shell` string). Each new assertion was mutation-verified (disable the fix →
-  the test fails). Test suite grew to 275 (added cursor-follows-session, confirm-discriminator, -f/dev/null config isolation, session-name allowlist, and reuse-path no-foreign-mutation coverage).
+  the test fails). Test suite grew to 278 (added cursor-follows-session, confirm-discriminator, -f/dev/null config isolation, session-name allowlist, reuse-path no-foreign-mutation, stale-owned-server recovery, and owner-token round-trip coverage).
 
   Known limitations (documented, not gated): (1) if the state store suffers a
   transient failure that drops ALL of a hooked session's writes AND fully recovers
