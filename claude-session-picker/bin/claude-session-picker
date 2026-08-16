@@ -137,15 +137,19 @@ fi
 # downstream (backend choice, the mode line in csp_draw, the 't' toggle,
 # --doctor) reads the cached CSP_TMUX_SUPPORTED / CSP_TMUX_VER.
 #
-# Informational flags (-V/--version, -h/--help) exit before any of this matters
-# and must stay cheap/pipe-safe, so we skip the tmux probe entirely for them —
-# no external process runs before their early dispatch in csp_main. Any other
-# argument (or none) resolves capability normally.
+# Informational / non-interactive flags (-V/--version, -h/--help, --list) exit
+# or emit before any of this matters and must stay cheap/pipe-safe, so we skip
+# the tmux probe entirely for them — no external process runs before their early
+# dispatch in csp_main. --list in particular is documented as a plain filter that
+# composes with other tools (`… --list | fzf`); it never reads tmux support, so
+# it must not fork `tmux -V`. --doctor is deliberately NOT skipped: it reports the
+# cached support/version, so it needs the probe. Any other argument (or none)
+# resolves capability normally.
 CSP_TMUX_VER=""
 CSP_TMUX_SUPPORTED=0
 CSP_ACTIVE_BACKEND="hub"
 case "${1:-}" in
-  -V|--version|-h|--help) : ;;   # skip the probe; csp_main exits immediately
+  -V|--version|-h|--help|--list) : ;;   # skip the probe; csp_main exits/emits without tmux
   *)
     CSP_TMUX_VER="$(csp_tmux_version)"
     if csp_tmux_supported "$CSP_TMUX_VER"; then CSP_TMUX_SUPPORTED=1; else CSP_TMUX_SUPPORTED=0; fi

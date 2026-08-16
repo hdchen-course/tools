@@ -112,6 +112,35 @@ setup() {
   [ -z "$output" ]
 }
 
+@test "cli: -V/--help/--list fork NO tmux, while --doctor probes once" {
+  # The startup capability block skips the tmux probe for the flags that never
+  # read tmux support (they exit/emit first and must stay cheap + pipe-safe),
+  # and keeps it for --doctor (which reports the cached version). A `tmux` stub
+  # first on PATH logs every call so we can assert exactly who forked it.
+  local stub="$BATS_TEST_TMPDIR/tmstub"; mkdir -p "$stub"
+  local log="$BATS_TEST_TMPDIR/tmux.calls"
+  printf '#!/bin/sh\necho called >> "%s"\n[ "$1" = -V ] && echo "tmux 3.4"\n' "$log" > "$stub/tmux"
+  chmod +x "$stub/tmux"
+  # A fake claude so --list's PATH gate (and --doctor's) is satisfied.
+  local fake="$BATS_TEST_TMPDIR/bin"; mkdir -p "$fake"
+  printf '#!/bin/sh\n:\n' > "$fake/claude"; chmod +x "$fake/claude"
+  local cdir="$BATS_TEST_TMPDIR/claude"; mkdir -p "$cdir/projects"
+
+  # The three no-probe flags: each must leave the call log empty.
+  local flag
+  for flag in -V --help --list; do
+    : > "$log"
+    run env PATH="$stub:$fake:/usr/bin:/bin" NO_COLOR=1 CSP_CLAUDE_DIR="$cdir" "$BIN" "$flag"
+    [ "$status" -eq 0 ]
+    [ ! -s "$log" ] || { echo "$flag forked tmux $(wc -l < "$log") time(s)"; false; }
+  done
+
+  # --doctor legitimately needs the cached support flag, so it DOES probe — once.
+  : > "$log"
+  run env PATH="$stub:$fake:/usr/bin:/bin" NO_COLOR=1 CSP_CLAUDE_DIR="$cdir" "$BIN" --doctor
+  [ -s "$log" ] || { echo "--doctor should probe tmux at least once"; false; }
+}
+
 @test "cli: version matches the top CHANGELOG.md entry" {
   # Keep --version and the changelog in lock-step.
   v=$("$BIN" --version | awk '{print $2}')

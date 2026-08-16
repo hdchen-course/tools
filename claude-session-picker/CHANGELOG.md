@@ -21,9 +21,11 @@ this project uses simple `MAJOR.MINOR.PATCH` version numbers.
   accepted. Regression tests cover both rejected suffixed forms.
 - **tmux is now probed exactly once at startup.** `csp_tmux_supported` accepts
   the already-captured version string, so the startup path calls `tmux -V` a
-  single time instead of twice, and `-V`/`--help` skip the probe entirely (they
-  exit before capability matters) — matching the "resolved once at startup"
-  contract in the notes below.
+  single time instead of twice, and the non-tmux flags (`-V`/`--help`/`--list`)
+  skip the probe entirely — they exit or emit before capability matters, and
+  `--list` in particular is a pipe-safe filter that must not fork `tmux`.
+  `--doctor` still probes (it reports the detected version). This matches the
+  "resolved once at startup" contract in the notes below.
 
 ## 1.2.1
 
