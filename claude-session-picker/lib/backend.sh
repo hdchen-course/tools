@@ -112,22 +112,32 @@ csp_tmux_version() {
   printf '%s' "$ver"
 }
 
-# csp_tmux_supported — 0 iff tmux exists AND is new enough (>= CSP_TMUX_MIN) for
-# the concurrent backend. A version we can't parse as digits (e.g. a "master" or
-# other dev build) is treated as SUPPORTED: we only refuse versions we can
-# positively prove are too old, so we never block a modern build that reports an
-# unusual string. Everything downstream (startup backend choice, the 't' toggle,
-# the mode line, --doctor) gates on this, not on csp_tmux_available alone.
+# csp_tmux_supported [VERSION] — 0 iff tmux exists AND is new enough
+# (>= CSP_TMUX_MIN) for the concurrent backend. A version we can't parse as
+# digits (e.g. a "master" or other dev build) is treated as SUPPORTED: we only
+# refuse versions we can positively prove are too old, so we never block a modern
+# build that reports an unusual string. Everything downstream (startup backend
+# choice, the 't' toggle, the mode line, --doctor) gates on this, not on
+# csp_tmux_available alone.
+#
+# If VERSION is passed (even empty), it is used verbatim instead of forking
+# `tmux -V` again — the startup path captures the version ONCE and passes it in,
+# so a launch probes tmux a single time. Called with no argument, it falls back
+# to csp_tmux_version (one fork) for direct/interactive callers.
 csp_tmux_supported() {
   csp_tmux_available || return 1
   local ver major minor min_major min_minor
-  ver=$(csp_tmux_version)
+  if [ "$#" -ge 1 ]; then ver="$1"; else ver=$(csp_tmux_version); fi
   [ -n "$ver" ] || return 0                 # can't ask → don't block
   major=${ver%%.*}
   minor=${ver#*.}
   [ "$minor" = "$ver" ] && minor=0          # no dot → minor 0
-  major=$(printf '%s' "$major" | tr -cd '0-9')   # "3" / "" for "master"
-  minor=$(printf '%s' "$minor" | tr -cd '0-9')   # "2" from "2a"
+  # Keep only the CONTIGUOUS numeric prefix of each field — everything from the
+  # first non-digit onward is dropped. This is deliberately NOT `tr -cd '0-9'`
+  # (which would splice non-adjacent digits together): "2.3.1" and "2.3-rc1"
+  # must parse as minor 3 (base 2.3, too old), not "31". "2.4a" → 4, "3.5" → 5.
+  major=${major%%[!0-9]*}                   # "3" / "" for "master"
+  minor=${minor%%[!0-9]*}                   # "4" from "4a"; "3" from "3.1"/"3-rc1"
   [ -n "$major" ] || return 0               # unparseable major → assume supported
   [ -n "$minor" ] || minor=0
   min_major=${CSP_TMUX_MIN%%.*}; min_minor=${CSP_TMUX_MIN#*.}

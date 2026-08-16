@@ -47,7 +47,7 @@ set -u  # Treat use of an unset variable as an error — catches typos early.
 # changes and add a matching CHANGELOG.md entry; because the install is a
 # symlink updated in place by `git pull`, this is how a user (or a bug report)
 # knows exactly which build they're on.
-CSP_VERSION="1.2.1"
+CSP_VERSION="1.2.2"
 
 # --- Locate our own library files, following symlinks -----------------------
 # The installer symlinks this script into a bin dir, so we resolve the real
@@ -130,20 +130,34 @@ else
   CSP_BACKEND_CHOICE=$(csp_load_backend_pref)
 fi
 # Resolve tmux support ONCE at startup and cache it. The tmux binary/version
-# can't change during a run, and csp_tmux_supported forks `tmux -V` — computing
-# it per frame (csp_draw runs on every keystroke) would fork tmux one or more
-# times per keypress. We compute it here and everything downstream (backend
-# choice, the mode line in csp_draw, the 't' toggle, --doctor) reads the cached
-# CSP_TMUX_SUPPORTED / CSP_TMUX_VER instead of re-forking.
-CSP_TMUX_VER="$(csp_tmux_version)"
-if csp_tmux_supported; then CSP_TMUX_SUPPORTED=1; else CSP_TMUX_SUPPORTED=0; fi
-# We pass "tmux SUPPORTED" (installed AND new enough — see csp_tmux_supported),
-# not merely "installed", so a forced/remembered tmux choice on a too-old tmux
-# resolves to hub at startup instead of trying and silently failing every launch.
-CSP_ACTIVE_BACKEND=$(csp_choose_backend \
-  "$CSP_TMUX_SUPPORTED" \
-  "$(csp_inside_tmux && echo 1 || echo 0)" \
-  "${CSP_BACKEND_CHOICE:-}")
+# can't change during a run, and probing forks `tmux -V` — computing it per
+# frame (csp_draw runs on every keystroke) would fork tmux one or more times per
+# keypress. We probe tmux a SINGLE time here (csp_tmux_version), pass the result
+# straight into csp_tmux_supported so it doesn't re-fork, and everything
+# downstream (backend choice, the mode line in csp_draw, the 't' toggle,
+# --doctor) reads the cached CSP_TMUX_SUPPORTED / CSP_TMUX_VER.
+#
+# Informational flags (-V/--version, -h/--help) exit before any of this matters
+# and must stay cheap/pipe-safe, so we skip the tmux probe entirely for them —
+# no external process runs before their early dispatch in csp_main. Any other
+# argument (or none) resolves capability normally.
+CSP_TMUX_VER=""
+CSP_TMUX_SUPPORTED=0
+CSP_ACTIVE_BACKEND="hub"
+case "${1:-}" in
+  -V|--version|-h|--help) : ;;   # skip the probe; csp_main exits immediately
+  *)
+    CSP_TMUX_VER="$(csp_tmux_version)"
+    if csp_tmux_supported "$CSP_TMUX_VER"; then CSP_TMUX_SUPPORTED=1; else CSP_TMUX_SUPPORTED=0; fi
+    # We pass "tmux SUPPORTED" (installed AND new enough — see csp_tmux_supported),
+    # not merely "installed", so a forced/remembered tmux choice on a too-old tmux
+    # resolves to hub at startup instead of trying and silently failing every launch.
+    CSP_ACTIVE_BACKEND=$(csp_choose_backend \
+      "$CSP_TMUX_SUPPORTED" \
+      "$(csp_inside_tmux && echo 1 || echo 0)" \
+      "${CSP_BACKEND_CHOICE:-}")
+    ;;
+esac
 
 # --- Colours & box-drawing ---------------------------------------------------
 # The menu is drawn as a framed "GUI-style" panel. All the escape codes live

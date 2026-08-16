@@ -7,6 +7,24 @@ command is a symlink updated in place by `git pull`, so this file (and the
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/);
 this project uses simple `MAJOR.MINOR.PATCH` version numbers.
 
+## 1.2.2
+
+### Fixed
+- **The tmux version gate no longer admits a too-old tmux with a patch or
+  pre-release suffix.** The 1.2.1 parse read the minor number with
+  `tr -cd '0-9'`, which spliced non-adjacent digits: `tmux 2.3.1` and
+  `tmux 2.3-rc1` both became minor `31`, clearing the 2.4 floor and re-opening
+  the exact failure the gate exists to prevent (old tmux offered as available,
+  then backend setup fails and falls back to hub). The parse now keeps only the
+  contiguous numeric prefix of each field, so `2.3.1`/`2.3-rc1` correctly read
+  as base `2.3` (rejected) while `2.4a`, `2.4.1`, `2.5-rc1` and `3.5` stay
+  accepted. Regression tests cover both rejected suffixed forms.
+- **tmux is now probed exactly once at startup.** `csp_tmux_supported` accepts
+  the already-captured version string, so the startup path calls `tmux -V` a
+  single time instead of twice, and `-V`/`--help` skip the probe entirely (they
+  exit before capability matters) — matching the "resolved once at startup"
+  contract in the notes below.
+
 ## 1.2.1
 
 ### Fixed

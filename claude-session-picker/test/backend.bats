@@ -139,6 +139,45 @@ _stub_tmux_version() {   # $1 = what `tmux -V` should print
   [ "$status" -ne 0 ]
 }
 
+@test "supported: a patch/pre-release suffix on a too-old base is still rejected (2.3.1, 2.3-rc1)" {
+  # Regression: minor was parsed with `tr -cd '0-9'`, which spliced non-adjacent
+  # digits — "2.3.1" → minor "31", "2.3-rc1" → "31" — both wrongly clearing the
+  # 2.4 floor. Only the CONTIGUOUS numeric prefix after the first dot counts, so
+  # both are minor 3 (base 2.3) and MUST be rejected.
+  csp_tmux_available() { return 0; }
+  local v
+  for v in 2.3.1 2.3-rc1; do
+    eval "csp_tmux_version() { printf '%s' '$v'; }"
+    run csp_tmux_supported
+    [ "$status" -ne 0 ] || { echo "expected $v rejected (base 2.3 < 2.4)"; return 1; }
+  done
+}
+
+@test "supported: a patch suffix on a new-enough base is still accepted (2.4.1, 2.5-rc1)" {
+  # Mirror of the above: the contiguous-prefix parse must not over-reject either.
+  csp_tmux_available() { return 0; }
+  local v
+  for v in 2.4.1 2.5-rc1 3.4.2; do
+    eval "csp_tmux_version() { printf '%s' '$v'; }"
+    run csp_tmux_supported
+    [ "$status" -eq 0 ] || { echo "expected $v accepted"; return 1; }
+  done
+}
+
+@test "supported: accepts a pre-captured version argument WITHOUT forking tmux" {
+  # The startup path probes `tmux -V` once and passes the string in, so
+  # csp_tmux_supported must not re-fork. Stub csp_tmux_version to FAIL loudly if
+  # it's called — then confirm the argument form ignores it entirely.
+  csp_tmux_available() { return 0; }
+  csp_tmux_version() { echo "csp_tmux_version was called" >&2; return 1; }
+  run csp_tmux_supported "1.8"
+  [ "$status" -ne 0 ]                       # 1.8 rejected via the passed value
+  [ -z "$output" ]                          # version helper never ran
+  run csp_tmux_supported "3.4"
+  [ "$status" -eq 0 ]                       # 3.4 accepted via the passed value
+  [ -z "$output" ]
+}
+
 @test "supported: exactly the minimum version is accepted" {
   csp_tmux_available() { return 0; }
   csp_tmux_version() { printf '%s' "$CSP_TMUX_MIN"; }
