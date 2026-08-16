@@ -326,7 +326,10 @@ _setup_id_model() {   # 3 sessions, ids s-a/s-b/s-c
   local calllog="$BATS_TEST_TMPDIR/tmux.calls"; : > "$calllog"
   printf '#!/bin/sh\necho called >> "%s"\n[ "$1" = -V ] && echo "tmux 3.4"\n' "$calllog" > "$stub/tmux"
   chmod +x "$stub/tmux"
-  # A minimal hub-mode model.
+  # A minimal hub-mode model. Pin the terminal WIDTH (like the sibling draw tests)
+  # so the mode-line match is deterministic regardless of the real terminal — a
+  # narrow attached tty would otherwise clip the substring and flake.
+  eval "csp_term_cols() { printf '120'; }"; CSP_CHROME_COLS=""
   CSP_ACTIVE_BACKEND="hub"; CSP_BACKEND_CHOICE="hub"
   CSP_TMUX_SUPPORTED=1; CSP_TMUX_VER="3.4"      # cached at startup (what we assert is used)
   csp_count=1; csp_ids=(a); csp_titles=("alpha"); csp_titles_full=("alpha")
@@ -338,10 +341,10 @@ _setup_id_model() {   # 3 sessions, ids s-a/s-b/s-c
   PATH="$stub:$PATH" csp_draw 0 >/dev/null
   PATH="$stub:$PATH" csp_draw 0 >/dev/null
   PATH="$stub:$PATH" csp_draw 0 >/dev/null
-  # The mode line reflects the cached "supported" state (the frame truncates the
-  # full phrase, so match a prefix that survives the width clip)...
+  # The mode line reflects the cached "supported" state (width is pinned at 120,
+  # so the full phrase is present, not clipped)...
   out="$(strip_sgr "$(PATH="$stub:$PATH" csp_draw 0)")"
-  case "$out" in *"press t: enable tmux"*) ok=1 ;; *) ok=0 ;; esac
+  case "$out" in *"enable tmux for concurrency"*) ok=1 ;; *) ok=0 ;; esac
   [ "$ok" = "1" ]
   # ...and NOT a single tmux subprocess was forked across all those frames.
   [ ! -s "$calllog" ] || { echo "csp_draw forked tmux $(wc -l < "$calllog") times"; false; }
@@ -352,6 +355,7 @@ _setup_id_model() {   # 3 sessions, ids s-a/s-b/s-c
   local calllog="$BATS_TEST_TMPDIR/tmux.calls2"; : > "$calllog"
   printf '#!/bin/sh\necho called >> "%s"\n[ "$1" = -V ] && echo "tmux 1.8"\n' "$calllog" > "$stub/tmux"
   chmod +x "$stub/tmux"
+  eval "csp_term_cols() { printf '120'; }"; CSP_CHROME_COLS=""   # pin width (see sibling)
   CSP_ACTIVE_BACKEND="hub"; CSP_BACKEND_CHOICE="hub"
   CSP_TMUX_SUPPORTED=0; CSP_TMUX_VER="1.8"       # installed but too old (cached)
   csp_count=1; csp_ids=(a); csp_titles=("alpha"); csp_titles_full=("alpha")
@@ -360,7 +364,7 @@ _setup_id_model() {   # 3 sessions, ids s-a/s-b/s-c
   csp_rows[0]=$(csp_format_line " " "alpha" "p/a" "1m ago" 0)
   CSP_FILTER=""; csp_rebuild_view
   out="$(strip_sgr "$(PATH="$stub:$PATH" csp_draw 0)")"
-  case "$out" in *"tmux 1.8 too old"*) ok=1 ;; *) ok=0 ;; esac
+  case "$out" in *"tmux 1.8 too old (need 2.4)"*) ok=1 ;; *) ok=0 ;; esac
   [ "$ok" = "1" ]
   [ ! -s "$calllog" ] || { echo "csp_draw forked tmux (should use cached ver)"; false; }
 }
