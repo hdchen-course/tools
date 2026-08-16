@@ -96,3 +96,74 @@ EOF
   run cat "$BATS_TEST_TMPDIR/proof2"
   [ "$output" = "args=[]" ]
 }
+
+# --- csp_tmux_version / csp_tmux_supported (version gate) --------------------
+# The concurrent backend needs tmux >= CSP_TMUX_MIN (features like `if-shell -F`,
+# `#{==:}`/`#{&&:}` format conditionals, `exit-empty`, `#{pid}`, `#{socket_path}`
+# that older tmux — e.g. the 1.8 on some Linux hosts — lacks). These tests pin the
+# parse-and-compare logic by stubbing what `tmux -V` reports.
+
+# csp_tmux_version reads `command tmux -V`, which bypasses shell functions — so we
+# stub tmux with a real executable on PATH (same technique the hub tests use).
+_stub_tmux_version() {   # $1 = what `tmux -V` should print
+  local stub="$BATS_TEST_TMPDIR/bin"
+  mkdir -p "$stub"
+  printf '#!/bin/sh\n[ "$1" = -V ] && echo "%s"\n' "$1" > "$stub/tmux"
+  chmod +x "$stub/tmux"
+  printf '%s' "$stub"
+}
+
+@test "version: parses a plain 'tmux X.Y' string" {
+  stub=$(_stub_tmux_version "tmux 3.4")
+  run env PATH="$stub:$PATH" bash -c '. "'"$BATS_TEST_DIRNAME"'/../lib/backend.sh"; csp_tmux_version'
+  [ "$output" = "3.4" ]
+}
+
+@test "version: strips a 'next-' build prefix" {
+  stub=$(_stub_tmux_version "tmux next-3.5")
+  run env PATH="$stub:$PATH" bash -c '. "'"$BATS_TEST_DIRNAME"'/../lib/backend.sh"; csp_tmux_version'
+  [ "$output" = "3.5" ]
+}
+
+@test "supported: tmux 1.8 is rejected (too old for the concurrent backend)" {
+  csp_tmux_available() { return 0; }
+  csp_tmux_version() { printf '1.8'; }
+  run csp_tmux_supported
+  [ "$status" -ne 0 ]
+}
+
+@test "supported: tmux just below the minor floor is rejected" {
+  csp_tmux_available() { return 0; }
+  csp_tmux_version() { printf '2.3'; }
+  run csp_tmux_supported
+  [ "$status" -ne 0 ]
+}
+
+@test "supported: exactly the minimum version is accepted" {
+  csp_tmux_available() { return 0; }
+  csp_tmux_version() { printf '%s' "$CSP_TMUX_MIN"; }
+  run csp_tmux_supported
+  [ "$status" -eq 0 ]
+}
+
+@test "supported: a newer major/minor and a lettered patch are accepted" {
+  csp_tmux_available() { return 0; }
+  for v in 2.5 3.0 3.2a next-3.5; do
+    eval "csp_tmux_version() { printf '%s' '$v'; }"
+    run csp_tmux_supported
+    [ "$status" -eq 0 ] || { echo "expected $v supported"; return 1; }
+  done
+}
+
+@test "supported: an unparseable version (dev build) is assumed supported, not blocked" {
+  csp_tmux_available() { return 0; }
+  csp_tmux_version() { printf 'master'; }
+  run csp_tmux_supported
+  [ "$status" -eq 0 ]
+}
+
+@test "supported: tmux missing entirely is not supported" {
+  csp_tmux_available() { return 1; }
+  run csp_tmux_supported
+  [ "$status" -ne 0 ]
+}

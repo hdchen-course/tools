@@ -47,7 +47,7 @@ set -u  # Treat use of an unset variable as an error — catches typos early.
 # changes and add a matching CHANGELOG.md entry; because the install is a
 # symlink updated in place by `git pull`, this is how a user (or a bug report)
 # knows exactly which build they're on.
-CSP_VERSION="1.2.0"
+CSP_VERSION="1.2.1"
 
 # --- Locate our own library files, following symlinks -----------------------
 # The installer symlinks this script into a bin dir, so we resolve the real
@@ -129,8 +129,19 @@ if [ -n "${CSP_BACKEND:-}" ] && csp_backend_is_valid "${CSP_BACKEND}"; then
 else
   CSP_BACKEND_CHOICE=$(csp_load_backend_pref)
 fi
+# Resolve tmux support ONCE at startup and cache it. The tmux binary/version
+# can't change during a run, and csp_tmux_supported forks `tmux -V` — computing
+# it per frame (csp_draw runs on every keystroke) would fork tmux one or more
+# times per keypress. We compute it here and everything downstream (backend
+# choice, the mode line in csp_draw, the 't' toggle, --doctor) reads the cached
+# CSP_TMUX_SUPPORTED / CSP_TMUX_VER instead of re-forking.
+CSP_TMUX_VER="$(csp_tmux_version)"
+if csp_tmux_supported; then CSP_TMUX_SUPPORTED=1; else CSP_TMUX_SUPPORTED=0; fi
+# We pass "tmux SUPPORTED" (installed AND new enough — see csp_tmux_supported),
+# not merely "installed", so a forced/remembered tmux choice on a too-old tmux
+# resolves to hub at startup instead of trying and silently failing every launch.
 CSP_ACTIVE_BACKEND=$(csp_choose_backend \
-  "$(csp_tmux_available && echo 1 || echo 0)" \
+  "$CSP_TMUX_SUPPORTED" \
   "$(csp_inside_tmux && echo 1 || echo 0)" \
   "${CSP_BACKEND_CHOICE:-}")
 
@@ -803,8 +814,15 @@ csp_draw() {
     mode_line="mode: tmux · Enter opens a session in its own window · switch with Ctrl-b n/p, menu = Ctrl-b 0  (t: off)"
   else
     mode_line="mode: hub · one session at a time, quit to return here"
-    if csp_tmux_available; then
+    # Read the CACHED support flag / version (resolved once at startup) — never
+    # fork `tmux -V` here, because csp_draw runs on every keystroke.
+    if [ "$CSP_TMUX_SUPPORTED" = 1 ]; then
       mode_line="$mode_line  (press t: enable tmux for concurrency)"
+    elif [ -n "$CSP_TMUX_VER" ]; then
+      # tmux is installed but too old for the concurrent backend — say so (and
+      # what to do) rather than dangling a 't' that would just fall back to hub.
+      # A non-empty version means the binary exists (csp_tmux_version ran it).
+      mode_line="$mode_line  — tmux $CSP_TMUX_VER too old (need $CSP_TMUX_MIN); upgrade to use tmux mode"
     elif [ "$CSP_BACKEND_CHOICE" = "tmux" ]; then
       # A remembered/forced tmux choice couldn't be honoured on this box.
       mode_line="$mode_line  — tmux not installed here, using hub"
@@ -1204,6 +1222,15 @@ csp_toggle_backend() {
       csp_pause_notice "$(printf '\ntmux mode needs the tmux command, which is not installed.\nInstall it (e.g. brew install tmux) then press t again. Enter to continue…')"
       return 0
     fi
+    if [ "$CSP_TMUX_SUPPORTED" != 1 ]; then
+      # tmux is installed but too old for the concurrent backend (see
+      # csp_tmux_supported). Rather than flip to tmux and silently fall back to
+      # hub on every launch, we stay in hub and tell the user to upgrade. Uses the
+      # cached support flag / version resolved once at startup.
+      csp_pause_notice "$(printf '\ntmux mode needs tmux %s or newer; this box has tmux %s.\nUpgrade tmux (e.g. brew install tmux, or your package manager),\nthen press t again. Staying in hub mode for now. Enter to continue…' \
+        "$CSP_TMUX_MIN" "${CSP_TMUX_VER:-?}")"
+      return 0
+    fi
     CSP_ACTIVE_BACKEND="tmux"
     # If we're not already inside our tmux, relaunch into the holding session so
     # the picker becomes window 0. csp_tmux_enter normally execs and never
@@ -1286,9 +1313,12 @@ csp_doctor() {
     csp_doctor_warn "state dir not created yet: $CSP_STATE_DIR (hooks have not run)"
   fi
 
-  # 5. tmux — optional; only needed for concurrent windows.
-  if csp_tmux_available; then
-    csp_doctor_ok "tmux found: $(command -v tmux) (concurrent mode available via 't')"
+  # 5. tmux — optional; only needed for concurrent windows. Reads the cached
+  # support flag / version resolved once at startup (no extra tmux forks).
+  if [ "$CSP_TMUX_SUPPORTED" = 1 ]; then
+    csp_doctor_ok "tmux found: $(command -v tmux) (v${CSP_TMUX_VER:-?}; concurrent mode available via 't')"
+  elif csp_tmux_available; then
+    csp_doctor_warn "tmux v${CSP_TMUX_VER:-?} is too old for tmux mode (need $CSP_TMUX_MIN+). Upgrade tmux to use concurrent windows; hub mode works fine meanwhile."
   else
     csp_doctor_warn "tmux not installed — hub mode only (that's fine for most people)."
   fi

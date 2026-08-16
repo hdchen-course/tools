@@ -314,3 +314,53 @@ _setup_id_model() {   # 3 sessions, ids s-a/s-b/s-c
   _setup_id_model
   [ -z "$(csp_view_pos_of_id no-such-id)" ]
 }
+
+# --- csp_draw must not fork tmux per frame (perf regression guard) ----
+@test "render: csp_draw forks NO tmux subprocess per frame (uses cached support flag)" {
+  # The tmux-version gate resolves support ONCE at startup into CSP_TMUX_SUPPORTED
+  # / CSP_TMUX_VER. csp_draw runs on every keystroke, so it must read those cached
+  # globals, NOT call csp_tmux_supported/csp_tmux_version (which fork `tmux -V`).
+  # We put a `tmux` stub on PATH that records every invocation, draw a hub frame,
+  # and assert the stub was never called.
+  local stub="$BATS_TEST_TMPDIR/tmuxstub"; mkdir -p "$stub"
+  local calllog="$BATS_TEST_TMPDIR/tmux.calls"; : > "$calllog"
+  printf '#!/bin/sh\necho called >> "%s"\n[ "$1" = -V ] && echo "tmux 3.4"\n' "$calllog" > "$stub/tmux"
+  chmod +x "$stub/tmux"
+  # A minimal hub-mode model.
+  CSP_ACTIVE_BACKEND="hub"; CSP_BACKEND_CHOICE="hub"
+  CSP_TMUX_SUPPORTED=1; CSP_TMUX_VER="3.4"      # cached at startup (what we assert is used)
+  csp_count=1; csp_ids=(a); csp_titles=("alpha"); csp_titles_full=("alpha")
+  csp_projects=("p/a"); csp_fullprojects=(/t); csp_files=(a.jsonl); csp_ages=("1m ago")
+  csp_lives=(0); csp_states=(""); csp_markers=(" "); CSP_HAVE_STATE=1
+  csp_rows[0]=$(csp_format_line " " "alpha" "p/a" "1m ago" 0)
+  CSP_FILTER=""; csp_rebuild_view
+  # Draw several frames with the stub tmux first on PATH.
+  PATH="$stub:$PATH" csp_draw 0 >/dev/null
+  PATH="$stub:$PATH" csp_draw 0 >/dev/null
+  PATH="$stub:$PATH" csp_draw 0 >/dev/null
+  # The mode line reflects the cached "supported" state (the frame truncates the
+  # full phrase, so match a prefix that survives the width clip)...
+  out="$(strip_sgr "$(PATH="$stub:$PATH" csp_draw 0)")"
+  case "$out" in *"press t: enable tmux"*) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
+  # ...and NOT a single tmux subprocess was forked across all those frames.
+  [ ! -s "$calllog" ] || { echo "csp_draw forked tmux $(wc -l < "$calllog") times"; false; }
+}
+
+@test "render: csp_draw shows the 'too old' hint from cached version without forking tmux" {
+  local stub="$BATS_TEST_TMPDIR/tmuxstub2"; mkdir -p "$stub"
+  local calllog="$BATS_TEST_TMPDIR/tmux.calls2"; : > "$calllog"
+  printf '#!/bin/sh\necho called >> "%s"\n[ "$1" = -V ] && echo "tmux 1.8"\n' "$calllog" > "$stub/tmux"
+  chmod +x "$stub/tmux"
+  CSP_ACTIVE_BACKEND="hub"; CSP_BACKEND_CHOICE="hub"
+  CSP_TMUX_SUPPORTED=0; CSP_TMUX_VER="1.8"       # installed but too old (cached)
+  csp_count=1; csp_ids=(a); csp_titles=("alpha"); csp_titles_full=("alpha")
+  csp_projects=("p/a"); csp_fullprojects=(/t); csp_files=(a.jsonl); csp_ages=("1m ago")
+  csp_lives=(0); csp_states=(""); csp_markers=(" "); CSP_HAVE_STATE=1
+  csp_rows[0]=$(csp_format_line " " "alpha" "p/a" "1m ago" 0)
+  CSP_FILTER=""; csp_rebuild_view
+  out="$(strip_sgr "$(PATH="$stub:$PATH" csp_draw 0)")"
+  case "$out" in *"tmux 1.8 too old"*) ok=1 ;; *) ok=0 ;; esac
+  [ "$ok" = "1" ]
+  [ ! -s "$calllog" ] || { echo "csp_draw forked tmux (should use cached ver)"; false; }
+}

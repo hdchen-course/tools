@@ -7,6 +7,24 @@ command is a symlink updated in place by `git pull`, so this file (and the
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/);
 this project uses simple `MAJOR.MINOR.PATCH` version numbers.
 
+## 1.2.1
+
+### Fixed
+- **tmux mode now checks the tmux version before offering itself.** The
+  concurrent backend needs tmux **2.4+** (it relies on `if-shell -F`, the
+  `#{==:}`/`#{&&:}` format conditionals, `exit-empty`, `#{pid}` and
+  `#{socket_path}`). On older tmux — e.g. the tmux 1.8 that ships on some Linux
+  hosts — those expand to empty or error out, so the holding server never got
+  stamped with `@csp_owner` and pressing `t` (or `CSP_BACKEND=tmux`) silently
+  fell back to hub every launch with no explanation. The picker now detects a
+  too-old tmux and stays in hub, telling you to upgrade: the `t` toggle shows an
+  upgrade prompt, the mode line notes `tmux <ver> too old (need 2.4)`, and
+  `--doctor` warns with the detected version. A tmux new enough is unchanged.
+  The version/support is resolved **once at startup** (cached in
+  `CSP_TMUX_SUPPORTED` / `CSP_TMUX_VER`) and read from there in the per-keystroke
+  draw path, the toggle and `--doctor`, so the check never forks `tmux -V` on
+  every frame.
+
 ## 1.2.0
 
 ### Added

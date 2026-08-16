@@ -90,6 +90,52 @@ csp_tmux_available() {
   command -v tmux >/dev/null 2>&1
 }
 
+# Minimum tmux the CONCURRENT (tmux) backend needs. The ownership guard in
+# csp_tmux_atomic_home is built on features that only landed in tmux 2.4:
+# `if-shell -F` (2.0), the `#{==:}` / `#{&&:}` / `#{||:}` / `#{server_sessions}`
+# FORMAT CONDITIONALS (2.4), plus `exit-empty` (2.1), `#{pid}` (2.1) and
+# `#{socket_path}` (2.2) elsewhere. On anything older (e.g. the tmux 1.8 that
+# ships on some Linux hosts) those expand to empty / error out, the server never
+# gets stamped with @csp_owner, and every launch silently falls back to hub. So
+# we gate tmux mode on this version rather than pretend and fail. Bump this if a
+# future change relies on a newer feature.
+CSP_TMUX_MIN="2.4"
+
+# csp_tmux_version — print the running tmux's numeric "major.minor" (e.g. "3.4"),
+# or nothing if it can't be determined. Strips the "tmux " prefix, any
+# "next-"/"openbsd-" build prefix, and a trailing letter/suffix ("3.2a" → "3.2").
+csp_tmux_version() {
+  local ver
+  ver=$(command tmux -V 2>/dev/null) || return 0
+  ver=${ver##* }                 # last field: "1.8" | "3.2a" | "next-3.5" | "master"
+  ver=${ver#next-}; ver=${ver#openbsd-}
+  printf '%s' "$ver"
+}
+
+# csp_tmux_supported — 0 iff tmux exists AND is new enough (>= CSP_TMUX_MIN) for
+# the concurrent backend. A version we can't parse as digits (e.g. a "master" or
+# other dev build) is treated as SUPPORTED: we only refuse versions we can
+# positively prove are too old, so we never block a modern build that reports an
+# unusual string. Everything downstream (startup backend choice, the 't' toggle,
+# the mode line, --doctor) gates on this, not on csp_tmux_available alone.
+csp_tmux_supported() {
+  csp_tmux_available || return 1
+  local ver major minor min_major min_minor
+  ver=$(csp_tmux_version)
+  [ -n "$ver" ] || return 0                 # can't ask → don't block
+  major=${ver%%.*}
+  minor=${ver#*.}
+  [ "$minor" = "$ver" ] && minor=0          # no dot → minor 0
+  major=$(printf '%s' "$major" | tr -cd '0-9')   # "3" / "" for "master"
+  minor=$(printf '%s' "$minor" | tr -cd '0-9')   # "2" from "2a"
+  [ -n "$major" ] || return 0               # unparseable major → assume supported
+  [ -n "$minor" ] || minor=0
+  min_major=${CSP_TMUX_MIN%%.*}; min_minor=${CSP_TMUX_MIN#*.}
+  if [ "$major" -gt "$min_major" ]; then return 0; fi
+  if [ "$major" -lt "$min_major" ]; then return 1; fi
+  [ "$minor" -ge "$min_minor" ]
+}
+
 # --- tmux server ownership identity ------------------------------------------
 # A tmux server is treated as OURS only when its server-global @csp_owner option
 # equals a PER-INSTANCE token we generated and persisted for this socket. This
