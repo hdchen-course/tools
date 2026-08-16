@@ -187,7 +187,12 @@ _stub_tmux_version() {   # $1 = what `tmux -V` should print
 
 @test "supported: a newer major/minor and a lettered patch are accepted" {
   csp_tmux_available() { return 0; }
-  for v in 2.5 3.0 3.2a next-3.5; do
+  # These are POST-strip forms (csp_tmux_version already removes the "next-"/
+  # "openbsd-" prefixes — see the dedicated "strips a 'next-' build prefix"
+  # test), so the compare path is genuinely exercised here rather than the
+  # unparseable-major fallback. 3.5 must be accepted via major 3 > 2, not because
+  # a stray prefix left the major empty.
+  for v in 2.5 3.0 3.2a 3.5; do
     eval "csp_tmux_version() { printf '%s' '$v'; }"
     run csp_tmux_supported
     [ "$status" -eq 0 ] || { echo "expected $v supported"; return 1; }

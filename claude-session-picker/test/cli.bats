@@ -135,10 +135,13 @@ setup() {
     [ ! -s "$log" ] || { echo "$flag forked tmux $(wc -l < "$log") time(s)"; false; }
   done
 
-  # --doctor legitimately needs the cached support flag, so it DOES probe — once.
+  # --doctor legitimately needs the cached support flag, so it DOES probe — but
+  # EXACTLY once (the double-probe this change eliminated must not creep back).
+  # The stub logs one line per invocation, so assert the count is precisely 1.
   : > "$log"
   run env PATH="$stub:$fake:/usr/bin:/bin" NO_COLOR=1 CSP_CLAUDE_DIR="$cdir" "$BIN" --doctor
-  [ -s "$log" ] || { echo "--doctor should probe tmux at least once"; false; }
+  [ "$(wc -l < "$log")" -eq 1 ] \
+    || { echo "--doctor should probe tmux exactly once, got $(wc -l < "$log")"; false; }
 }
 
 @test "cli: version matches the top CHANGELOG.md entry" {
